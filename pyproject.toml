@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "deptrail"
+version = "0.0.1.dev0"
+description = "Time-axis forensics for npm supply-chain incidents: did we install it, did it run, what must be rotated"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+authors = [{ name = "Official-Space-AI" }]
+keywords = ["security", "supply-chain", "npm", "forensics", "incident-response", "lockfile", "ioc"]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Intended Audience :: Developers",
+  "Topic :: Security",
+  "Programming Language :: Python :: 3",
+]
+
+[project.urls]
+Repository = "https://github.com/Official-Space-AI/deptrail"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/deptrail"]
