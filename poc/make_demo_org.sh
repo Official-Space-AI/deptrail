@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 모의 조직(레포 3개)을 생성한다: api-server만 공격 창(11/24~26) 안에 감염 버전 chalk@5.6.1을 설치한 이력을 가진다.
+# Builds a mock org (3 repos): only api-server has a history of installing the compromised chalk@5.6.1 inside the attack window (Nov 24-26).
 set -euo pipefail
 cd "$(dirname "$0")"
 rm -rf demo-org && mkdir demo-org && cd demo-org
@@ -19,20 +19,20 @@ EOF
 
 commit_at() { GIT_AUTHOR_DATE="$1" GIT_COMMITTER_DATE="$1" git commit -qm "$2"; }
 
-# 레포 1: api-server — 공격 창 안에 감염 버전 5.6.1 도입 후 5.6.2로 탈출
+# Repo 1: api-server — adopts compromised 5.6.1 inside the window, later escapes to 5.6.2
 mkdir api-server && cd api-server && git init -q
 mklock 5.6.0 && git add -A && commit_at "2025-11-20T10:00:00+09:00" "chore: initial deps (chalk 5.6.0)"
 mklock 5.6.1 && git add -A && commit_at "2025-11-25T14:30:00+09:00" "chore: bump deps (chalk 5.6.1)"
 mklock 5.6.2 && git add -A && commit_at "2025-11-28T09:00:00+09:00" "chore: bump deps (chalk 5.6.2)"
 cd ..
 
-# 레포 2: web-frontend — 감염 버전을 거치지 않고 5.6.0 → 5.6.2
+# Repo 2: web-frontend — jumps 5.6.0 -> 5.6.2 without ever holding the compromised version
 mkdir web-frontend && cd web-frontend && git init -q
 mklock 5.6.0 && git add -A && commit_at "2025-11-10T11:00:00+09:00" "chore: initial deps (chalk 5.6.0)"
 mklock 5.6.2 && git add -A && commit_at "2025-11-29T16:00:00+09:00" "chore: bump deps (chalk 5.6.2)"
 cd ..
 
-# 레포 3: mobile-app — chalk 미사용
+# Repo 3: mobile-app — does not use chalk at all
 mkdir mobile-app && cd mobile-app && git init -q
 python3 - <<'EOF' > package-lock.json
 import json
@@ -44,4 +44,4 @@ EOF
 git add -A && commit_at "2025-11-15T13:00:00+09:00" "chore: initial deps"
 cd ..
 
-echo "demo-org 생성 완료 — 실행: python3 poc/scan.py poc/demo-org poc/ioc-demo.json"
+echo "demo-org ready — run: python3 poc/scan.py poc/demo-org poc/ioc-demo.json"
