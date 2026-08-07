@@ -75,7 +75,12 @@ class LockfileModel:
 
 
 def parse_lockfile(text: str) -> LockfileModel:
-    """Parse raw package-lock.json content of lockfileVersion 1, 2 or 3."""
+    """Parse raw package-lock.json content of lockfileVersion 1, 2 or 3.
+
+    Every structural surprise is normalized to LockfileParseError so callers can
+    treat "this snapshot is unreadable" as one condition — a half-parsed lockfile
+    must never crash a scan or pass as evidence.
+    """
     try:
         data = json.loads(text)
     except json.JSONDecodeError as e:
@@ -83,10 +88,17 @@ def parse_lockfile(text: str) -> LockfileModel:
     if not isinstance(data, dict):
         raise LockfileParseError("lockfile root must be a JSON object")
 
-    if isinstance(data.get("packages"), dict):
-        return _parse_packages_format(data)  # lockfileVersion 2 and 3
-    if isinstance(data.get("dependencies"), dict):
-        return _parse_v1(data)
+    try:
+        if isinstance(data.get("packages"), dict):
+            return _parse_packages_format(data)  # lockfileVersion 2 and 3
+        if isinstance(data.get("dependencies"), dict):
+            return _parse_v1(data)
+    except LockfileParseError:
+        raise
+    except Exception as e:
+        raise LockfileParseError(
+            f"malformed lockfile structure: {type(e).__name__}: {e}"
+        ) from e
     raise LockfileParseError("neither 'packages' nor 'dependencies' present")
 
 
@@ -125,8 +137,10 @@ def _parse_packages_format(data: dict) -> LockfileModel:
             continue
         name = entry.get("name") or _name_from_path(path)
         ver = entry.get("version")
-        if not ver:
+        if ver is None:
             continue
+        if not isinstance(ver, str):
+            raise LockfileParseError(f"non-string version at {path!r}")
         installed.append(InstalledPackage(name=name, version=ver, path=path))
         declared.setdefault(name, set()).update(_declared_names(entry))
 
@@ -155,6 +169,8 @@ def _parse_v1(data: dict) -> LockfileModel:
         for name, entry in block.items():
             if not isinstance(entry, dict) or "version" not in entry:
                 continue
+            if not isinstance(entry["version"], str):
+                raise LockfileParseError(f"non-string version for {name!r}")
             path = f"{prefix}node_modules/{name}"
             installed.append(InstalledPackage(name=name, version=entry["version"], path=path))
             requires = entry.get("requires")
