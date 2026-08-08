@@ -78,3 +78,21 @@ class TestErrors:
     def test_unknown_shape(self):
         with pytest.raises(LockfileParseError):
             parse_lockfile('{"name": "x", "version": "1.0.0"}')
+
+
+class TestSchemaNormalization:
+    """Regressions from review: every structural surprise must be LockfileParseError."""
+
+    def test_non_numeric_lockfile_version(self):
+        with pytest.raises(LockfileParseError):
+            parse_lockfile('{"lockfileVersion": "three", "packages": {"": {}}}')
+
+    def test_non_string_version_rejected(self):
+        with pytest.raises(LockfileParseError):
+            parse_lockfile(
+                '{"lockfileVersion": 3, "packages": {"node_modules/a": {"version": {"x": 1}}}}'
+            )
+
+    def test_malformed_root_entry_normalized(self):
+        with pytest.raises(LockfileParseError):
+            parse_lockfile('{"lockfileVersion": 3, "packages": {"": []}}')
