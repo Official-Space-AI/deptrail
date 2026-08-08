@@ -10,6 +10,15 @@ Two hard rules shape this module, both learned from the walker's review:
   A partial feed can prove exposure but can never prove its absence, and
   consumers must surface that (see ``Advisory.coverage_warning``).
 
+A window is the interval in which the malicious artifact was **installable** —
+first malicious publish until the registry removed it — not the interval in which
+the attacker was active. Vendors usually publish the latter, and the two differ
+by hours: the TanStack wave's CI compromise ran 11:29-19:15 UTC while the
+poisoned versions only appeared at 19:20 and later, so a feed transcribing the
+attacker-activity window could only ever return CLEAN. When the removal time is
+not published, a deliberately late end bound is the safe error: a wide window
+over-reports exposure, a narrow one hides it.
+
 Windows are inclusive on both ends and must be written as full ISO-8601
 timestamps with a UTC offset — no bare dates, because deciding which instants a
 published date covers is a judgment that belongs in the feed, visible to whoever
@@ -18,6 +27,7 @@ reads the report.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -27,6 +37,13 @@ from .history import WindowQuery
 FEEDS_DIR = Path(__file__).parent / "feeds"
 SCHEMA_VERSION = 1
 COVERAGE_VALUES = ("complete", "partial")
+
+# npm's own name rule (lowercase since 2014), and an exact-version shape: a
+# lockfile stores a resolved version string, so anything a range or tag could
+# expand to would match nothing and read as CLEAN.
+_NPM_NAME = re.compile(r"^(?:@[a-z0-9-~][a-z0-9._~-]*/)?[a-z0-9-~][a-z0-9._~-]*$")
+_EXACT_VERSION = re.compile(r"^\d+(?:\.\d+)*(?:[-+][0-9A-Za-z.+-]+)?$")
+_URL = re.compile(r"^https?://\S+$")
 
 _ADVISORY_KEYS = {
     "schema_version", "id", "name", "ecosystem", "window", "coverage",
@@ -76,11 +93,11 @@ def _parse_bound(value: object, *, where: str) -> datetime:
 
 
 def _parse_window(raw: object, where: str) -> tuple[datetime, datetime]:
-    _require(isinstance(raw, dict), f"{where}: window must be an object")
+    _require(isinstance(raw, dict), f"{where}: must be an object")
     window = dict(raw)  # type: ignore[arg-type]
     _reject_unknown(window, _WINDOW_KEYS, where)
     for key in _WINDOW_KEYS:
-        _require(key in window, f"{where}: window is missing {key!r}")
+        _require(key in window, f"{where}: missing {key!r}")
     start = _parse_bound(window["start"], where=f"{where}.start")
     end = _parse_bound(window["end"], where=f"{where}.end")
     _require(start <= end, f"{where}: window start is after its end")
@@ -138,18 +155,31 @@ class Advisory:
         ]
 
 
+def _no_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
+    """Reject duplicated JSON keys instead of letting the last one win.
+
+    A window block pasted twice would otherwise silently scan the wrong period.
+    """
+    seen: set[str] = set()
+    for key, _ in pairs:
+        if key in seen:
+            raise IocError(f"duplicate JSON key {key!r}: which one applies is ambiguous")
+        seen.add(key)
+    return dict(pairs)
+
+
 def parse_advisory(text: str) -> Advisory:
     """Parse and validate advisory JSON. Every violation raises IocError."""
     try:
-        data = json.loads(text)
+        data = json.loads(text, object_pairs_hook=_no_duplicate_keys)
     except json.JSONDecodeError as e:
         raise IocError(f"not valid JSON: {e}") from e
     _require(isinstance(data, dict), "advisory root must be a JSON object")
     _reject_unknown(data, _ADVISORY_KEYS, "advisory")
 
     version = data.get("schema_version")
-    _require(version == SCHEMA_VERSION,
-             f"advisory: schema_version must be {SCHEMA_VERSION}, got {version!r}")
+    _require(type(version) is int and version == SCHEMA_VERSION,
+             f"advisory: schema_version must be the integer {SCHEMA_VERSION}, got {version!r}")
     for key in ("id", "name", "ecosystem", "coverage", "packages", "sources", "window"):
         _require(key in data, f"advisory: missing required field {key!r}")
     for key in ("id", "name", "ecosystem"):
@@ -159,8 +189,8 @@ def parse_advisory(text: str) -> Advisory:
              f"advisory.ecosystem: only 'npm' is supported, got {data['ecosystem']!r}")
     _require(data["coverage"] in COVERAGE_VALUES,
              f"advisory.coverage: must be one of {list(COVERAGE_VALUES)}")
-    window = _parse_window(data["window"], "advisory")
-    sources = _string_list(data["sources"], "advisory.sources", required=True)
+    window = _parse_window(data["window"], "advisory.window")
+    sources = _url_list(data["sources"], "advisory.sources")
 
     raw_packages = data["packages"]
     _require(isinstance(raw_packages, list) and raw_packages,
@@ -172,17 +202,25 @@ def parse_advisory(text: str) -> Advisory:
         _reject_unknown(raw, _PACKAGE_KEYS, where)
         for key in ("name", "versions", "sources"):
             _require(key in raw, f"{where}: missing required field {key!r}")
-        name = raw["name"]
-        _require(isinstance(name, str) and name.strip(), f"{where}.name: must be a non-empty string")
-        _require(name not in seen, f"{where}.name: duplicate entry for {name!r}")
-        seen.add(name)
-        versions = _string_list(raw["versions"], f"{where}.versions", required=True)
-        _require(len(set(versions)) == len(versions), f"{where}.versions: duplicate versions")
+        name = _package_name(raw["name"], f"{where}.name")
+        versions = _versions(raw["versions"], f"{where}.versions")
+        pkg_window = _parse_window(raw["window"], f"{where}.window") if "window" in raw else None
+        if pkg_window is not None:
+            _require(window[0] <= pkg_window[0] and pkg_window[1] <= window[1],
+                     f"{where}.window: {_fmt_window(pkg_window)} is not inside the advisory "
+                     f"window {_fmt_window(window)}; widen the advisory window instead")
+        # A package may appear twice only for genuinely different waves, so each
+        # repeat must carry its own window; otherwise it is a paste error.
+        key = (name, pkg_window)
+        _require(key not in seen,
+                 f"{where}.name: duplicate entry for {name!r} with the same window "
+                 "(give each wave its own 'window' if this is intentional)")
+        seen.add(key)
         packages.append(CompromisedPackage(
             name=name,
             versions=versions,
-            window=_parse_window(raw["window"], where) if "window" in raw else None,
-            sources=_string_list(raw["sources"], f"{where}.sources", required=True),
+            window=pkg_window,
+            sources=_url_list(raw["sources"], f"{where}.sources"),
             notes=_optional_str(raw.get("notes"), f"{where}.notes"),
         ))
 
@@ -191,6 +229,61 @@ def parse_advisory(text: str) -> Advisory:
         window=window, coverage=data["coverage"], packages=tuple(packages),
         sources=sources, notes=_optional_str(data.get("notes"), "advisory.notes"),
     )
+
+
+def _fmt_window(window: tuple[datetime, datetime]) -> str:
+    return f"[{window[0].isoformat()} .. {window[1].isoformat()}]"
+
+
+def _package_name(raw: object, where: str) -> str:
+    """An npm package name exactly as a lockfile would spell it.
+
+    Names are matched against lockfile entries by equality, so a stray space or
+    a ``name@version`` cell copied out of a vendor table would match nothing and
+    read as CLEAN. Anything that cannot be an npm name is an error, not a scan.
+    """
+    _require(isinstance(raw, str), f"{where}: must be a string")
+    name = str(raw).strip()
+    _require(name != "", f"{where}: must not be empty")
+    if not _NPM_NAME.fullmatch(name):
+        hint = ""
+        if "@" in name[1:]:
+            hint = " — looks like 'name@version'; put the version in 'versions'"
+        elif name != name.lower():
+            hint = " — npm names are lowercase"
+        elif any(c.isspace() for c in name):
+            hint = " — contains whitespace"
+        raise IocError(f"{where}: {raw!r} is not a valid npm package name{hint}")
+    return name
+
+
+def _versions(raw: object, where: str) -> tuple[str, ...]:
+    """Exact resolved versions only.
+
+    A lockfile records one resolved version per install, so a range or dist-tag
+    could never match it: accepting ``^5.6.1`` would silently judge nothing and
+    report CLEAN. Ranges are rejected rather than expanded, because expanding
+    one would judge versions the advisory never named.
+    """
+    versions = _string_list(raw, where, required=True)
+    _require(len(set(versions)) == len(versions), f"{where}: duplicate versions")
+    for version in versions:
+        if not _EXACT_VERSION.fullmatch(version):
+            hint = " — ranges and tags cannot match a resolved lockfile version"
+            if version.startswith(("v", "V")):
+                hint = " — drop the leading 'v'"
+            raise IocError(f"{where}: {version!r} is not an exact version{hint}")
+    return versions
+
+
+def _url_list(raw: object, where: str) -> tuple[str, ...]:
+    """Provenance is an invariant: every entry must be a resolvable http(s) URL."""
+    items = _string_list(raw, where, required=True)
+    for item in items:
+        _require(bool(_URL.fullmatch(item)),
+                 f"{where}: {item!r} is not an http(s) URL; every entry needs a source "
+                 "a reader can open")
+    return items
 
 
 def _string_list(raw: object, where: str, *, required: bool) -> tuple[str, ...]:
@@ -212,14 +305,19 @@ def _optional_str(raw: object, where: str) -> str | None:
 
 def load_advisory(path: str | Path) -> Advisory:
     """Load an advisory from a file path, or by bundled feed name (no .json)."""
-    candidate = Path(path)
-    if not candidate.exists():
-        bundled = FEEDS_DIR / f"{candidate.name}.json"
-        if bundled.exists():
-            candidate = bundled
-        else:
+    text_path = str(path)
+    looks_like_path = ("/" in text_path or "\\" in text_path
+                       or text_path.endswith(".json") or Path(text_path).exists())
+    if looks_like_path:
+        candidate = Path(text_path)
+        if not candidate.is_file():
+            raise IocError(f"advisory not found: {text_path!r}")
+    else:
+        candidate = FEEDS_DIR / f"{text_path}.json"
+        if not candidate.is_file():
             raise IocError(
-                f"advisory not found: {path!r} (bundled feeds: {', '.join(bundled_feeds())})"
+                f"no bundled feed named {text_path!r} "
+                f"(available: {', '.join(bundled_feeds())})"
             )
     try:
         text = candidate.read_text(encoding="utf-8")
