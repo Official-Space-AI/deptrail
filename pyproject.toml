@@ -26,3 +26,4 @@ Repository = "https://github.com/Official-Space-AI/deptrail"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/deptrail"]
+artifacts = ["src/deptrail/feeds/*.json"]
