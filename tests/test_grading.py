@@ -37,9 +37,10 @@ def exposure(*, since=datetime(2025, 11, 25, tzinfo=timezone.utc),
 
 
 def run(*, sha=COMMIT, at=datetime(2025, 11, 25, 10, tzinfo=timezone.utc),
-        installs=None, run_id="1") -> RunRecord:
+        installs=True, run_id="1", created=None) -> RunRecord:
+    """A run that installs dependencies by default — the confirming shape."""
     return RunRecord(run_id=run_id, head_sha=sha, started_at=at, workflow="CI",
-                     installs_dependencies=installs)
+                     installs_dependencies=installs, created_at=created)
 
 
 def history(*records, oldest=datetime(2025, 11, 1, tzinfo=timezone.utc)) -> RunHistory:
@@ -51,7 +52,7 @@ class TestConfirmed:
         graded = grade_exposure(exposure(), WINDOW, history(run()))
         assert graded.grade is Grade.CONFIRMED
         assert graded.run_ids == ("1",)
-        assert any("inside the window" in e for e in graded.evidence)
+        assert any("pinned and live" in e for e in graded.evidence)
 
     def test_confirmed_cites_the_commit_and_version(self):
         graded = grade_exposure(exposure(), WINDOW, history(run()))
@@ -61,6 +62,13 @@ class TestConfirmed:
     def test_run_that_provably_installs_nothing_is_not_confirmed(self):
         graded = grade_exposure(exposure(), WINDOW, history(run(installs=False)))
         assert graded.grade is Grade.LIKELY
+        assert any("installs no dependencies" in e for e in graded.evidence)
+
+    def test_uninspectable_run_cannot_confirm(self):
+        # We could not read the run's steps, so we cannot claim it installed.
+        graded = grade_exposure(exposure(), WINDOW, history(run(installs=None)))
+        assert graded.grade is Grade.LIKELY
+        assert any("could not verify" in e for e in graded.evidence)
 
 
 class TestLikely:
@@ -70,7 +78,7 @@ class TestLikely:
         late = datetime(2025, 11, 27, 12, tzinfo=timezone.utc)
         graded = grade_exposure(exposure(), WINDOW, history(run(at=late)))
         assert graded.grade is Grade.LIKELY
-        assert any("may have failed after removal" in e for e in graded.evidence)
+        assert any("no longer live" in e for e in graded.evidence)
 
     def test_runs_in_window_on_other_commits(self):
         graded = grade_exposure(exposure(), WINDOW, history(run(sha=OTHER)))
@@ -99,13 +107,19 @@ class TestPossible:
 
 
 class TestWindowIntersection:
-    def test_run_before_the_pin_does_not_confirm(self):
-        # In the window but before the pin existed: the build cannot prove an
-        # install of the malicious artifact, so it must not reach CONFIRMED.
+    def test_run_before_the_pin_is_no_evidence_of_malicious_install(self):
+        # The run fetched the clean version, so it is not evidence at all —
+        # escalating it to LIKELY would overstate the incident's scope.
         early = datetime(2025, 11, 24, 1, tzinfo=timezone.utc)
         graded = grade_exposure(exposure(), WINDOW, history(run(at=early)))
-        assert graded.grade is Grade.LIKELY
-        assert any("both pinned and" in e for e in graded.evidence)
+        assert graded.grade is Grade.POSSIBLE
+
+    def test_run_months_before_the_window_does_not_escalate(self):
+        exp = exposure(since=datetime(2025, 1, 1, tzinfo=timezone.utc), until=None)
+        old_run = run(at=datetime(2025, 6, 1, tzinfo=timezone.utc))
+        graded = grade_exposure(exp, WINDOW, history(old_run,
+                                                     oldest=datetime(2024, 12, 1, tzinfo=timezone.utc)))
+        assert graded.grade is Grade.POSSIBLE
 
     def test_unrelated_run_before_the_pin_is_only_possible(self):
         early = datetime(2025, 11, 24, 1, tzinfo=timezone.utc)
@@ -122,6 +136,48 @@ class TestWindowIntersection:
         exp = exposure(until=None)
         graded = grade_exposure(exp, WINDOW, history(run(at=WINDOW.window_end)))
         assert graded.grade is Grade.CONFIRMED
+
+
+class TestRerunTimestamps:
+    def test_rerun_cannot_move_an_install_out_of_the_window(self):
+        # A re-run in December rewrote startedAt; createdAt still points at the
+        # original queue time inside the window.
+        rerun = run(at=datetime(2025, 12, 20, tzinfo=timezone.utc),
+                    created=datetime(2025, 11, 25, 10, tzinfo=timezone.utc))
+        graded = grade_exposure(exposure(), WINDOW, history(rerun))
+        assert graded.grade is Grade.CONFIRMED
+
+
+class TestIndeterminateNeverClears:
+    """A repo whose history could not be read must stay on the checklist."""
+
+    @pytest.mark.parametrize("warning", [
+        "shallow clone: history is truncated, absence of exposure is not evidence",
+        "package-lock.json@abc123: snapshot unreadable (object missing)",
+        "package-lock.json: discovered in refs but no walkable history",
+    ])
+    def test_unreadable_history_is_possible_not_no_evidence(self, warning):
+        finding = RepoFinding(repo=Path("/tmp/repo"), warnings=[warning])
+        graded = grade_finding(finding, WINDOW, history(run()))
+        assert graded.verdict is Verdict.INDETERMINATE
+        assert graded.worst_grade is Grade.POSSIBLE
+        assert graded.needs_rotation
+
+    def test_readable_and_unexposed_repo_is_cleared(self):
+        graded = grade_finding(RepoFinding(repo=Path("/tmp/repo")), WINDOW, history(run()))
+        assert graded.worst_grade is Grade.NO_EVIDENCE and not graded.needs_rotation
+
+
+class TestAdvisoryIdentity:
+    def test_coverage_warning_and_identity_travel_with_the_grades(self):
+        graded = grade_finding(
+            RepoFinding(repo=Path("/tmp/repo"), exposures=[exposure()]), WINDOW,
+            history(run()), advisory_id="GHSA-xxxx",
+            coverage_warning="advisory GHSA-xxxx declares partial coverage",
+        )
+        assert graded.advisory_id == "GHSA-xxxx"
+        assert graded.package == "chalk"
+        assert "partial coverage" in graded.coverage_warning
 
 
 class TestFindingRollup:
@@ -146,7 +202,7 @@ class TestFindingRollup:
         (lambda: history(run()), True),                      # CONFIRMED
         (lambda: history(run(sha=OTHER)), True),             # LIKELY
         (lambda: history(), True),                           # POSSIBLE
-    ])
+    ])  # every grade that admits an exposure requires rotation
     def test_every_exposure_grade_requires_rotation(self, grade_history, expected):
         graded = grade_finding(self._finding(exposure()), WINDOW, grade_history())
         assert graded.needs_rotation is expected

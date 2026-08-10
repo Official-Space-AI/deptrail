@@ -15,19 +15,32 @@ reaches:
   honest grade for "no CI evidence", never a downgrade to safe.
 - ``NO_EVIDENCE``— no exposure interval overlapped the window.
 
-Two failure modes are deliberately designed against. Run records expire (GitHub
-keeps them ~90 days by default), so a window older than the retention horizon
-must not read as "no install happened" — it produces POSSIBLE plus a warning
-that the records are gone. And a workflow whose steps never install dependencies
-cannot confirm anything, but it also cannot clear the repo, because the developer
-who committed the lockfile ran the install locally.
+``CONFIRMED`` demands positive evidence on both axes: the run must be shown to
+have installed dependencies (its steps are inspected), and it must have started
+while the artifact was live. A run we cannot inspect, or one that ran before the
+version turned malicious, does not confirm anything.
+
+Three failure modes are deliberately designed against. Run records expire
+(GitHub keeps them ~90 days by default), so a window older than the retention
+horizon must not read as "no install happened" — it produces POSSIBLE plus a
+warning that the records are gone. A repository whose history could not be read
+at all (shallow clone, unreadable snapshot) is likewise POSSIBLE, never
+NO_EVIDENCE: nothing was ruled out, so nothing may be cleared. And a workflow
+whose steps never install dependencies cannot confirm anything, but it also
+cannot clear the repo, because the developer who committed the lockfile ran the
+install locally.
+
+Known limits of the run metadata: for ``pull_request`` events the run checks out
+an ephemeral merge of head and base, so its install reflects that merge rather
+than the head snapshot alone; and ``startedAt`` is rewritten by re-runs, so the
+earlier of ``createdAt``/``startedAt`` is used as a run's effective time.
 """
 from __future__ import annotations
 
 import json
 import subprocess
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
 
@@ -36,7 +49,10 @@ from .history import Exposure, RepoFinding, Verdict, WindowQuery, _parse_iso
 # Workflow steps that fetch dependencies; a run containing one of these executed
 # whatever the lockfile pinned, including any install scripts it carried.
 INSTALL_HINTS = ("npm ci", "npm install", "npm i ", "yarn install", "pnpm install",
-                 "setup-node", "actions/setup-node")
+                 "setup-node", "install dependencies", "install deps")
+# GitHub's default run retention; used only to say "the records for that window
+# are probably gone", never to claim a run did or did not happen.
+RETENTION = timedelta(days=90)
 
 
 class Grade(str, Enum):
@@ -48,13 +64,24 @@ class Grade(str, Enum):
 
 @dataclass(frozen=True)
 class RunRecord:
-    """One CI run, reduced to what grading needs."""
+    """One CI run, reduced to what grading needs.
+
+    ``created_at`` is kept because a re-run rewrites ``startedAt``: the earlier
+    of the two is the run's effective time, so a re-run months later cannot move
+    an install out of the window it actually happened in.
+    """
 
     run_id: str
     head_sha: str
     started_at: datetime
     workflow: str
     installs_dependencies: bool | None = None  # None = could not tell
+    created_at: datetime | None = None
+    event: str = "unknown"
+
+    @property
+    def at(self) -> datetime:
+        return min(self.started_at, self.created_at or self.started_at)
 
 
 @dataclass(frozen=True)
@@ -88,18 +115,30 @@ class GradedExposure:
 
 @dataclass
 class GradedFinding:
-    """A repo's exposures, graded, plus anything that limited the grading."""
+    """A repo's exposures, graded, plus anything that limited the grading.
+
+    The advisory identity and its coverage caveat travel with the grades so a
+    report cannot show "nothing found" for a partial feed without the caveat.
+    """
 
     repo: Path
     verdict: Verdict
     graded: list[GradedExposure] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    advisory_id: str | None = None
+    package: str | None = None
+    coverage_warning: str | None = None
 
     @property
     def worst_grade(self) -> Grade:
         for grade in (Grade.CONFIRMED, Grade.LIKELY, Grade.POSSIBLE):
             if any(g.grade is grade for g in self.graded):
                 return grade
+        if self.verdict is Verdict.INDETERMINATE:
+            # The walker could not read this repo's history, so an install was
+            # neither shown nor ruled out — which is what POSSIBLE means.
+            # NO_EVIDENCE would claim the lockfile never held a named version.
+            return Grade.POSSIBLE
         return Grade.NO_EVIDENCE
 
     @property
@@ -124,45 +163,63 @@ def grade_exposure(exposure: Exposure, query: WindowQuery,
                    history: RunHistory) -> GradedExposure:
     """Grade one exposure against the run records. Pure: no I/O, no clock."""
     start, end = _overlap(exposure, query)
-    in_window = [r for r in history.records if start <= r.started_at <= end]
-    on_commit = [r for r in history.records if r.head_sha == exposure.commit]
-    installing = [r for r in in_window
-                  if r.head_sha == exposure.commit and r.installs_dependencies is not False]
+    live = [r for r in history.records if start <= r.at <= end]
+    on_commit_live = [r for r in live if r.head_sha == exposure.commit]
+    confirming = [r for r in on_commit_live if r.installs_dependencies is True]
+    # A run on the exposing commit that started after the artifact was pulled may
+    # have failed to fetch it; one that ran before the version turned malicious
+    # installed the clean artifact and is no evidence at all.
+    after_removal = [r for r in history.records
+                     if r.head_sha == exposure.commit and r.at > end]
 
-    if installing:
-        run = installing[0]
+    if confirming:
+        run = confirming[0]
         return GradedExposure(
             exposure=exposure, grade=Grade.CONFIRMED,
             evidence=(
                 f"run {run.run_id} ({run.workflow}) checked out {exposure.commit[:8]} "
-                f"at {run.started_at.isoformat()}, inside the window",
-                f"that commit pinned {exposure.version} in {exposure.lockfile_path}",
+                f"at {run.at.isoformat()}, while {exposure.version} was pinned and live",
+                f"that run installs dependencies, so {exposure.version} executed",
             ),
-            run_ids=tuple(r.run_id for r in installing),
+            run_ids=tuple(r.run_id for r in confirming),
         )
 
-    if on_commit:
-        run = on_commit[0]
+    if on_commit_live:
+        run = on_commit_live[0]
+        why = ("could not verify that this run installs dependencies"
+               if run.installs_dependencies is None
+               else "this run installs no dependencies")
+        return GradedExposure(
+            exposure=exposure, grade=Grade.LIKELY,
+            evidence=(
+                f"run {run.run_id} ({run.workflow}) checked out {exposure.commit[:8]} "
+                f"at {run.at.isoformat()}, while {exposure.version} was pinned and "
+                f"live, but {why}",
+            ),
+            run_ids=tuple(r.run_id for r in on_commit_live),
+        )
+
+    if after_removal:
+        run = after_removal[0]
         return GradedExposure(
             exposure=exposure, grade=Grade.LIKELY,
             evidence=(
                 f"run {run.run_id} checked out the exposing commit "
-                f"{exposure.commit[:8]} but started {run.started_at.isoformat()}, "
-                f"outside the interval when {exposure.version} was both pinned and "
-                f"live ({start.isoformat()} .. {end.isoformat()}); the install may "
-                "have failed after removal",
+                f"{exposure.commit[:8]} at {run.at.isoformat()}, after "
+                f"{end.isoformat()} when {exposure.version} was no longer live; "
+                "the install may have failed rather than fetched it",
             ),
-            run_ids=tuple(r.run_id for r in on_commit),
+            run_ids=tuple(r.run_id for r in after_removal),
         )
 
-    if in_window:
+    if live:
         return GradedExposure(
             exposure=exposure, grade=Grade.LIKELY,
             evidence=(
-                f"{len(in_window)} CI run(s) started while {exposure.version} was "
+                f"{len(live)} CI run(s) started while {exposure.version} was "
                 "pinned and live, on other commits",
             ),
-            run_ids=tuple(r.run_id for r in in_window),
+            run_ids=tuple(r.run_id for r in live),
         )
 
     if not history.covers(start):
@@ -183,22 +240,27 @@ def grade_exposure(exposure: Exposure, query: WindowQuery,
     )
 
 
-def grade_finding(finding: RepoFinding, query: WindowQuery,
-                  history: RunHistory) -> GradedFinding:
-    """Grade every exposure in a repo finding, carrying its warnings forward."""
+def grade_finding(finding: RepoFinding, query: WindowQuery, history: RunHistory,
+                  *, advisory_id: str | None = None,
+                  coverage_warning: str | None = None) -> GradedFinding:
+    """Grade every exposure in a repo finding, carrying its caveats forward."""
     graded = GradedFinding(
-        repo=finding.repo, verdict=finding.verdict, warnings=list(finding.warnings)
+        repo=finding.repo, verdict=finding.verdict, warnings=list(finding.warnings),
+        advisory_id=advisory_id, package=query.package,
+        coverage_warning=coverage_warning,
     )
-    for exposure in finding.exposures:
-        graded.graded.append(grade_exposure(exposure, query, history))
-    for item in graded.graded:
-        start, _ = _overlap(item.exposure, query)
-        if item.grade is Grade.POSSIBLE and not history.covers(start):
+    graded.graded.extend(grade_exposure(e, query, history) for e in finding.exposures)
+
+    if finding.exposures:
+        earliest = min(_overlap(e, query)[0] for e in finding.exposures)
+        newest = max((r.at for r in history.records), default=None)
+        beyond_retention = newest is not None and earliest < newest - RETENTION
+        if not history.covers(earliest) or beyond_retention:
             graded.warnings.append(
-                f"CI records do not reach {start.isoformat()}: "
-                "absence of a run is not absence of an install"
+                f"CI records may not reach {earliest.isoformat()} "
+                f"(GitHub keeps runs ~{RETENTION.days} days): absence of a run is "
+                "not absence of an install"
             )
-            break
     return graded
 
 
@@ -211,7 +273,7 @@ def runs_from_github(repo_slug: str, *, limit: int = 200) -> RunHistory:
     try:
         raw = subprocess.run(
             ["gh", "run", "list", "--repo", repo_slug, "--limit", str(limit),
-             "--json", "databaseId,headSha,startedAt,name"],
+             "--json", "databaseId,headSha,startedAt,createdAt,event,name"],
             capture_output=True, text=True, check=True,
         ).stdout
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
@@ -222,13 +284,52 @@ def runs_from_github(repo_slug: str, *, limit: int = 200) -> RunHistory:
             run_id=str(item["databaseId"]),
             head_sha=item["headSha"],
             started_at=_parse_iso(item["startedAt"]),
+            created_at=_parse_iso(item["createdAt"]) if item.get("createdAt") else None,
             workflow=item.get("name") or "unknown",
+            event=item.get("event") or "unknown",
         ))
-    records.sort(key=lambda r: r.started_at)
+    records.sort(key=lambda r: r.at)
     return RunHistory(
         records=tuple(records),
-        # The oldest record we actually saw is the only horizon we can claim; a
-        # full page means older runs may exist beyond it, so we stay silent.
-        oldest_available=records[0].started_at if records and len(records) < limit else None,
+        # Retention is not published per repo, so no horizon is claimed from a
+        # full page. Even on a partial page the oldest record only proves runs
+        # were seen that far back; grading treats an older window as unanswered.
+        oldest_available=records[0].at if records and len(records) < limit else None,
         source=f"gh run list --repo {repo_slug}",
     )
+
+
+def resolve_installs(repo_slug: str, records: tuple[RunRecord, ...],
+                     ) -> tuple[RunRecord, ...]:
+    """Fill in ``installs_dependencies`` by reading each run's step names.
+
+    CONFIRMED requires showing that a run installed dependencies, so the step
+    names are read for the candidate runs only (one call each). A run we cannot
+    inspect keeps ``None`` and therefore cannot confirm anything.
+    """
+    resolved = []
+    for record in records:
+        installs: bool | None = None
+        try:
+            raw = subprocess.run(
+                ["gh", "run", "view", record.run_id, "--repo", repo_slug,
+                 "--json", "jobs"],
+                capture_output=True, text=True, check=True,
+            ).stdout
+            steps = " ".join(
+                step.get("name", "").lower()
+                for job in json.loads(raw or "{}").get("jobs", [])
+                for step in job.get("steps", [])
+            )
+            installs = any(hint in steps for hint in INSTALL_HINTS)
+        except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
+            installs = None
+        resolved.append(
+            RunRecord(
+                run_id=record.run_id, head_sha=record.head_sha,
+                started_at=record.started_at, workflow=record.workflow,
+                installs_dependencies=installs, created_at=record.created_at,
+                event=record.event,
+            )
+        )
+    return tuple(resolved)
