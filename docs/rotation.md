@@ -58,13 +58,16 @@ so the repository is graded `POSSIBLE`, every credential it can reach goes on th
 list with the reason, and the run exits `1`. In CI, check out with `fetch-depth: 0`;
 the bundled Action deepens the history itself.
 
-**There was no lockfile we could read at all** — a project locked with Yarn or
-pnpm, or a Node project with no lockfile in its history. Nothing was seen, and
-nothing was hidden from us either: no version, no window overlap, no run. Such a
-tree is listed under **not judged** with the file that caused it, the report
-refuses to prove absence, and the run exits `2`. It raises no credentials, because
-grading it `POSSIBLE` would hand every Yarn user a list of their entire secret
-store — a false alarm, not caution.
+**There was no lockfile we could read at all** — a tree locked with Yarn, pnpm,
+Bun or Deno, present while the malicious version was installable. Nothing was seen,
+and nothing was hidden from us either: no version, no window overlap, no run. Such a
+tree is listed under **not judged** with the file that caused it, the report refuses
+to prove absence, and the run exits `2`. It raises no credentials, because grading it
+`POSSIBLE` would hand every Yarn user a list of their entire secret store — a false
+alarm, not caution.
+
+A tree with *no* lockfile at all belongs in this category too and is not yet reported;
+see issue #22 for why that needs npm's workspace rules to answer correctly.
 
 A lockfile of either kind under `tests/fixtures`, `examples` and the like is
 committed data: it is named in the caveats and does not cost the repository its

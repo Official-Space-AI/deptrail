@@ -17,6 +17,15 @@ inputs:
     description: Path to write an HTML report to; skipped when empty.
     required: false
     default: ""
+outputs:
+  exit-code:
+    # A composite action's step outputs are not visible to the calling workflow
+    # unless they are mapped here, so without this block a caller reading
+    # `steps.<id>.outputs.exit-code` gets an empty string.
+    description: >-
+      The scan's exit code: 0 nothing to do, 1 credentials to rotate, 2 the scan
+      could not prove absence, 3 malformed input.
+    value: ${{ steps.scan.outputs.exit-code }}
 runs:
   using: composite
   steps:

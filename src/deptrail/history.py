@@ -26,20 +26,17 @@ Judgment model (shaped by adversarial review — see PR #8):
   warnings, and a repo with warnings and no exposures is INDETERMINATE, not
   CLEAN.
 - **A tree we cannot read is not a tree without exposure.** Only npm lockfiles
-  are parsed. A tree locked with Yarn or pnpm, or a ``package.json`` no lockfile
-  governed, is recorded in ``unread_trees`` and makes the repo INDETERMINATE —
+  are parsed. A tree locked with Yarn, pnpm, Bun or Deno is recorded in
+  ``unread_trees`` and makes the repo INDETERMINATE —
   reporting CLEAN there would answer a question nobody could have looked at
   (found by replaying such repositories, see ``docs/experiments.md`` E12).
   Unlike a warning, it does not raise a grade: nothing suggests exposure either,
   so the honest outcome is "not judged".
-- **Lock coverage is a property of a tree at a time, not of a repository.** One
-  directory's lockfile says nothing about the directory beside it, and a lockfile
-  deleted before the malicious version was published governed nothing while it
-  mattered. Both are judged per path over the window, using existence intervals
-  read from git — a file whose *contents* we cannot parse still tells us exactly
-  when it was there. Judging this per repository was wrong in both directions at
-  once: any lockfile anywhere silenced every unlocked tree, and any foreign
-  lockfile ever committed denied an all-clear forever (E13).
+- **A foreign lockfile counts during the window and only then.** Its existence
+  interval is read from git even though its contents cannot be parsed, so a
+  project that moved off Yarn years before the incident is not denied an
+  all-clear forever (E13). Whether a ``package.json`` that *no* lockfile governed
+  is likewise unread is a harder question than it looks — see issue #22.
 - **Only the lockfile npm would have read testifies.** When a directory holds
   both ``npm-shrinkwrap.json`` and ``package-lock.json``, npm ignores the latter,
   so at those commits so do we; scanning both invents exposure from a file that
@@ -50,14 +47,12 @@ The attack window is inclusive on both ends; held intervals are half-open
 """
 from __future__ import annotations
 
-import json
 import posixpath
-import re
 import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 from .lockfile import LockfileModel, LockfileParseError, parse_lockfile
 
@@ -76,7 +71,6 @@ FOREIGN_LOCKFILES = {
     "bun.lockb": "Bun",
     "deno.lock": "Deno",  # locks npm: specifiers alongside its own
 }
-MANIFEST = "package.json"
 DATE_DIVERGENCE_WARN = timedelta(hours=48)
 
 
@@ -229,14 +223,17 @@ def is_shallow(repo: Path) -> bool:
 def _paths_with_basename(repo: Path, basenames: tuple[str, ...]) -> list[str]:
     """Every path where one of these files ever lived on any ref.
 
-    ``-z`` output is unquoted, so paths with non-ASCII or special characters
-    survive; the basename check rejects look-alikes such as
+    ``-z`` output is unquoted and NUL-separated, so it is split on NUL and nothing
+    else: rewriting newlines as separators turned ``line\\nbreak/package-lock.json``
+    into a file called ``break/package-lock.json``, which was then reported as
+    unwalkable (E14). The basename check rejects look-alikes such as
     ``sample-package-lock.json``, which the ``*name`` pathspec would match.
     """
     out = _git(repo, "log", "--all", "--format=", "--name-only", "-z",
                "--", *(f"*{name}" for name in basenames))
-    names = {n for n in out.replace("\n", "\0").split("\0") if n}
     wanted = set(basenames)
+    names = {token[1:] if token.startswith("\n") else token
+             for token in out.split("\0") if token.strip("\n")}
     return sorted(n for n in names if posixpath.basename(n) in wanted)
 
 
@@ -257,17 +254,6 @@ def lockfile_paths(repo: Path) -> list[str]:
     return discovered_lockfiles(repo)[0]
 
 
-def manifest_paths(repo: Path) -> list[str]:
-    """Every ``package.json`` that describes a project, dependencies excluded.
-
-    A committed ``node_modules`` carries one manifest per installed package; those
-    describe dependencies, not trees anyone locks, and counting them would bury
-    the report in thousands of entries.
-    """
-    return [p for p in _paths_with_basename(repo, (MANIFEST,))
-            if "node_modules" not in PurePosixPath(p).parts]
-
-
 def _exists_at(repo: Path, sha: str, path: str) -> bool:
     """Whether ``path`` is present in one commit's tree. Reads no content."""
     return subprocess.run(
@@ -276,54 +262,20 @@ def _exists_at(repo: Path, sha: str, path: str) -> bool:
     ).returncode == 0
 
 
-def _batch_presence(repo: Path, pairs: list[tuple[str, str]]) -> dict[tuple[str, str], bool]:
-    """Resolve many (commit, path) existence questions in one process.
-
-    Coverage asks this question once per file per commit that touched it, and a
-    monorepo has thousands of both: asking git separately each time spent the whole
-    runtime spawning processes rather than reading trees (E14). ``--batch-check``
-    answers the lot in input order, echoing the request back with ``missing`` for
-    anything that is not there.
-    """
-    if not pairs:
-        return {}
-    query = "".join(f"{sha}:{path}\0" for sha, path in pairs)
-    result = subprocess.run(
-        ["git", "-C", str(repo), "cat-file", "--batch-check", "-z"],
-        input=query, capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        # Older git, or a rejected argument: fall back to one question at a time
-        # rather than guessing that everything exists.
-        return {pair: _exists_at(repo, *pair) for pair in pairs}
-    answers = [line for line in result.stdout.split("\0") if line]
-    if len(answers) != len(pairs):
-        return {pair: _exists_at(repo, *pair) for pair in pairs}
-    return {pair: not answer.endswith(("missing", "missing\n"))
-            for pair, answer in zip(pairs, answers)}
-
-
-# A stretch of time a file was in the tree, and a commit that witnesses it.
-Span = tuple[datetime, datetime, str]
-
-
-def _presence_spans(repo: Path, path: str, commits: list[Commit], query: WindowQuery,
-                    children: dict[str, list[str]],
-                    present: dict[tuple[str, str], bool]) -> list[Span]:
-    """When ``path`` was in this ref's tree, clipped to the advisory window.
+def _existed_during(repo: Path, path: str, query: WindowQuery,
+                    refs: list[str], children: dict[str, list[str]],
+                    present: dict[tuple[str, str], bool]) -> str | None:
+    """A commit witnessing ``path`` in the tree while the window was open.
 
     A file's *contents* may be unreadable — a Yarn lockfile, a binary lock — but
     *when it was there* is always readable from git, and a file deleted before the
-    window or added after it governed nothing while it mattered.
+    window or added after it says nothing about the window.
 
-    Computed per ref, never across all of them. A deletion on ``main`` says nothing
-    about a feature branch that still carries the file and is still built, and
-    treating one ref's deletion as the end of every ref's interval reported such a
-    repository clean (E14). Within a ref an interval still ends at the first
-    *descendant* that no longer has the file, so a sibling line cannot truncate it.
-
-    Each span carries the commit that opened it, so a caller judging that tree can
-    read the workflows of the time instead of the workflows of today.
+    Every ref is asked separately and any one of them answering is enough: a
+    deletion on ``main`` says nothing about a branch that still carries the file
+    and is still built. Within a ref an interval ends at the first *descendant*
+    that no longer has the file, so a sibling line cannot truncate it. The window
+    test is the one exposures use, so a file present at the closing instant counts.
     """
     def here(sha: str) -> bool:
         key = (sha, path)
@@ -331,126 +283,24 @@ def _presence_spans(repo: Path, path: str, commits: list[Commit], query: WindowQ
             present[key] = _exists_at(repo, sha, path)
         return present[key]
 
-    spans: list[Span] = []
-    for i, commit in enumerate(commits):
-        if not here(commit.sha):
-            continue
-        end: datetime | None = None
-        forward = _descendants(children, commit.sha)
-        for successor in commits[i + 1:]:
-            if successor.sha in forward and not here(successor.sha):
-                end = successor.late
-                break
-        start = max(commit.early, query.window_start)
-        stop = query.window_end if end is None else min(end, query.window_end)
-        if start < stop:
-            spans.append((start, stop, commit.sha))
-    return spans
-
-
-def _ancestor_dirs(directory: str) -> list[str]:
-    """This directory and every directory above it, nearest first.
-
-    Only these can hold a lockfile that covers the directory, which is what keeps
-    coverage from being a comparison of every lockfile against every tree.
-    """
-    chain = [directory]
-    while directory:
-        directory = posixpath.dirname(directory)
-        chain.append(directory)
-    return chain
-
-
-def _uncovered(span: Span, holes: list[Span]) -> bool:
-    """Whether any part of ``span`` is left once every hole is removed."""
-    remaining = [(span[0], span[1])]
-    for hole_start, hole_end, _ in holes:
-        carved: list[tuple[datetime, datetime]] = []
-        for start, stop in remaining:
-            if hole_end <= start or hole_start >= stop:
-                carved.append((start, stop))
+    for ref in refs:
+        commits = _log_commits(repo, path, ref=ref)
+        for i, commit in enumerate(commits):
+            if not here(commit.sha):
                 continue
-            if hole_start > start:
-                carved.append((start, hole_start))
-            if hole_end < stop:
-                carved.append((hole_end, stop))
-        remaining = carved
-        if not remaining:
-            return False
-    return bool(remaining)
+            end: datetime | None = None
+            forward = _descendants(children, commit.sha)
+            for successor in commits[i + 1:]:
+                if successor.sha in forward and not here(successor.sha):
+                    end = successor.late
+                    break
+            if commit.early > query.window_end:
+                continue
+            if end is not None and end <= query.window_start:
+                continue
+            return commit.sha
+    return None
 
-
-def _workspace_globs(raw: object) -> tuple[str, ...]:
-    """The workspace patterns a manifest declares, in either accepted spelling."""
-    if isinstance(raw, dict):
-        raw = raw.get("packages")
-    if not isinstance(raw, list):
-        return ()
-    return tuple(pattern for pattern in raw if isinstance(pattern, str))
-
-
-def _matches_glob(relative: str, pattern: str) -> bool:
-    """Whether a workspace pattern covers this path, with npm's ``*`` semantics.
-
-    ``*`` stops at a slash and ``**`` does not, which is what separates
-    ``packages/*`` from ``packages/**``.
-    """
-    pattern = pattern.strip("/")
-    expression, index = "", 0
-    while index < len(pattern):
-        if pattern.startswith("**", index):
-            expression += ".*"
-            index += 2
-        elif pattern[index] == "*":
-            expression += "[^/]*"
-            index += 1
-        else:
-            expression += re.escape(pattern[index])
-            index += 1
-    return re.fullmatch(expression, relative) is not None
-
-
-def _declared_workspaces(repo: Path, sha: str, lock_dir: str, finding: RepoFinding,
-                         cache: dict[tuple[str, str], tuple[str, ...]],
-                         ) -> tuple[str, ...]:
-    """The workspace patterns declared beside a lockfile, read once per commit."""
-    key = (sha, lock_dir)
-    if key in cache:
-        return cache[key]
-    manifest = posixpath.join(lock_dir, MANIFEST) if lock_dir else MANIFEST
-    try:
-        declaration = json.loads(_git(repo, "show", f"{sha}:{manifest}"))
-        globs = (_workspace_globs(declaration.get("workspaces"))
-                 if isinstance(declaration, dict) else ())
-    except (GitError, json.JSONDecodeError, UnicodeDecodeError) as e:
-        # What this lockfile covered cannot be established, which is itself a thing
-        # the report must not paper over.
-        finding.diagnostics.append(
-            f"{manifest}@{sha[:8]}: workspace declaration unreadable "
-            f"({str(e)[:120]}); directories below it were not treated as covered"
-        )
-        globs = ()
-    cache[key] = globs
-    return globs
-
-
-def _governs(repo: Path, span: Span, lock_dir: str, tree_dir: str,
-             finding: RepoFinding,
-             cache: dict[tuple[str, str], tuple[str, ...]]) -> bool:
-    """Whether a lockfile in ``lock_dir`` covered the project in ``tree_dir``.
-
-    Its own directory, always. A directory below it only when that directory is a
-    declared workspace — measured against npm 10.9.3: ``npm install`` inside a
-    workspace member uses the root lockfile and writes none of its own, while the
-    same command in a directory the root does not list writes a lockfile of its
-    own. Inheriting to every descendant therefore cleared standalone applications
-    that were never locked at all (E14).
-    """
-    if lock_dir == tree_dir:
-        return True
-    relative = tree_dir[len(lock_dir) + 1:] if lock_dir else tree_dir
-    return any(_matches_glob(relative, pattern) for pattern in
-               _declared_workspaces(repo, span[2], lock_dir, finding, cache))
 
 
 def _refs(repo: Path) -> list[str]:
@@ -596,8 +446,12 @@ def _scan_ref_chain(repo: Path, path: str, ref: str, chain: list[Commit],
             snapshots[commit.sha] = _read_snapshot(repo, commit.sha, path, finding)
         return snapshots[commit.sha]
 
+    def shadowed(sha: str) -> bool:
+        """Whether the file taking precedence over this one exists at that commit."""
+        return shadowed_by is not None and _exists_at(repo, sha, shadowed_by)
+
     for i, commit in enumerate(chain):
-        if shadowed_by is not None and _exists_at(repo, commit.sha, shadowed_by):
+        if shadowed(commit.sha):
             continue
         model = snapshot(commit)
         if isinstance(model, str):
@@ -611,6 +465,12 @@ def _scan_ref_chain(repo: Path, path: str, ref: str, chain: list[Commit],
         for successor in chain[i + 1:]:
             if successor.sha not in forward:
                 continue
+            if shadowed(successor.sha):
+                # npm stopped reading this file here, so the pin stopped mattering
+                # here. Without this the interval stayed open and the report said
+                # "still pinned" about a lockfile nothing installs (E14).
+                until = successor.late
+                break
             later = snapshot(successor)
             if later is UNREADABLE:
                 continue  # cannot claim the pin ended here
@@ -660,86 +520,27 @@ def scan_repo(repo: Path, query: WindowQuery) -> RepoFinding:
                 "shallow clone: history is truncated, absence of exposure is not evidence"
             )
         paths, foreign = discovered_lockfiles(repo)
-        manifests = manifest_paths(repo)
         refs = _refs(repo)
-        children, parents = (_commit_graph(repo) if paths or foreign or manifests
-                             else ({}, {}))
-        # Coverage is a property of a tree at a moment, so it is computed per ref
-        # over spans of time rather than as one question per repository. Both
-        # coarser answers were wrong at once: any lockfile anywhere silenced every
-        # unlocked tree, and any foreign lockfile ever committed denied an
-        # all-clear forever (E13/E14).
-        # Every path's touching commits, then every existence question they raise,
-        # resolved in one process each rather than one per file per commit.
-        touched = {(path, ref): _log_commits(repo, path, ref=ref)
-                   for path in (*paths, *foreign, *manifests) for ref in refs}
-        present = _batch_presence(repo, sorted({
-            (commit.sha, path) for (path, _), commits in touched.items()
-            for commit in commits
-        }))
-        held: dict[tuple[str, str], list[Span]] = {}
-
-        def when(path: str, ref: str) -> list[Span]:
-            """Cached spans, so no path is walked twice however often it is asked."""
-            key = (path, ref)
-            if key not in held:
-                held[key] = _presence_spans(repo, path, touched[key], query,
-                                            children, present)
-            return held[key]
-
-        # Only a lockfile in this tree's own directory or above it can cover the
-        # tree, so coverage costs one lookup per directory level rather than a
-        # comparison of every lockfile against every manifest.
-        locks_by_dir: dict[str, list[str]] = {}
-        for lock in (*paths, *foreign):
-            locks_by_dir.setdefault(posixpath.dirname(lock), []).append(lock)
-        workspaces: dict[tuple[str, str], tuple[str, ...]] = {}
-
-        live_foreign: dict[str, Span] = {}
-        for path in foreign:
-            for ref in refs:
-                if when(path, ref):
-                    live_foreign.setdefault(path, when(path, ref)[0])
-                    break
-
-        unlocked: dict[str, str] = {}
-        for manifest in manifests:
-            tree = posixpath.dirname(manifest)
-            candidates = [lock for directory in _ancestor_dirs(tree)
-                          for lock in locks_by_dir.get(directory, ())]
-            for ref in refs:
-                if manifest in unlocked:
-                    break
-                for span in when(manifest, ref):
-                    covering: list[Span] = []
-                    for lock in candidates:
-                        covering.extend(
-                            s for s in when(lock, ref)
-                            if _governs(repo, s, posixpath.dirname(lock), tree,
-                                        finding, workspaces)
-                        )
-                    if _uncovered(span, covering):
-                        unlocked[manifest] = span[2]
-                        break
+        children, parents = _commit_graph(repo) if paths or foreign else ({}, {})
+        # A foreign lockfile only says something about the window if it was there
+        # during it: holding one committed years earlier against a project denied
+        # an all-clear forever (E13).
+        present: dict[tuple[str, str], bool] = {}
+        live_foreign = {
+            path: witness for path in foreign
+            if (witness := _existed_during(repo, path, query, refs, children, present))
+        }
     except GitError as e:
         finding.warnings.append(str(e))
         return finding
 
-    for path, span in live_foreign.items():
+    for path, witness in live_foreign.items():
         tool = FOREIGN_LOCKFILES[posixpath.basename(path)]
         finding.unread_trees.append(UnreadTree(
             path=path,
             reason=f"{path}: {tool} lockfiles are not parsed yet, so the versions this "
                    "tree installed were not judged",
-            commit=span[2],
-        ))
-    for path, sha in unlocked.items():
-        finding.unread_trees.append(UnreadTree(
-            path=path,
-            reason=f"{path}: no lockfile governed this tree for part of the time the "
-                   "named versions were installable, so what it installed then is "
-                   "unknown",
-            commit=sha,
+            commit=witness,
         ))
 
     for path in paths:
@@ -761,8 +562,8 @@ def scan_repo(repo: Path, query: WindowQuery) -> RepoFinding:
                 # Reuse the log the coverage pass already read, unless precedence
                 # needs the wider one: a git log per file per ref is what a monorepo
                 # scan spends its time on.
-                chain = (_log_commits(repo, path, ref=ref, also=(shadowed_by,))
-                         if shadowed_by else touched[(path, ref)])
+                chain = _log_commits(repo, path, ref=ref,
+                                     also=(shadowed_by,) if shadowed_by else ())
             except GitError as e:
                 finding.warnings.append(f"{path}@{ref}: {e}")
                 continue

@@ -109,8 +109,11 @@ read as a scan that found nothing.
 - **npm lockfiles only.** `package-lock.json` and `npm-shrinkwrap.json` are parsed.
   A tree locked with Yarn, pnpm, Bun or Deno is reported as **not judged**, exits
   `2`, and produces no rotation list — neither cleared nor accused
-  ([#17](https://github.com/Official-Space-AI/deptrail/issues/17)). The same applies
-  to a `package.json` that no lockfile governed while the versions were installable.
+  ([#17](https://github.com/Official-Space-AI/deptrail/issues/17)).
+- **A `package.json` with no lockfile is not yet reported.** Such a tree resolves
+  ranges fresh at install time, so what it installed is unknown, but deciding
+  *which* lockfile governed *which* directory *when* needs npm's workspace rules and
+  is tracked separately ([#22](https://github.com/Official-Space-AI/deptrail/issues/22)).
 - **A shallow clone cannot be cleared.** `actions/checkout` is depth-1 by default,
   and truncated history hides pins. Use `fetch-depth: 0`. Today a shallow clone
   exits `1` where an unreadable tree exits `2`; reconciling those is
