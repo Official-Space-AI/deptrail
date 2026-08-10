@@ -122,7 +122,12 @@ class Exposure:
 
     @property
     def still_pinned(self) -> bool:
-        return self.evidence == "interval:HEAD" and self.until is None
+        """Whether the ref that established this interval still pins the version.
+
+        True for any ref, not just HEAD: a release branch whose tip still holds a
+        compromised version is exactly what a remediation list must contain.
+        """
+        return self.until is None
 
 
 @dataclass

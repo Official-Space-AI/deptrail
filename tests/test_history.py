@@ -209,7 +209,8 @@ class TestReviewRegressions:
         finding = scan_repo(repo, WINDOW)
         assert finding.verdict is Verdict.EXPOSED
         assert finding.exposures[0].evidence == "interval:refs/heads/feat"
-        assert not finding.exposures[0].still_pinned
+        # The branch tip still pins it, which a remediation list must show.
+        assert finding.exposures[0].still_pinned
 
     def test_lookalike_filenames_are_not_lockfiles(self, tmp_path):
         repo = tmp_path / "lookalike"
@@ -272,10 +273,11 @@ class TestReviewRegressions:
         git(repo, "merge", "-q", "-s", "ours", default, "-m", "merge",
             date="2025-11-26T10:00:00+00:00")
         finding = scan_repo(repo, WINDOW)
-        # The malicious pin on master's line is real exposure evidence, but it
-        # must not be reported as still pinned at HEAD (HEAD holds 5.6.2).
+        # The malicious pin on master's line is real exposure evidence. HEAD
+        # holds 5.6.2, so the interval that HEAD established must be closed.
         assert finding.exposed
-        assert not any(e.still_pinned for e in finding.exposures)
+        assert not any(e.still_pinned for e in finding.exposures
+                       if e.evidence == "interval:HEAD")
 
     def test_per_version_chains_differ(self, tmp_path):
         # Two malicious versions entering through different parents must carry

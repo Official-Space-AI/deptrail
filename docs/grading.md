@@ -53,6 +53,20 @@ minutes, while leaving one live in an attacker's hands is the incident repeating
   retention, so a full page of results claims no horizon; an older window is
   reported as unanswered rather than quiet.
 
+## Only the run that built *this* commit is evidence
+
+A run on some other commit installed a different lockfile state, so it says
+nothing about this exposure — counting it would inflate the incident's scope.
+Conversely, the pin's end does not bound what a run could fetch: checking out the
+old commit *after* the fix landed still pulls the malicious artifact for as long
+as the registry serves it, so an exact-commit run is judged against the advisory
+window, not against the remediation time.
+
+Install evidence is read from the workflow file that defines the run, at that
+run's own commit. A repository where `ci.yml` runs `npm ci` and `docs.yml` does
+not gets different answers for the two, because an `issue_comment` or docs run
+installs nothing.
+
 ## What a `pull_request` run can and cannot show
 
 For `pull_request` events GitHub checks out an ephemeral merge of the head and

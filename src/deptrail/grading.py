@@ -88,8 +88,10 @@ class RunRecord:
     started_at: datetime
     workflow: str
     installs_dependencies: bool | None = None  # None = could not tell
+    workflow_path: str | None = None  # the file that defines this run
     created_at: datetime | None = None
     event: str = "unknown"
+    attempt: int = 1
 
     @property
     def at(self) -> datetime:
@@ -171,74 +173,81 @@ def _overlap(exposure: Exposure, query: WindowQuery) -> tuple[datetime, datetime
     return start, end
 
 
+# Events whose run checks out the head commit itself. A ``pull_request`` run
+# checks out an ephemeral merge of head and base instead, so what it installed is
+# that merge — it can support a grade but never confirm one for this commit.
+HEAD_CHECKOUT_EVENTS = ("push", "workflow_dispatch", "schedule", "release")
+
+
 def grade_exposure(exposure: Exposure, query: WindowQuery,
                    history: RunHistory) -> GradedExposure:
-    """Grade one exposure against the run records. Pure: no I/O, no clock."""
-    start, end = _overlap(exposure, query)
-    live = [r for r in history.records if start <= r.at <= end]
-    on_commit_live = [r for r in live if r.head_sha == exposure.commit]
-    confirming = [r for r in on_commit_live if r.installs_dependencies is True]
-    # A run on the exposing commit that started after the artifact was pulled may
-    # have failed to fetch it; one that ran before the version turned malicious
-    # installed the clean artifact and is no evidence at all.
-    after_removal = [r for r in history.records
-                     if r.head_sha == exposure.commit and r.at > end]
+    """Grade one exposure against the run records. Pure: no I/O, no clock.
+
+    Only runs that built *this* commit are evidence. A run on some other commit
+    installed a different lockfile state, so it says nothing about this exposure
+    — counting it would inflate the incident. The window, not the pin's end,
+    bounds what such a run could have fetched: checking out an old commit after
+    the fix still pulls the malicious artifact while the registry serves it.
+    """
+    live_start = max(exposure.since, query.window_start)
+    on_commit = [r for r in history.records if r.head_sha == exposure.commit]
+    during = [r for r in on_commit if live_start <= r.at <= query.window_end]
+    confirming = [r for r in during
+                  if r.installs_dependencies is True
+                  and r.event in HEAD_CHECKOUT_EVENTS]
 
     if confirming:
         run = confirming[0]
         return GradedExposure(
             exposure=exposure, grade=Grade.CONFIRMED,
             evidence=(
-                f"run {run.run_id} ({run.workflow}) checked out {exposure.commit[:8]} "
-                f"at {run.at.isoformat()}, while {exposure.version} was pinned and live",
-                f"that run installs dependencies, so {exposure.version} executed",
+                f"run {run.run_id} ({run.workflow}, {run.event}) built "
+                f"{exposure.commit[:8]} at {run.at.isoformat()}, while "
+                f"{exposure.version} was still served by the registry",
+                f"the workflows at that commit install dependencies, so "
+                f"{exposure.version} executed",
             ),
             run_ids=tuple(r.run_id for r in confirming),
         )
 
-    if on_commit_live:
-        run = on_commit_live[0]
-        why = ("could not verify that this run installs dependencies"
-               if run.installs_dependencies is None
-               else "this run installs no dependencies")
+    if during:
+        run = during[0]
+        if run.event == "pull_request":
+            why = ("a pull_request run installs a merge of head and base, not "
+                   "this commit's tree")
+        elif run.installs_dependencies is False:
+            why = "the workflows at that commit install no dependencies"
+        else:
+            why = "the workflows at that commit could not be read"
         return GradedExposure(
             exposure=exposure, grade=Grade.LIKELY,
             evidence=(
-                f"run {run.run_id} ({run.workflow}) checked out {exposure.commit[:8]} "
-                f"at {run.at.isoformat()}, while {exposure.version} was pinned and "
-                f"live, but {why}",
+                f"run {run.run_id} ({run.workflow}, {run.event}) built "
+                f"{exposure.commit[:8]} at {run.at.isoformat()}, while "
+                f"{exposure.version} was still served, but {why}",
             ),
-            run_ids=tuple(r.run_id for r in on_commit_live),
+            run_ids=tuple(r.run_id for r in during),
         )
 
-    if after_removal:
-        run = after_removal[0]
+    later = [r for r in on_commit if r.at > query.window_end]
+    if later:
+        run = later[0]
         return GradedExposure(
             exposure=exposure, grade=Grade.LIKELY,
             evidence=(
-                f"run {run.run_id} checked out the exposing commit "
+                f"run {run.run_id} built the exposing commit "
                 f"{exposure.commit[:8]} at {run.at.isoformat()}, after "
-                f"{end.isoformat()} when {exposure.version} was no longer live; "
-                "the install may have failed rather than fetched it",
+                f"{query.window_end.isoformat()} when {exposure.version} was no "
+                "longer served; the install may have failed rather than fetched it",
             ),
-            run_ids=tuple(r.run_id for r in after_removal),
+            run_ids=tuple(r.run_id for r in later),
         )
 
-    if live:
-        return GradedExposure(
-            exposure=exposure, grade=Grade.LIKELY,
-            evidence=(
-                f"{len(live)} CI run(s) started while {exposure.version} was "
-                "pinned and live, on other commits",
-            ),
-            run_ids=tuple(r.run_id for r in live),
-        )
-
-    if not history.covers(start):
+    if not history.covers(live_start):
         return GradedExposure(
             exposure=exposure, grade=Grade.POSSIBLE,
             evidence=(
-                f"no CI records reach back to {start.isoformat()} "
+                f"no CI records reach back to {live_start.isoformat()} "
                 f"(source: {history.source}); an install cannot be ruled out",
             ),
         )
@@ -246,8 +255,9 @@ def grade_exposure(exposure: Exposure, query: WindowQuery,
     return GradedExposure(
         exposure=exposure, grade=Grade.POSSIBLE,
         evidence=(
-            "no CI run coincides with the exposure; a developer machine install "
-            "leaves no record, so this cannot be cleared",
+            f"no CI run built {exposure.commit[:8]} while {exposure.version} was "
+            "served; a developer machine install leaves no record, so this cannot "
+            "be cleared",
         ),
     )
 
@@ -276,85 +286,112 @@ def grade_finding(finding: RepoFinding, query: WindowQuery, history: RunHistory,
     return graded
 
 
-def runs_from_github(repo_slug: str, *, limit: int = 200) -> RunHistory:
-    """Read run records through the GitHub CLI.
+def parse_run_list(raw: str, *, source: str,
+                   covered_from: datetime | None = None) -> RunHistory:
+    """Turn the API's run list into records. Pure, so it can be tested directly.
 
-    Only run metadata is used — never logs — because logs expire long before the
-    runs they belong to, and metadata is enough to place an install in time.
+    Runs without a usable start time (queued, or serialised as a zero date) are
+    dropped: a record that cannot be placed in time must not silently claim a
+    retention horizon it does not establish.
     """
+    payload = json.loads(raw or "{}")
+    items = payload.get("workflow_runs", payload) if isinstance(payload, dict) else payload
+    records, skipped = [], 0
+    for item in items or ():
+        stamp = item.get("run_started_at") or item.get("created_at")
+        created = item.get("created_at")
+        if not stamp or str(stamp).startswith("0001"):
+            skipped += 1
+            continue
+        records.append(RunRecord(
+            run_id=str(item.get("id") or item.get("databaseId")),
+            head_sha=item["head_sha"] if "head_sha" in item else item["headSha"],
+            started_at=_parse_iso(stamp),
+            created_at=_parse_iso(created) if created and not str(created).startswith("0001") else None,
+            workflow=item.get("name") or "unknown",
+            workflow_path=item.get("path"),
+            event=item.get("event") or "unknown",
+            attempt=int(item.get("run_attempt") or 1),
+        ))
+    records.sort(key=lambda r: r.at)
+    note = f"{source} ({skipped} run(s) without a start time skipped)" if skipped else source
+    return RunHistory(records=tuple(records), oldest_available=covered_from, source=note)
+
+
+def runs_from_github(repo_slug: str, *, since: datetime | None = None,
+                     until: datetime | None = None) -> RunHistory:
+    """Read run records for a date range through the GitHub API.
+
+    The range is asked for explicitly and every page is fetched, so coverage is
+    known rather than guessed: a fixed "most recent N runs" cap would silently
+    miss the one run that matters in a busy repository, and would leave the
+    retention horizon unknowable.
+    """
+    query = "per_page=100"
+    if since or until:
+        lo = since.date().isoformat() if since else "*"
+        hi = until.date().isoformat() if until else "*"
+        query += f"&created={lo}..{hi}"
     try:
         raw = subprocess.run(
-            ["gh", "run", "list", "--repo", repo_slug, "--limit", str(limit),
-             "--json", "databaseId,headSha,startedAt,createdAt,event,name"],
+            ["gh", "api", "--paginate", "--slurp",
+             f"repos/{repo_slug}/actions/runs?{query}"],
             capture_output=True, text=True, check=True,
         ).stdout
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
         raise RuntimeError(f"could not read CI runs for {repo_slug}: {e}") from e
-    records = []
-    for item in json.loads(raw or "[]"):
-        records.append(RunRecord(
-            run_id=str(item["databaseId"]),
-            head_sha=item["headSha"],
-            started_at=_parse_iso(item["startedAt"]),
-            created_at=_parse_iso(item["createdAt"]) if item.get("createdAt") else None,
-            workflow=item.get("name") or "unknown",
-            event=item.get("event") or "unknown",
-        ))
-    records.sort(key=lambda r: r.at)
-    return RunHistory(
-        records=tuple(records),
-        # Retention is not published per repo, so no horizon is claimed from a
-        # full page. Even on a partial page the oldest record only proves runs
-        # were seen that far back; grading treats an older window as unanswered.
-        oldest_available=records[0].at if records and len(records) < limit else None,
-        source=f"gh run list --repo {repo_slug}",
+    pages = json.loads(raw or "[]")
+    runs = [run for page in pages for run in page.get("workflow_runs", [])]
+    return parse_run_list(
+        json.dumps({"workflow_runs": runs}),
+        source=f"gh api repos/{repo_slug}/actions/runs ({query})",
+        # Coverage is exactly the range requested; an unbounded query establishes
+        # nothing about how far back the platform still keeps runs.
+        covered_from=since,
     )
 
 
-def installs_from_workflows(repo: Path, sha: str) -> bool | None:
-    """Whether the workflows committed at ``sha`` unambiguously install deps.
+def installs_from_workflows(repo: Path, sha: str,
+                            workflow_path: str | None = None) -> bool | None:
+    """Whether the workflow that ran at ``sha`` unambiguously installs deps.
 
-    The workflow files are read from git rather than from the API: they are
-    versioned alongside the lockfile, so this answers what that commit's CI
-    would have run — and it needs no network, no tokens, and no run retention.
-    ``None`` means undecidable (no workflow files, or only ambiguous steps such
-    as a bare "Install"), which can never raise a grade to CONFIRMED.
+    The workflow file is read from git rather than from the API: it is versioned
+    alongside the lockfile, so this answers what that commit's CI would have run
+    — no network, no tokens, no dependence on run retention.
+
+    ``workflow_path`` narrows the question to the file that defines the run.
+    Without it the answer stays ``None`` even when *some* workflow in the repo
+    installs dependencies, because an issue-comment or docs workflow installs
+    nothing and attributing another file's steps to it would confirm an
+    execution that never happened.
     """
+    if workflow_path is None:
+        return None
     try:
-        listing = _git_text(repo, "ls-tree", "-r", "--name-only", sha,
-                            "--", ".github/workflows")
+        body = _git_text(repo, "show", f"{sha}:{workflow_path}").lower()
     except GitError:
         return None
-    paths = [line for line in listing.splitlines()
-             if line.endswith((".yml", ".yaml"))]
-    if not paths:
-        return None
-    decided = False
-    for path in paths:
-        try:
-            body = _git_text(repo, "show", f"{sha}:{path}").lower()
-        except GitError:
-            continue
-        decided = True
-        if any(command in body for command in INSTALL_COMMANDS):
-            return True
-    return False if decided else None
+    return any(command in body for command in INSTALL_COMMANDS)
 
 
 def annotate_installs(repo: Path, records: tuple[RunRecord, ...],
                       ) -> tuple[RunRecord, ...]:
-    """Fill ``installs_dependencies`` for each run from its own commit's workflows."""
-    cache: dict[str, bool | None] = {}
+    """Fill ``installs_dependencies`` from each run's own workflow file at its commit."""
+    cache: dict[tuple[str, str | None], bool | None] = {}
     annotated = []
     for record in records:
-        if record.head_sha not in cache:
-            cache[record.head_sha] = installs_from_workflows(repo, record.head_sha)
+        key = (record.head_sha, record.workflow_path)
+        if key not in cache:
+            cache[key] = installs_from_workflows(repo, record.head_sha,
+                                                 record.workflow_path)
         annotated.append(
             RunRecord(
                 run_id=record.run_id, head_sha=record.head_sha,
                 started_at=record.started_at, workflow=record.workflow,
-                installs_dependencies=cache[record.head_sha],
+                installs_dependencies=cache[key],
+                workflow_path=record.workflow_path,
                 created_at=record.created_at, event=record.event,
+                attempt=record.attempt,
             )
         )
     return tuple(annotated)

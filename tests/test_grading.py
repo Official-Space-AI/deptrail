@@ -4,6 +4,7 @@ Grades are asserted through their consequences, not their spelling: what a
 responder does with CONFIRMED and POSSIBLE differs, and what they must never see
 is a repo cleared because no run record survived.
 """
+import json
 import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -16,6 +17,7 @@ from deptrail.grading import (
     RunRecord,
     annotate_installs,
     grade_exposure,
+    parse_run_list,
     grade_finding,
     installs_from_workflows,
 )
@@ -40,10 +42,10 @@ def exposure(*, since=datetime(2025, 11, 25, tzinfo=timezone.utc),
 
 
 def run(*, sha=COMMIT, at=datetime(2025, 11, 25, 10, tzinfo=timezone.utc),
-        installs=True, run_id="1", created=None) -> RunRecord:
-    """A run that installs dependencies by default — the confirming shape."""
+        installs=True, run_id="1", created=None, event="push") -> RunRecord:
+    """A run that installs dependencies on a head-checkout event by default."""
     return RunRecord(run_id=run_id, head_sha=sha, started_at=at, workflow="CI",
-                     installs_dependencies=installs, created_at=created)
+                     installs_dependencies=installs, created_at=created, event=event)
 
 
 def history(*records, oldest=datetime(2025, 11, 1, tzinfo=timezone.utc)) -> RunHistory:
@@ -55,7 +57,7 @@ class TestConfirmed:
         graded = grade_exposure(exposure(), WINDOW, history(run()))
         assert graded.grade is Grade.CONFIRMED
         assert graded.run_ids == ("1",)
-        assert any("pinned and live" in e for e in graded.evidence)
+        assert any("still served by the registry" in e for e in graded.evidence)
 
     def test_confirmed_cites_the_commit_and_version(self):
         graded = grade_exposure(exposure(), WINDOW, history(run()))
@@ -65,13 +67,13 @@ class TestConfirmed:
     def test_run_that_provably_installs_nothing_is_not_confirmed(self):
         graded = grade_exposure(exposure(), WINDOW, history(run(installs=False)))
         assert graded.grade is Grade.LIKELY
-        assert any("installs no dependencies" in e for e in graded.evidence)
+        assert any("install no dependencies" in e for e in graded.evidence)
 
     def test_uninspectable_run_cannot_confirm(self):
         # We could not read the run's steps, so we cannot claim it installed.
         graded = grade_exposure(exposure(), WINDOW, history(run(installs=None)))
         assert graded.grade is Grade.LIKELY
-        assert any("could not verify" in e for e in graded.evidence)
+        assert any("could not be read" in e for e in graded.evidence)
 
 
 class TestLikely:
@@ -81,12 +83,14 @@ class TestLikely:
         late = datetime(2025, 11, 27, 12, tzinfo=timezone.utc)
         graded = grade_exposure(exposure(), WINDOW, history(run(at=late)))
         assert graded.grade is Grade.LIKELY
-        assert any("no longer live" in e for e in graded.evidence)
+        assert any("no longer served" in e for e in graded.evidence)
 
-    def test_runs_in_window_on_other_commits(self):
+    def test_runs_on_other_commits_are_not_evidence(self):
+        # That run built a different lockfile state, so it says nothing about
+        # this exposure; counting it would inflate the incident.
         graded = grade_exposure(exposure(), WINDOW, history(run(sha=OTHER)))
-        assert graded.grade is Grade.LIKELY
-        assert any("other commits" in e for e in graded.evidence)
+        assert graded.grade is Grade.POSSIBLE
+        assert any("no CI run built" in e for e in graded.evidence)
 
 
 class TestPossible:
@@ -129,11 +133,19 @@ class TestWindowIntersection:
         graded = grade_exposure(exposure(), WINDOW, history(run(sha=OTHER, at=early)))
         assert graded.grade is Grade.POSSIBLE
 
-    def test_run_after_remediation_does_not_confirm(self):
+    def test_rebuilding_the_old_commit_after_the_fix_still_confirms(self):
+        # The fix landed on 11-25, but checking out the old commit on 11-26 —
+        # while the registry still served the artifact — installs it anyway.
         exp = exposure(until=datetime(2025, 11, 25, 12, tzinfo=timezone.utc))
-        after = datetime(2025, 11, 26, tzinfo=timezone.utc)  # in window, after the fix
+        after = datetime(2025, 11, 26, tzinfo=timezone.utc)
         graded = grade_exposure(exp, WINDOW, history(run(at=after)))
-        assert graded.grade is Grade.LIKELY  # on the commit, but outside the pin's life
+        assert graded.grade is Grade.CONFIRMED
+
+    def test_run_after_the_artifact_was_pulled_is_only_likely(self):
+        after_window = datetime(2025, 11, 28, tzinfo=timezone.utc)
+        graded = grade_exposure(exposure(), WINDOW, history(run(at=after_window)))
+        assert graded.grade is Grade.LIKELY
+        assert any("no longer served" in e for e in graded.evidence)
 
     def test_still_pinned_exposure_uses_the_window_end(self):
         exp = exposure(until=None)
@@ -188,12 +200,12 @@ class TestFindingRollup:
         return RepoFinding(repo=Path("/tmp/repo"), exposures=list(exposures))
 
     def test_worst_grade_wins(self):
-        # One exposure has a run on its own commit (CONFIRMED); the other only
-        # coincides in time (LIKELY). The repo is graded by the strongest.
+        # One exposure has a run on its own commit (CONFIRMED); the other has no
+        # run of its own (POSSIBLE). The repo is graded by the strongest.
         graded = grade_finding(
             self._finding(exposure(), exposure(commit=OTHER)), WINDOW, history(run())
         )
-        assert {g.grade for g in graded.graded} == {Grade.CONFIRMED, Grade.LIKELY}
+        assert {g.grade for g in graded.graded} == {Grade.CONFIRMED, Grade.POSSIBLE}
         assert graded.worst_grade is Grade.CONFIRMED
 
     def test_no_exposures_means_no_evidence_and_no_rotation(self):
@@ -266,17 +278,36 @@ class TestInstallDetection:
         repo, sha = self._repo(tmp_path, {
             ".github/workflows/ci.yml": "jobs:\n  test:\n    steps:\n      - run: npm ci\n",
         })
-        assert installs_from_workflows(repo, sha) is True
+        assert installs_from_workflows(repo, sha, ".github/workflows/ci.yml") is True
+
+    def test_another_workflow_in_the_repo_does_not_answer_for_this_run(self, tmp_path):
+        # A docs workflow installs nothing even though ci.yml runs npm ci.
+        repo, sha = self._repo(tmp_path, {
+            ".github/workflows/ci.yml": "jobs:\n  test:\n    steps:\n      - run: npm ci\n",
+            ".github/workflows/docs.yml": "jobs:\n  docs:\n    steps:\n      - run: make docs\n",
+        })
+        assert installs_from_workflows(repo, sha, ".github/workflows/docs.yml") is False
+
+    def test_unknown_workflow_path_is_undecidable(self, tmp_path):
+        repo, sha = self._repo(tmp_path, {
+            ".github/workflows/ci.yml": "jobs:\n  test:\n    steps:\n      - run: npm ci\n",
+        })
+        assert installs_from_workflows(repo, sha, None) is None
 
     def test_other_ecosystem_is_false(self, tmp_path):
         repo, sha = self._repo(tmp_path, {
             ".github/workflows/ci.yml": "jobs:\n  test:\n    steps:\n      - run: pip install -e .\n",
         })
-        assert installs_from_workflows(repo, sha) is False
+        assert installs_from_workflows(repo, sha, ".github/workflows/ci.yml") is False
 
-    def test_no_workflows_is_undecidable(self, tmp_path):
+    def test_missing_file_at_that_commit_is_undecidable(self, tmp_path):
         repo, sha = self._repo(tmp_path, {"README.md": "hi"})
-        assert installs_from_workflows(repo, sha) is None
+        assert installs_from_workflows(repo, sha, ".github/workflows/ci.yml") is None
+
+    def test_unrecognised_event_cannot_confirm(self, tmp_path):
+        # An issue_comment run does not check out this commit's tree.
+        graded = grade_exposure(exposure(), WINDOW, history(run(event="issue_comment")))
+        assert graded.grade is Grade.LIKELY
 
     def test_ambiguous_step_name_cannot_confirm(self, tmp_path):
         # A step merely named "Install" may install anything; guessing would
@@ -284,13 +315,77 @@ class TestInstallDetection:
         repo, sha = self._repo(tmp_path, {
             ".github/workflows/ci.yml": "jobs:\n  test:\n    steps:\n      - name: Install\n        run: make bootstrap\n",
         })
-        assert installs_from_workflows(repo, sha) is False
+        assert installs_from_workflows(repo, sha, ".github/workflows/ci.yml") is False
 
-    def test_annotate_uses_one_answer_per_commit(self, tmp_path):
+    def test_annotate_answers_per_commit_and_workflow(self, tmp_path):
         repo, sha = self._repo(tmp_path, {
             ".github/workflows/ci.yml": "jobs:\n  test:\n    steps:\n      - run: npm ci\n",
+            ".github/workflows/docs.yml": "jobs:\n  docs:\n    steps:\n      - run: make docs\n",
         })
-        records = (run(sha=sha, installs=None, run_id="1"),
-                   run(sha=sha, installs=None, run_id="2"))
+        records = (
+            RunRecord(run_id="1", head_sha=sha, started_at=WINDOW.window_start,
+                      workflow="CI", workflow_path=".github/workflows/ci.yml"),
+            RunRecord(run_id="2", head_sha=sha, started_at=WINDOW.window_start,
+                      workflow="Docs", workflow_path=".github/workflows/docs.yml"),
+        )
         annotated = annotate_installs(repo, records)
-        assert [r.installs_dependencies for r in annotated] == [True, True]
+        assert [r.installs_dependencies for r in annotated] == [True, False]
+
+
+class TestPullRequestRuns:
+    """A pull_request run installs a merge of head and base, not this tree."""
+
+    def test_pull_request_run_cannot_confirm(self):
+        graded = grade_exposure(exposure(), WINDOW,
+                                history(run(event="pull_request")))
+        assert graded.grade is Grade.LIKELY
+        assert any("merge of head and base" in e for e in graded.evidence)
+
+    def test_push_run_can_confirm(self):
+        graded = grade_exposure(exposure(), WINDOW, history(run(event="push")))
+        assert graded.grade is Grade.CONFIRMED
+
+
+class TestRunListParsing:
+    """The collector is tested directly, on the API's own shape."""
+
+    def _payload(self, **overrides):
+        item = {
+            "id": 42, "head_sha": COMMIT, "name": "CI", "event": "push",
+            "run_started_at": "2025-11-25T10:00:00Z",
+            "created_at": "2025-11-25T09:59:00Z", "run_attempt": 2,
+        }
+        item.update(overrides)
+        return json.dumps({"workflow_runs": [item]})
+
+    def test_fields_are_mapped(self):
+        parsed = parse_run_list(self._payload(), source="test")
+        record = parsed.records[0]
+        assert record.run_id == "42" and record.event == "push"
+        assert record.attempt == 2
+        # A re-run rewrote run_started_at; created_at keeps the original time.
+        assert record.at == datetime(2025, 11, 25, 9, 59, tzinfo=timezone.utc)
+
+    def test_queued_run_without_start_is_skipped_and_noted(self):
+        parsed = parse_run_list(
+            self._payload(run_started_at=None, created_at=None), source="test"
+        )
+        assert parsed.records == ()
+        assert "without a start time" in parsed.source
+
+    def test_zero_date_does_not_become_a_horizon(self):
+        parsed = parse_run_list(
+            self._payload(run_started_at="0001-01-01T00:00:00Z", created_at=None),
+            source="test",
+        )
+        assert parsed.records == ()
+        assert not parsed.covers(datetime(2025, 1, 1, tzinfo=timezone.utc))
+
+    def test_coverage_is_what_was_requested_not_what_came_back(self):
+        asked = datetime(2025, 11, 1, tzinfo=timezone.utc)
+        parsed = parse_run_list(self._payload(), source="test", covered_from=asked)
+        assert parsed.covers(asked)
+        assert not parsed.covers(asked - timedelta(days=1))
+
+    def test_empty_response(self):
+        assert parse_run_list("", source="test").records == ()

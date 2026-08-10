@@ -21,8 +21,10 @@ runs included — the match by SHA holds. But GitHub checks out an ephemeral
 *merge* commit for `pull_request` events, so what such a run installed is the
 merge of head and base, not the head snapshot alone.
 
-**Change**: grading matches on `headSha` as designed; the merge-commit caveat is
-documented as a limitation of what a PR run can confirm.
+**Change**: grading matches on `headSha` as designed, but only for events that
+check out the head commit (`push`, `workflow_dispatch`, `schedule`, `release`). A
+`pull_request` run installs the merge of head and base, so it can support a grade
+and never confirm one. Later measurement (E6) showed why the allow-list matters.
 
 ## E2 — Are look-alike lockfile names a real hazard or a hypothetical one?
 
@@ -128,3 +130,31 @@ move an install out of the window it actually happened in.
 a re-run months later cannot erase an in-window install. Covered by a regression
 test rather than by this experiment, which could only establish that the field
 exists and is populated.
+
+## E6 — Does the collector actually see the runs that matter?
+
+**Assumption**: reading the most recent 200 runs is enough to find the one that
+installed the malicious version.
+
+**Method**: query real run history for a date range through the API, for this
+repository and for `axios/axios`.
+
+**Result**: `axios/axios` produced **297 runs in nine days** — three pages. Any
+fixed "recent N" cap would have silently dropped the older runs in a busy
+repository, which is exactly where an incident lands. The same query also
+surfaced event types the grading rules had not considered: `issue_comment`,
+`issues`, `pull_request_review_comment`, and `dynamic`. Those runs carry the
+default branch's `head_sha` but execute a workflow that may install nothing, so
+attributing another workflow's `npm ci` to them would have confirmed an
+execution that never happened.
+
+**Changes**: the collector asks for an explicit date range and follows every page,
+so coverage is *what was requested* rather than an inference from page fullness.
+Install detection now reads only the workflow file that defines the run
+(`workflow_runs[].path`), not every workflow at that commit. Events outside the
+head-checkout allow-list cannot confirm.
+
+**Verification**: the range query returns 7 runs for this repository and 0 for a
+range with no activity; `axios/axios` returns all 297; per-workflow detection
+answers `True` for a `ci.yml` running `npm ci` and `False` for a `docs.yml`
+beside it at the same commit.
