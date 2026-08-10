@@ -158,11 +158,25 @@ class OrgReport:
                             key=lambda i: (order.get(i.grade, 3), i.repo, i.secret)))
 
     @property
+    def rotation_required(self) -> bool:
+        """Whether a responder has credentials to act on.
+
+        True when items were named *or* a repository's credentials are at risk but
+        could not be listed — an empty item list is not an all-clear.
+        """
+        return bool(self.rotation_items) or any(r.unnamed for r in self.rotations)
+
+    @property
+    def unnamed_rotations(self) -> tuple[str, ...]:
+        """Repositories whose credentials must be rotated but could not be named."""
+        return tuple(f"{r.repo}: {note}" for r in self.rotations for note in r.unnamed)
+
+    @property
     def rotation_notes(self) -> tuple[str, ...]:
         """Per-repository caveats, deduplicated, prefixed with the repo they came from."""
         seen, notes = set(), []
         for rotation in self.rotations:
-            for note in rotation.notes:
+            for note in (*rotation.unnamed, *rotation.notes):
                 line = f"{rotation.repo}: {note}"
                 if line not in seen:
                     seen.add(line)
@@ -322,8 +336,9 @@ def render_report(report: OrgReport) -> str:
             runs_cited = f" (run {', '.join(item.run_ids)})" if item.run_ids else ""
             lines.append(f"  [{item.grade.value:11s}] {item.repo}: {item.secret}"
                          f"{scope}{runs_cited} — {item.reason}")
-    elif report.rotation_notes:
-        lines.append("rotate: no credential could be named — read the caveats below")
+    elif report.unnamed_rotations:
+        lines.append("rotate: credentials are at risk but could not be named")
+        lines += [f"  {note}" for note in report.unnamed_rotations]
     else:
         lines.append("rotate: nothing")
 

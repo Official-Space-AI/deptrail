@@ -1,0 +1,351 @@
+"""The `deptrail` command: point it at an advisory and an organization, get a
+timeline and a rotation list.
+
+Three entry points, in the order someone meets them:
+
+- ``deptrail demo`` — the whole judgment flow on a mock infection, offline, in
+  seconds. No token, no network, no waiting: the first thing to run.
+- ``deptrail scan --repo <path>`` — local clones. CI evidence needs a repository
+  to ask about, so pass ``--slug owner/name`` to collect it; without a slug the
+  report says so rather than implying the runs were checked.
+- ``deptrail scan --org <org>`` — clone (or refresh) every repository in an
+  organization and judge them all.
+
+Exit codes are the contract, and a caller must never have to parse prose to learn
+what happened: ``0`` nothing to do and absence established, ``1`` credentials to
+rotate, ``2`` the scan could not prove absence (something failed, was truncated,
+or was unreadable), ``3`` bad input or a missing tool. Every path returns one of
+these — a traceback escaping as exit 1 would read as "rotate now".
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
+
+from .demo import advisory_path, build, runs_provider, secrets_provider
+from .grading import RunHistory, annotate_installs, runs_from_github
+from .ioc import Advisory, IocError, bundled_feeds, load_advisory
+from .org import OrgReport, render_report, scan_organization
+from .report import render_html
+
+EXIT_CLEAN = 0
+EXIT_ROTATE = 1
+EXIT_INCOMPLETE = 2
+EXIT_BAD_INPUT = 3
+
+
+class Parser(argparse.ArgumentParser):
+    """Argparse exits 2 on a usage error, which is this tool's "incomplete scan"."""
+
+    def error(self, message: str):  # pragma: no cover - argparse plumbing
+        self.print_usage(sys.stderr)
+        print(f"{self.prog}: {message}", file=sys.stderr)
+        raise SystemExit(EXIT_BAD_INPUT)
+
+
+def _exit_code(report: OrgReport) -> int:
+    """One code per outcome, with no overlap.
+
+    Rotation wins over incompleteness: a responder who has credentials to rotate
+    must act, and the report states separately that the scan was incomplete.
+    """
+    if report.rotation_required:
+        return EXIT_ROTATE
+    return EXIT_CLEAN if report.proves_absence else EXIT_INCOMPLETE
+
+
+def _emit(report: OrgReport, args: argparse.Namespace, advisory: Advisory | None) -> int:
+    """Write the report where it was asked for. A write failure is not a verdict."""
+    if args.format == "json":
+        text = json.dumps(_as_dict(report, advisory), indent=2)
+    elif args.format == "html":
+        text = render_html(report, advisory)
+    else:
+        text = render_report(report)
+    if not args.output:
+        print(text)
+        return EXIT_CLEAN
+    try:
+        Path(args.output).write_text(text + "\n", encoding="utf-8")
+    except OSError as e:
+        print(f"could not write {args.output}: {e}", file=sys.stderr)
+        return EXIT_BAD_INPUT
+    print(f"wrote {args.output}", file=sys.stderr)
+    return EXIT_CLEAN
+
+
+def _as_dict(report: OrgReport, advisory: Advisory | None) -> dict:
+    """The report as data: the decision first, then the evidence behind it."""
+    payload = {
+        "decision": {
+            "exit_code": _exit_code(report),
+            "rotation_required": report.rotation_required,
+            "scan_complete": report.proves_absence,
+            "worst_grade": report.worst_grade.value,
+        },
+        "advisory": {"id": report.advisory_id, "name": report.advisory_name},
+        "repos_scanned": report.repos_scanned,
+        "exposed_repos": list(report.exposed_repos),
+        "timeline": [
+            {
+                "repo": e.repo, "package": e.package, "version": e.exposure.version,
+                "lockfile": e.exposure.lockfile_path, "grade": e.grade.value,
+                "since": e.exposure.since.isoformat(),
+                "until": e.exposure.until.isoformat() if e.exposure.until else None,
+                "commit": e.exposure.commit, "chain": list(e.exposure.chain),
+                "evidence": list(e.evidence), "run_ids": list(e.run_ids),
+            }
+            for e in report.timeline if e.probably_installed
+        ],
+        "set_aside": [
+            {"repo": e.repo, "package": e.package, "version": e.exposure.version,
+             "lockfile": e.exposure.lockfile_path, "grade": e.grade.value}
+            for e in report.set_aside
+        ],
+        "rotate": [
+            {"repo": i.repo, "secret": i.secret, "scope": i.scope.value,
+             "grade": i.grade.value, "reason": i.reason, "run_ids": list(i.run_ids)}
+            for i in report.rotation_items
+        ],
+        "rotate_unnamed": list(report.unnamed_rotations),
+        "errors": list(report.errors),
+        "caveats": list(report.notes) + list(report.rotation_notes),
+    }
+    if advisory is not None:
+        payload["advisory"].update({
+            "window": {"start": advisory.window[0].isoformat(),
+                       "end": advisory.window[1].isoformat()},
+            "coverage": advisory.coverage,
+            "sources": list(advisory.sources),
+            "packages": [{"name": p.name, "versions": list(p.versions)}
+                         for p in advisory.packages],
+        })
+    return payload
+
+
+def _expected_remote(org: str, name: str) -> tuple[str, ...]:
+    base = f"github.com/{org}/{name}"
+    return (f"https://{base}.git", f"https://{base}", f"git@github.com:{org}/{name}.git")
+
+
+def _clone_org(org: str, workdir: Path, *, limit: int,
+               ) -> tuple[list[tuple[str, Path]], list[str]]:
+    """Clone or refresh every repository in an organization.
+
+    Clones are full, never shallow: a truncated history cannot answer when a
+    version was installed. Each repository is kept under its own organization
+    directory and its remote is verified, so two organizations that share a
+    repository name cannot be judged with each other's history. Anything that
+    fails becomes an error the report must carry — a repository nobody looked at
+    may not read as clean.
+    """
+    errors: list[str] = []
+    listing = subprocess.run(
+        ["gh", "repo", "list", org, "--limit", str(limit), "--json", "name",
+         "--jq", ".[].name"],
+        check=True, capture_output=True, text=True,
+    ).stdout.split()
+    if len(listing) >= limit:
+        errors.append(
+            f"{org}: repository list hit the --limit of {limit}; repositories beyond "
+            "it were not scanned (raise --limit)"
+        )
+    root = workdir / org
+    root.mkdir(parents=True, exist_ok=True)
+    repos = []
+    for name in listing:
+        dest = root / name
+        if (dest / ".git").exists():
+            remote = subprocess.run(
+                ["git", "-C", str(dest), "remote", "get-url", "origin"],
+                capture_output=True, text=True,
+            ).stdout.strip()
+            if remote and not remote.rstrip("/").startswith(_expected_remote(org, name)):
+                errors.append(
+                    f"{name}: cached clone at {dest} points at {remote}, not {org}/{name}"
+                )
+                continue
+            fetch = subprocess.run(["git", "-C", str(dest), "fetch", "--prune", "--quiet"],
+                                   capture_output=True, text=True)
+            if fetch.returncode != 0:
+                errors.append(
+                    f"{name}: fetch failed, the cached history may be stale "
+                    f"({fetch.stderr.strip()[:120]})"
+                )
+        else:
+            print(f"cloning {org}/{name}", file=sys.stderr)
+            clone = subprocess.run(
+                ["git", "clone", "--quiet", f"https://github.com/{org}/{name}.git",
+                 str(dest)], capture_output=True, text=True,
+            )
+            if clone.returncode != 0:
+                errors.append(f"{name}: clone failed ({clone.stderr.strip()[:120]})")
+                continue
+        repos.append((name, dest))
+    return repos, errors
+
+
+def _github_runs(slug_of, window: tuple[datetime, datetime], *, annotate: bool):
+    """CI history for a repository, restricted to the advisory's window."""
+    since, until = window
+
+    def provider(path: Path, name: str) -> RunHistory:
+        history = runs_from_github(slug_of(name),
+                                   since=since - timedelta(days=1),
+                                   until=until + timedelta(days=1))
+        if annotate:
+            history = RunHistory(
+                records=annotate_installs(path, history.records),
+                oldest_available=history.oldest_available, source=history.source,
+            )
+        return history
+    return provider
+
+
+def _github_secrets(slug_of):
+    def provider(path: Path, name: str) -> tuple[str, ...]:
+        raw = subprocess.run(
+            ["gh", "secret", "list", "--repo", slug_of(name), "--json", "name"],
+            check=True, capture_output=True, text=True,
+        ).stdout
+        return tuple(item["name"] for item in json.loads(raw or "[]"))
+    return provider
+
+
+def _uncollected_runs(reason: str):
+    def provider(path: Path, name: str) -> RunHistory:
+        return RunHistory(source=reason)
+    return provider
+
+
+def cmd_demo(args: argparse.Namespace) -> int:
+    root = Path(args.workdir)
+    try:
+        repos = build(root)
+    except FileExistsError as e:
+        print(f"{e}", file=sys.stderr)
+        return EXIT_BAD_INPUT
+    advisory = load_advisory(advisory_path(root))
+    print(f"built {len(repos)} synthetic demo repositories in {root} "
+          "(not a real incident)", file=sys.stderr)
+    report = scan_organization(repos, advisory.plan(),
+                               runs=runs_provider(root), secrets=secrets_provider())
+    written = _emit(report, args, advisory)
+    return written or _exit_code(report)
+
+
+def cmd_scan(args: argparse.Namespace) -> int:
+    if args.org and args.repo:
+        print("pass either --org or --repo, not both: they would be judged with "
+              "different CI evidence", file=sys.stderr)
+        return EXIT_BAD_INPUT
+    try:
+        advisory = load_advisory(args.ioc)
+    except IocError as e:
+        print(f"advisory rejected: {e}", file=sys.stderr)
+        return EXIT_BAD_INPUT
+
+    errors: list[str] = []
+    if args.org:
+        repos, errors = _clone_org(args.org, Path(args.workdir), limit=args.limit)
+        slug_of = lambda name: f"{args.org}/{name}"  # noqa: E731
+    else:
+        repos = [(Path(p).name, Path(p)) for p in args.repo]
+        slug_of = (lambda name: args.slug) if args.slug else None
+    if not repos and not errors:
+        print("nothing to scan: pass --org or one or more --repo paths", file=sys.stderr)
+        return EXIT_BAD_INPUT
+
+    runs = _uncollected_runs("CI evidence not collected")
+    secrets = None
+    if args.no_ci:
+        runs = _uncollected_runs("CI evidence not collected (--no-ci)")
+    elif slug_of is not None:
+        runs = _github_runs(slug_of, advisory.window, annotate=True)
+        secrets = _github_secrets(slug_of)
+    else:
+        runs = _uncollected_runs(
+            "CI evidence not collected (no --slug given, so no repository to query)"
+        )
+
+    # Even when every repository was skipped, the report must carry why: dropping
+    # the errors here would turn "we could not look" into "there was nothing".
+    report = scan_organization(repos, advisory.plan(), runs=runs, secrets=secrets)
+    report.errors[:0] = errors
+    written = _emit(report, args, advisory)
+    return written or _exit_code(report)
+
+
+def cmd_feeds(args: argparse.Namespace) -> int:
+    for name in bundled_feeds():
+        advisory = load_advisory(name)
+        print(f"{name}\t{advisory.id}\t{advisory.name}\t[{advisory.coverage}]")
+    return EXIT_CLEAN
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = Parser(
+        prog="deptrail",
+        description="Judge which repositories installed a compromised package, "
+                    "and which credentials that puts at risk.",
+    )
+    parser.set_defaults(func=None)
+    subs = parser.add_subparsers(dest="command")
+
+    def add_output(sub: argparse.ArgumentParser) -> None:
+        sub.add_argument("--format", choices=("text", "json", "html"), default="text")
+        sub.add_argument("--output", help="write the report to this file (any format)")
+
+    demo = subs.add_parser("demo", help="judge a bundled mock infection, offline")
+    demo.add_argument("--workdir", default=".deptrail-demo",
+                      help="where to build the demo repositories")
+    add_output(demo)
+    demo.set_defaults(func=cmd_demo)
+
+    scan = subs.add_parser("scan", help="judge real repositories against an advisory")
+    scan.add_argument("--ioc", required=True,
+                      help="advisory file path, or a bundled feed name")
+    scan.add_argument("--org", help="GitHub organization to clone and judge")
+    scan.add_argument("--repo", action="append", default=[],
+                      help="path to a local clone (repeatable)")
+    scan.add_argument("--slug", help="owner/name of the --repo clone, so its CI runs "
+                                    "and secret names can be read")
+    scan.add_argument("--workdir", default=".deptrail-cache",
+                      help="where organization clones are kept")
+    scan.add_argument("--limit", type=int, default=200,
+                      help="maximum repositories to list from the organization")
+    scan.add_argument("--no-ci", action="store_true",
+                      help="skip CI and secret lookups (no token needed)")
+    add_output(scan)
+    scan.set_defaults(func=cmd_scan)
+
+    feeds = subs.add_parser("feeds", help="list bundled advisories")
+    feeds.set_defaults(func=cmd_feeds, format="text", output=None)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.func is None:
+        parser.print_help()
+        return EXIT_BAD_INPUT
+    try:
+        return args.func(args)
+    except FileNotFoundError as e:
+        # A missing tool is bad input, not a verdict: exiting 1 here would read as
+        # "rotate these credentials".
+        print(f"a required tool is missing: {e}", file=sys.stderr)
+        return EXIT_BAD_INPUT
+    except subprocess.CalledProcessError as e:
+        detail = (e.stderr or "").strip()[:300]
+        print(f"a command failed: {' '.join(e.cmd)}\n{detail}", file=sys.stderr)
+        return EXIT_INCOMPLETE
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())
