@@ -174,7 +174,7 @@ class TestReviewRegressions:
         ])
         finding = scan_repo(repo, WINDOW)
         assert finding.verdict is Verdict.EXPOSED
-        assert any("non-monotonic" in w for w in finding.warnings)
+        assert any("predates its parent" in w for w in finding.warnings)
 
     def test_rebase_rewritten_committer_dates_still_detected(self, tmp_path):
         # Rebase rewrites committer dates to merge day; author dates keep the truth.
