@@ -228,12 +228,14 @@ class TestFindingRollup:
         assert graded.verdict is Verdict.INDETERMINATE
         assert graded.warnings == ["shallow clone: truncated"]
 
-    def test_expired_records_add_a_finding_level_warning(self):
+    def test_expired_records_are_noted_apart_from_history_warnings(self):
         recent = RunHistory(records=(), oldest_available=datetime(2026, 8, 1, tzinfo=timezone.utc),
                             source="gh")
         graded = grade_finding(self._finding(exposure()), WINDOW, recent)
-        assert any("absence of a run is not absence of an install" in w
-                   for w in graded.warnings)
+        # A CI-coverage note must not be mistaken for an unreadable history.
+        assert any("absence of a run is not absence of an install" in n
+                   for n in graded.ci_notes)
+        assert graded.warnings == []
 
     def test_warning_is_not_repeated_per_exposure(self):
         recent = RunHistory(records=(), oldest_available=datetime(2026, 8, 1, tzinfo=timezone.utc),
@@ -241,7 +243,7 @@ class TestFindingRollup:
         graded = grade_finding(
             self._finding(exposure(), exposure(commit=OTHER)), WINDOW, recent
         )
-        assert sum("absence of a run" in w for w in graded.warnings) == 1
+        assert sum("absence of a run" in n for n in graded.ci_notes) == 1
 
 
 class TestRunHistoryHorizon:

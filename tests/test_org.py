@@ -135,7 +135,10 @@ class TestRotationScope:
         items = report.rotation_items
         assert {i.scope for i in items} == {Scope.DEVELOPER}
         assert {i.secret for i in items} == {"AWS_KEY", "DEPLOY_TOKEN", "NPM_TOKEN"}
-        assert any("locally" in i.reason for i in items)
+        # The reason must not claim the developer held the Actions secrets, only
+        # that the install happened outside CI and those values may also be local.
+        assert any("outside CI" in i.reason for i in items)
+        assert any("investigate that machine" in i.reason for i in items)
 
     def test_secrets_inherit_cannot_be_narrowed(self, tmp_path, plan):
         workflow = "name: CI\non: [push]\njobs:\n  call:\n    secrets: inherit\n    steps:\n      - run: npm ci\n"
@@ -201,7 +204,10 @@ class TestOrgAggregation:
 
         report = scan_organization([("broken", broken), ("api", repo)], plan, runs=flaky)
         assert any("gh unavailable" in e for e in report.errors)
-        assert report.exposed_repos == ("api",)
+        # Losing the CI evidence must not lose the exposure git already proved.
+        assert report.exposed_repos == ("api", "broken")
+        broken_grades = {e.grade for e in report.timeline if e.repo == "broken"}
+        assert broken_grades == {Grade.POSSIBLE}
         assert not report.proves_absence
 
     def test_partial_advisory_never_proves_absence(self, tmp_path):
@@ -398,8 +404,15 @@ class TestDeduplicationAndHonesty:
         report = scan_organization([("api", repo)], plan, runs=no_runs)
         assert report.rotation_items == ()
         assert any("could not be listed" in n for n in report.rotation_notes)
-        text = render_report(report)
-        assert "unavailable" not in text.split("rotate")[1].split("caveats")[0]
+        # The list must not read as an all-clear when nothing could be named.
+        assert "rotate: nothing" not in render_report(report)
+
+    def test_repo_with_no_secrets_says_so(self, tmp_path, plan):
+        repo = make_repo(tmp_path, "api", [("2025-11-25T10:00:00+00:00", "5.6.1")])
+        report = scan_organization([("api", repo)], plan, runs=no_runs,
+                                  secrets=lambda path, name: ())
+        assert report.rotation_items == ()
+        assert any("holds no secrets" in n for n in report.rotation_notes)
 
     def test_github_token_is_context_not_an_action(self, tmp_path, plan):
         workflow = ("name: CI\non: [push]\njobs:\n  test:\n    steps:\n      - run: npm ci\n"
@@ -452,3 +465,40 @@ class TestDeduplicationAndHonesty:
         ))
         assert "chalk@5.6.1" in text
         assert "run 99" in text and "[CONFIRMED  ]" in text
+
+
+class TestEvidenceBeatsPathHeuristic:
+    """codex: a real app can live under examples/; a root install is not proof
+    that a fixture lockfile was installed."""
+
+    def _repo(self, tmp_path, lockfile_dir: str, workflow: str):
+        repo = tmp_path / "app"
+        repo.mkdir()
+        git(repo, "init", "-q")
+        (repo / ".github/workflows").mkdir(parents=True)
+        (repo / ".github/workflows/ci.yml").write_text(workflow)
+        target = repo / lockfile_dir
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "package-lock.json").write_text(lock("5.6.1"))
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "deps", date="2025-11-25T10:00:00+00:00")
+        return repo
+
+    def test_deployed_app_under_examples_is_not_filed_away(self, tmp_path, plan):
+        workflow = ("name: CI\non: [push]\njobs:\n  ship:\n"
+                    "    defaults:\n      run:\n"
+                    "        working-directory: examples/production\n"
+                    "    steps:\n      - run: npm ci\n      - run: deploy\n"
+                    "        env:\n          KEY: ${{ secrets.AWS_KEY }}\n")
+        repo = self._repo(tmp_path, "examples/production", workflow)
+        report = scan_organization([("app", repo)], plan, runs=runs_with(head(repo)),
+                                  secrets=secrets_provider)
+        assert report.exposed_repos == ("app",)
+        assert report.set_aside == ()
+        assert {i.secret for i in report.rotation_items} == {"AWS_KEY"}
+
+    def test_root_install_is_not_credited_with_a_fixture_tree(self, tmp_path, plan):
+        repo = self._repo(tmp_path, "tests/fixtures", CI_WORKFLOW)
+        report = scan_organization([("app", repo)], plan, runs=runs_with(head(repo)),
+                                  secrets=secrets_provider)
+        assert report.set_aside and report.rotation_items == ()
