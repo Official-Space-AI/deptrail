@@ -28,7 +28,11 @@ jobs:
           grep -q "LIKELY     ] docs-site" demo.txt
           grep -q "rotate (3 credential(s))" demo.txt
           grep -q "NPM_TOKEN" demo.txt
-          grep -qv "AWS_ACCESS_KEY" demo.txt
+          # The workflow never reads AWS_ACCESS_KEY, so it must appear nowhere.
+          # (`grep -qv` would pass on any single non-matching line — not the same test.)
+          if grep -q "AWS_ACCESS_KEY" demo.txt; then
+            echo "AWS_ACCESS_KEY must not be on the rotation list"; exit 1
+          fi
           {
             echo "## deptrail demo"
             echo '```'
@@ -36,8 +40,20 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
       - name: exit codes are the contract
+        # Each command's non-zero exit is the thing under test, so it is captured
+        # rather than allowed to abort the step (the default shell runs with -e).
         run: |
           set -uo pipefail
-          deptrail scan --ioc example-demo --repo . --no-ci > /dev/null; test $? -eq 0
-          deptrail scan --ioc no-such-feed --repo . > /dev/null 2>&1; test $? -eq 3
-          deptrail scan --ioc example-demo --repo "$RUNNER_TEMP" --no-ci > /dev/null; test $? -eq 2
+          expect() {
+            local want="$1"; shift
+            local got=0
+            "$@" > /dev/null 2>&1 || got=$?
+            if [ "$got" -ne "$want" ]; then
+              echo "expected exit $want from: $*  (got $got)"
+              exit 1
+            fi
+          }
+          expect 0 deptrail scan --ioc example-demo --repo . --no-ci
+          expect 3 deptrail scan --ioc no-such-feed --repo .
+          expect 2 deptrail scan --ioc example-demo --repo "$RUNNER_TEMP" --no-ci
+          expect 3 deptrail scan --ioc example-demo --org acme --repo .
