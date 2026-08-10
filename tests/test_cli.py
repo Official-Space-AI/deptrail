@@ -403,6 +403,33 @@ class TestUnreadableLockfileDialects:
         assert "npm-shrinkwrap.json" in out
         assert "not judged" not in out
 
+    def test_deno_lockfile_is_recognised(self, tmp_path, capsys):
+        # Deno installs from the npm registry through npm: specifiers, so a name
+        # missing from the table is a repository this tool would call clean.
+        advisory = self._advisory(tmp_path)
+        repo = self._repo(tmp_path, "denoapp", {"deno.lock": '{"version":"4"}'})
+        code = main(["scan", "--ioc", str(advisory), "--repo", str(repo), "--no-ci"])
+        assert code == EXIT_INCOMPLETE
+        assert "deno.lock" in capsys.readouterr().out
+
+    def test_an_incomplete_scan_is_not_painted_green(self, tmp_path):
+        # The banner colour is read before the sentence next to it, so green must
+        # mean a proven all-clear and nothing else.
+        from deptrail.report import GRADE_COLOR
+        from deptrail.grading import Grade
+        advisory = self._advisory(tmp_path)
+        repo = self._repo(tmp_path, "yarnapp2", {
+            "yarn.lock": '"chalk@^5.6.0":\n  version "5.6.1"\n',
+        })
+        target = tmp_path / "r.html"
+        main(["scan", "--ioc", str(advisory), "--repo", str(repo), "--no-ci",
+              "--format", "html", "--output", str(target)])
+        html = target.read_text(encoding="utf-8")
+        banner = next(line for line in html.splitlines() if "class='banner'" in line)
+        assert "cannot prove absence" in banner
+        assert GRADE_COLOR[Grade.NO_EVIDENCE] not in banner, \
+            "an incomplete scan must not wear the all-clear colour"
+
     def test_repository_with_nothing_to_read_is_genuinely_clean(self, tmp_path, capsys):
         advisory = self._advisory(tmp_path)
         repo = self._repo(tmp_path, "pythonapp", {"main.py": "print(1)\n"})

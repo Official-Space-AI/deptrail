@@ -331,3 +331,60 @@ exit codes (`2`, `1`, `0`), plus unit tests for each dialect, for a mixed
 repository, and for a Yarn fixture under `tests/fixtures` that must *not* cost a
 tooling project its all-clear. The demo workflow builds a Yarn project on the
 runner and asserts exit 2 with an empty rotation list.
+
+## E13 — Is "no lockfile we can read" a property of a repository?
+
+**Assumption**: the E12 fix was complete. A repository either had a lockfile this
+tool can read or it did not, so one question per repository was enough.
+
+**Method**: both reviews of the E12 commit were told to build repositories rather
+than read code, and to hunt in two directions at once — shapes that still get a
+false clean, and honest shapes pushed to a false alarm. Nine such repositories were
+built with real git history and scanned.
+
+**Result**: the single per-repository question was wrong in both directions
+simultaneously, which is why it looked right.
+
+*Too permissive.* Any lockfile anywhere in history silenced the check, so exit 0
+came back for: a `package-lock.json` deleted before the window with its
+`package.json` still there — the tree ran unlocked exactly when the malicious
+version was installable; a monorepo where one app was locked and the app beside it
+was not; and a repository whose only lockfile was a test fixture, which cleared the
+deployed root tree it says nothing about. A deployed application under `examples/`
+was also filed away as sample data, even when a workflow named that directory as
+its `working-directory` — the escape hatch that already existed for exposures had
+not been extended to unread trees.
+
+*Too strict.* Every foreign lockfile ever committed denied an all-clear forever, so
+a project that migrated off Yarn years before the incident could never be cleared
+again. `has_manifest` omitted the exact-basename check its sibling function
+documents, so a single `metadata-package.json` in a Python repository produced exit
+2; and because it returned a boolean rather than paths, a `tests/fixtures/package.json`
+could not be set aside the way a fixture lockfile is.
+
+Two further defects came from the same "per repository" habit elsewhere. An
+exposure wins the aggregate verdict, and both the completeness claim and the
+repo-wide rotation fallback were keyed on that verdict — so in a repository where
+one tree was exposed and a second npm lockfile failed to parse, the report claimed
+`scan_complete: true` and dropped every credential the narrow evidence did not
+name. And adding `npm-shrinkwrap.json` support in E12 had created a false
+*exposure*: npm ignores `package-lock.json` when a shrinkwrap sits beside it, so a
+malicious pin in the file npm never read was reported as real.
+
+**Changes**: lock coverage is now judged per path over the window. Existence
+intervals are read from git — a file whose contents cannot be parsed still says
+exactly when it was there — and a lockfile governs only its own directory and the
+directories beneath it, which is how npm workspaces actually resolve. A
+`package.json` no lockfile governed during the window becomes an unread tree
+carrying its own path, so the fixture rule and the workflow-names-the-directory
+rule both apply to it. Precedence is decided per commit. `proves_absence` and the
+rotation fallback check lost evidence independently of the aggregate verdict.
+`deno.lock` joined the table. The HTML banner no longer wears the all-clear colour
+when the scan could not prove absence, and the Action annotates exit 2 as a warning
+instead of passing silently.
+
+**Verification**: the nine repositories are pinned as tests, each asserting the
+exit code that was wrong before. Two properties are now tested in both directions,
+which is what the round was really about: a lockfile must clear the tree it governs
+and only that tree, and a foreign lockfile must count during the window and only
+during the window.

@@ -107,10 +107,17 @@ What the tool cannot do, it says out loud — a scan that could not look must ne
 read as a scan that found nothing.
 
 - **npm lockfiles only.** `package-lock.json` and `npm-shrinkwrap.json` are parsed.
-  A project locked with Yarn or pnpm is reported as **not judged**, exits `2`, and
-  produces no rotation list — neither cleared nor accused ([#17](https://github.com/Official-Space-AI/deptrail/issues/17)).
+  A tree locked with Yarn, pnpm, Bun or Deno is reported as **not judged**, exits
+  `2`, and produces no rotation list — neither cleared nor accused
+  ([#17](https://github.com/Official-Space-AI/deptrail/issues/17)). The same applies
+  to a `package.json` that no lockfile governed while the versions were installable.
 - **A shallow clone cannot be cleared.** `actions/checkout` is depth-1 by default,
-  and truncated history hides pins. Use `fetch-depth: 0`.
+  and truncated history hides pins. Use `fetch-depth: 0`. Today a shallow clone
+  exits `1` where an unreadable tree exits `2`; reconciling those is
+  [#20](https://github.com/Official-Space-AI/deptrail/issues/20).
+- **Submodules are not crossed.** `git log` does not descend into a gitlink, so a
+  Node project inside a submodule is invisible
+  ([#21](https://github.com/Official-Space-AI/deptrail/issues/21)).
 - **CI evidence is bounded by retention.** GitHub keeps run records for about 90
   days; older incidents can reach `LIKELY` but not `CONFIRMED`.
 - **Secret values are never visible**, only names — so the report tells you what to

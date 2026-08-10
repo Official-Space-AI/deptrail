@@ -341,6 +341,28 @@ class TestUnreadableTrees:
         # The reason belongs under its own heading, printed once.
         assert text.count("Yarn lockfiles are not parsed yet") == 1
 
+    def test_a_workflow_naming_the_directory_beats_the_heuristic(self, tmp_path, plan):
+        # An application that really lives under examples/ must not be filed away
+        # as sample data: the repository would be cleared on a directory name.
+        repo = tmp_path / "deployed-example"
+        repo.mkdir()
+        git(repo, "init", "-q")
+        (repo / ".github/workflows").mkdir(parents=True)
+        (repo / ".github/workflows/ci.yml").write_text(
+            CI_WORKFLOW.replace("- run: npm ci",
+                                "- run: yarn --frozen-lockfile\n        "
+                                "working-directory: examples/production")
+        )
+        (repo / "examples/production").mkdir(parents=True)
+        (repo / "examples/production/yarn.lock").write_text(
+            '"chalk@^5.6.0":\n  version "5.6.1"\n')
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "deploy the example",
+            date="2025-11-25T10:00:00+00:00")
+        report = scan_organization([("deployed-example", repo)], plan, runs=no_runs)
+        assert report.unread, "the workflow names this directory, so it is deployed"
+        assert not report.proves_absence
+
     def test_fixture_yarn_lockfile_does_not_cost_the_verdict(self, tmp_path, plan):
         # A tooling repo that keeps a Yarn fixture is not a repo with an unread
         # dependency tree; treating it as one would deny an all-clear to projects
@@ -368,6 +390,44 @@ class TestUnreadableTrees:
         assert report.rotation_items, "the npm tree's exposure still rotates"
         assert report.unread and "mobile/yarn.lock" in report.unread[0]
         assert not report.proves_absence
+
+
+class TestAnExposureMustNotMaskLostEvidence:
+    """Review of #16: an exposure wins the aggregate verdict, and both the
+    completeness claim and the rotation fallback were keyed on that verdict — so a
+    second, unreadable tree in the same repository vanished from both."""
+
+    def _mixed(self, tmp_path):
+        repo = make_repo(tmp_path, "api", [("2025-11-25T10:00:00+00:00", "5.6.1")])
+        (repo / "service").mkdir()
+        (repo / "service/package-lock.json").write_text("{ not json")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "second tree", date="2025-11-25T11:00:00+00:00")
+        return repo
+
+    def test_completeness_is_not_claimed(self, tmp_path, plan):
+        repo = self._mixed(tmp_path)
+        report = scan_organization([("api", repo)], plan,
+                                   runs=runs_with(exposing_commit(repo)),
+                                   secrets=secrets_provider)
+        assert report.rotation_items, "the readable tree's exposure still rotates"
+        assert not report.proves_absence, \
+            "one tree was unreadable, so the scan saw less than everything"
+
+    def test_the_unreadable_tree_widens_the_rotation_list(self, tmp_path, plan):
+        # The confirmed workflow names DEPLOY_TOKEN and NPM_TOKEN; AWS_KEY is only
+        # reachable through the repo-wide fallback, which the verdict gate dropped.
+        repo = self._mixed(tmp_path)
+        report = scan_organization([("api", repo)], plan,
+                                   runs=runs_with(exposing_commit(repo)),
+                                   secrets=secrets_provider)
+        secrets = {i.secret for i in report.rotation_items}
+        assert "AWS_KEY" in secrets, secrets
+        assert {"DEPLOY_TOKEN", "NPM_TOKEN"} <= secrets
+        # The narrow evidence keeps its stronger grade after the merge.
+        by_secret = {i.secret: i.grade for i in report.rotation_items}
+        assert by_secret["NPM_TOKEN"] is Grade.CONFIRMED
+        assert by_secret["AWS_KEY"] is Grade.POSSIBLE
 
 
 class TestMultipleWorkflows:

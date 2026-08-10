@@ -26,12 +26,24 @@ Judgment model (shaped by adversarial review — see PR #8):
   warnings, and a repo with warnings and no exposures is INDETERMINATE, not
   CLEAN.
 - **A tree we cannot read is not a tree without exposure.** Only npm lockfiles
-  are parsed. A project locked with Yarn or pnpm, or a Node project with no
-  lockfile in its history at all, is recorded in ``unread_trees`` and makes the
-  repo INDETERMINATE — reporting CLEAN there would answer a question nobody
-  could have looked at (found by replaying such repositories, see
-  ``docs/experiments.md`` E12). Unlike a warning, it does not raise a grade:
-  nothing suggests exposure either, so the honest outcome is "not judged".
+  are parsed. A tree locked with Yarn or pnpm, or a ``package.json`` no lockfile
+  governed, is recorded in ``unread_trees`` and makes the repo INDETERMINATE —
+  reporting CLEAN there would answer a question nobody could have looked at
+  (found by replaying such repositories, see ``docs/experiments.md`` E12).
+  Unlike a warning, it does not raise a grade: nothing suggests exposure either,
+  so the honest outcome is "not judged".
+- **Lock coverage is a property of a tree at a time, not of a repository.** One
+  directory's lockfile says nothing about the directory beside it, and a lockfile
+  deleted before the malicious version was published governed nothing while it
+  mattered. Both are judged per path over the window, using existence intervals
+  read from git — a file whose *contents* we cannot parse still tells us exactly
+  when it was there. Judging this per repository was wrong in both directions at
+  once: any lockfile anywhere silenced every unlocked tree, and any foreign
+  lockfile ever committed denied an all-clear forever (E13).
+- **Only the lockfile npm would have read testifies.** When a directory holds
+  both ``npm-shrinkwrap.json`` and ``package-lock.json``, npm ignores the latter,
+  so at those commits so do we; scanning both invents exposure from a file that
+  was never installed.
 
 The attack window is inclusive on both ends; held intervals are half-open
 ``[since, until)``.
@@ -43,7 +55,7 @@ import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from .lockfile import LockfileModel, LockfileParseError, parse_lockfile
 
@@ -60,6 +72,7 @@ FOREIGN_LOCKFILES = {
     "shrinkwrap.yaml": "pnpm (v3 and earlier)",
     "bun.lock": "Bun",
     "bun.lockb": "Bun",
+    "deno.lock": "Deno",  # locks npm: specifiers alongside its own
 }
 MANIFEST = "package.json"
 DATE_DIVERGENCE_WARN = timedelta(hours=48)
@@ -230,15 +243,74 @@ def lockfile_paths(repo: Path) -> list[str]:
     return discovered_lockfiles(repo)[0]
 
 
-def has_manifest(repo: Path) -> bool:
-    """Whether any commit ever added a ``package.json``.
+def manifest_paths(repo: Path) -> list[str]:
+    """Every ``package.json`` that describes a project, dependencies excluded.
 
-    Asked only when no readable lockfile was found, to tell a Node project whose
-    lock we cannot see from a repository that was never a Node project at all.
-    ``-1`` lets git stop at the first hit instead of walking the whole history.
+    A committed ``node_modules`` carries one manifest per installed package; those
+    describe dependencies, not trees anyone locks, and counting them would bury
+    the report in thousands of entries.
     """
-    return bool(_git(repo, "log", "--all", "--format=%H", "-1",
-                     "--", f"*{MANIFEST}").strip())
+    return [p for p in _paths_with_basename(repo, (MANIFEST,))
+            if "node_modules" not in PurePosixPath(p).parts]
+
+
+def _exists_at(repo: Path, sha: str, path: str) -> bool:
+    """Whether ``path`` is present in one commit's tree. Reads no content."""
+    return subprocess.run(
+        ["git", "-C", str(repo), "cat-file", "-e", f"{sha}:{path}"],
+        capture_output=True,
+    ).returncode == 0
+
+
+def _existed_during(repo: Path, path: str, query: WindowQuery,
+                    children: dict[str, list[str]]) -> bool:
+    """Whether ``path`` was in the tree at any moment overlapping the window.
+
+    A file's *contents* may be unreadable — a Yarn lockfile, a binary lock — but
+    *when it existed* is always readable from git, and a file deleted before the
+    malicious version was published, or added after it was pulled, governed
+    nothing while it mattered. Intervals are closed by the first descendant that
+    no longer has the file, for the same reason exposures are: a sibling branch
+    is not a deletion.
+    """
+    commits = _log_commits(repo, path, all_refs=True)
+    present: dict[str, bool] = {}
+
+    def here(sha: str) -> bool:
+        if sha not in present:
+            present[sha] = _exists_at(repo, sha, path)
+        return present[sha]
+
+    for i, commit in enumerate(commits):
+        if not here(commit.sha):
+            continue
+        until: datetime | None = None
+        forward = _descendants(children, commit.sha)
+        for successor in commits[i + 1:]:
+            if successor.sha in forward and not here(successor.sha):
+                until = successor.late
+                break
+        if commit.early > query.window_end:
+            continue
+        if until is not None and until <= query.window_start:
+            continue
+        return True
+    return False
+
+
+def _governed(directory: str, governing: set[str]) -> bool:
+    """Whether a lockfile in this directory or an ancestor of it applied.
+
+    npm workspaces keep a single lockfile at the workspace root, so an ancestor's
+    lockfile is what governs a package that has none of its own.
+    """
+    current = directory
+    while True:
+        if current in governing:
+            return True
+        if not current:
+            return False
+        current = posixpath.dirname(current)
 
 
 def _refs(repo: Path) -> list[str]:
@@ -360,7 +432,8 @@ def _scan_ref_chain(repo: Path, path: str, ref: str, chain: list[Commit],
                     query: WindowQuery, finding: RepoFinding,
                     seen: set[tuple], snapshots: dict[str, LockfileModel | str],
                     children: dict[str, list[str]], parents: dict[str, list[str]],
-                    by_sha: dict[str, Commit], warned: set[str]) -> None:
+                    by_sha: dict[str, Commit], warned: set[str],
+                    shadowed_by: str | None = None) -> None:
     """Judge one ref's lockfile history, ancestors first.
 
     An interval starts at the pinning commit and ends at the first *descendant*
@@ -368,6 +441,10 @@ def _scan_ref_chain(repo: Path, path: str, ref: str, chain: list[Commit],
     lockfile. Successors that are merely later in topological order but not
     descendants (a sibling branch) do not close it: widening an interval
     over-reports, truncating one hides exposure.
+
+    ``shadowed_by`` names a lockfile that takes precedence over this one; at any
+    commit where it exists, this file is what npm ignored, so it testifies to
+    nothing.
     """
     def snapshot(commit: Commit) -> LockfileModel | str:
         if commit.sha not in snapshots:
@@ -375,6 +452,8 @@ def _scan_ref_chain(repo: Path, path: str, ref: str, chain: list[Commit],
         return snapshots[commit.sha]
 
     for i, commit in enumerate(chain):
+        if shadowed_by is not None and _exists_at(repo, commit.sha, shadowed_by):
+            continue
         model = snapshot(commit)
         if isinstance(model, str):
             continue
@@ -436,26 +515,39 @@ def scan_repo(repo: Path, query: WindowQuery) -> RepoFinding:
                 "shallow clone: history is truncated, absence of exposure is not evidence"
             )
         paths, foreign = discovered_lockfiles(repo)
+        manifests = manifest_paths(repo)
         refs = _refs(repo)
-        children, parents = _commit_graph(repo) if paths else ({}, {})
-        # Only worth asking when there is no lockfile at all to judge.
-        unlocked_node = not paths and not foreign and has_manifest(repo)
+        children, parents = (_commit_graph(repo) if paths or foreign or manifests
+                             else ({}, {}))
+        # Which lockfiles could have governed anything while the malicious version
+        # was installable. Judged per file and per interval, not per repository: a
+        # lockfile in one directory says nothing about the tree next to it, and one
+        # deleted before the window says nothing about the window.
+        live = {path: _existed_during(repo, path, query, children)
+                for path in (*paths, *foreign)}
+        governing = {posixpath.dirname(p) for p, alive in live.items() if alive}
+        live_foreign = [p for p in foreign if live[p]]
+        unlocked = [
+            m for m in manifests
+            if not _governed(posixpath.dirname(m), governing)
+            and _existed_during(repo, m, query, children)
+        ]
     except GitError as e:
         finding.warnings.append(str(e))
         return finding
 
-    for path in foreign:
+    for path in live_foreign:
         tool = FOREIGN_LOCKFILES[posixpath.basename(path)]
         finding.unread_trees.append(UnreadTree(
             path=path,
             reason=f"{path}: {tool} lockfiles are not parsed yet, so the versions this "
                    "tree installed were not judged",
         ))
-    if unlocked_node:
+    for path in unlocked:
         finding.unread_trees.append(UnreadTree(
-            path="",
-            reason=f"a {MANIFEST} is in this history but no lockfile this tool can "
-                   "read, so the versions this project installed are unknown",
+            path=path,
+            reason=f"{path}: no lockfile governed this tree while the named versions "
+                   "were installable, so the versions it installed are unknown",
         ))
 
     for path in paths:
@@ -464,6 +556,13 @@ def scan_repo(repo: Path, query: WindowQuery) -> RepoFinding:
         snapshots: dict[str, LockfileModel | str] = {}
         by_sha: dict[str, Commit] = {}
         any_history = False
+        # npm ignores package-lock.json entirely when a shrinkwrap sits beside it,
+        # so judging both independently would invent an exposure from a file npm
+        # never read.
+        shadowed_by = None
+        if posixpath.basename(path) == "package-lock.json":
+            sibling = posixpath.join(posixpath.dirname(path), "npm-shrinkwrap.json")
+            shadowed_by = sibling if sibling in paths else None
 
         for ref in refs:
             try:
@@ -475,7 +574,8 @@ def scan_repo(repo: Path, query: WindowQuery) -> RepoFinding:
                 any_history = True
                 by_sha.update({c.sha: c for c in chain})
                 _scan_ref_chain(repo, path, ref, chain, query, finding, seen,
-                                snapshots, children, parents, by_sha, warned)
+                                snapshots, children, parents, by_sha, warned,
+                                shadowed_by=shadowed_by)
 
         if not any_history:
             finding.warnings.append(

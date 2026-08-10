@@ -375,7 +375,8 @@ class TestUnreadableTrees:
         git(repo, "commit", "-qm", "manifest", date="2025-11-25T12:00:00+00:00")
         finding = scan_repo(repo, WINDOW)
         assert finding.verdict is Verdict.INDETERMINATE
-        assert [t.path for t in finding.unread_trees] == [""]
+        # The manifest's own path is kept, so a caller can judge which tree it is.
+        assert [t.path for t in finding.unread_trees] == ["package.json"]
 
     def test_repository_that_is_not_a_node_project_is_clean(self, tmp_path):
         # The honest opposite: nothing to read because there was nothing to read.
@@ -411,6 +412,144 @@ class TestUnreadableTrees:
         git(repo, "commit", "-qm", "app", date="2025-11-25T12:00:00+00:00")
         finding = scan_repo(repo, WINDOW)
         assert [t.path for t in finding.unread_trees] == ["yarn.lock"]
+
+
+class TestLockCoverageIsPerTreeAndPerWindow:
+    """Review of the #16 fix: judging lock coverage per *repository* was wrong in
+    both directions at once. Every case here was verified against the real tool
+    before and after — see docs/experiments.md E13."""
+
+    def write(self, repo, path, body, date):
+        target = repo / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(body)
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", f"write {path}", date=date)
+
+    def fresh(self, tmp_path, name):
+        repo = tmp_path / name
+        repo.mkdir()
+        git(repo, "init", "-q")
+        return repo
+
+    def test_lockfile_deleted_before_the_window_no_longer_clears_the_repo(self, tmp_path):
+        # The tree carried a package.json and no lock while 5.6.1 was installable,
+        # so what it installed then is unknown. This reported CLEAN and exit 0.
+        repo = self.fresh(tmp_path, "dropped")
+        self.write(repo, "package.json", '{"name":"app"}', "2025-11-01T10:00:00+00:00")
+        self.write(repo, "package-lock.json", lock_json("5.6.0"),
+                   "2025-11-01T11:00:00+00:00")
+        (repo / "package-lock.json").unlink()
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "drop the lock", date="2025-11-10T10:00:00+00:00")
+        finding = scan_repo(repo, WINDOW)
+        assert finding.verdict is Verdict.INDETERMINATE
+        assert [t.path for t in finding.unread_trees] == ["package.json"]
+
+    def test_one_locked_app_does_not_clear_its_unlocked_sibling(self, tmp_path):
+        repo = self.fresh(tmp_path, "monorepo")
+        self.write(repo, "locked/package.json", '{"name":"l"}',
+                   "2025-11-25T10:00:00+00:00")
+        self.write(repo, "locked/package-lock.json", lock_json("5.6.0"),
+                   "2025-11-25T10:30:00+00:00")
+        self.write(repo, "unlocked/package.json", '{"name":"u"}',
+                   "2025-11-25T11:00:00+00:00")
+        finding = scan_repo(repo, WINDOW)
+        assert [t.path for t in finding.unread_trees] == ["unlocked/package.json"]
+
+    def test_a_fixture_lockfile_does_not_clear_the_root_tree(self, tmp_path):
+        # The fixture lock is real but governs only tests/fixtures; the deployed
+        # root tree still had nothing we could read.
+        repo = self.fresh(tmp_path, "fixture-only")
+        self.write(repo, "package.json", '{"name":"app"}', "2025-11-25T10:00:00+00:00")
+        self.write(repo, "tests/fixtures/package-lock.json", lock_json("5.6.0"),
+                   "2025-11-25T10:30:00+00:00")
+        finding = scan_repo(repo, WINDOW)
+        assert [t.path for t in finding.unread_trees] == ["package.json"]
+
+    def test_a_workspace_root_lockfile_covers_its_packages(self, tmp_path):
+        # The other direction: npm workspaces keep one lock at the root, so a
+        # package without its own lock is governed, not unread.
+        repo = self.fresh(tmp_path, "workspace")
+        self.write(repo, "package-lock.json", lock_json("5.6.0"),
+                   "2025-11-25T10:00:00+00:00")
+        self.write(repo, "packages/api/package.json", '{"name":"api"}',
+                   "2025-11-25T10:30:00+00:00")
+        finding = scan_repo(repo, WINDOW)
+        assert finding.unread_trees == []
+        assert finding.verdict is Verdict.CLEAN
+
+    def test_foreign_lockfile_removed_before_the_window_is_not_held_against_the_repo(
+            self, tmp_path):
+        # A project that migrated off Yarn years ago was denied an all-clear
+        # forever, because every foreign lockfile ever committed counted.
+        repo = self.fresh(tmp_path, "migrated")
+        self.write(repo, "yarn.lock", YARN_LOCK, "2025-11-01T10:00:00+00:00")
+        (repo / "yarn.lock").unlink()
+        self.write(repo, "package-lock.json", lock_json("5.6.0"),
+                   "2025-11-02T10:00:00+00:00")
+        finding = scan_repo(repo, WINDOW)
+        assert finding.unread_trees == []
+        assert finding.verdict is Verdict.CLEAN
+
+    def test_foreign_lockfile_added_after_the_window_is_not_held_against_the_repo(
+            self, tmp_path):
+        repo = self.fresh(tmp_path, "adopted")
+        self.write(repo, "package-lock.json", lock_json("5.6.0"),
+                   "2025-11-01T10:00:00+00:00")
+        self.write(repo, "yarn.lock", YARN_LOCK, "2025-12-20T10:00:00+00:00")
+        finding = scan_repo(repo, WINDOW)
+        assert finding.unread_trees == []
+
+    def test_foreign_lockfile_present_during_the_window_still_counts(self, tmp_path):
+        repo = self.fresh(tmp_path, "yarn-live")
+        self.write(repo, "yarn.lock", YARN_LOCK, "2025-11-20T10:00:00+00:00")
+        finding = scan_repo(repo, WINDOW)
+        assert [t.path for t in finding.unread_trees] == ["yarn.lock"]
+
+    def test_shrinkwrap_takes_precedence_over_package_lock(self, tmp_path):
+        # npm ignores package-lock.json when a shrinkwrap sits beside it, so the
+        # malicious pin in the ignored file is not an exposure.
+        repo = self.fresh(tmp_path, "both")
+        self.write(repo, "npm-shrinkwrap.json", lock_json("5.6.0"),
+                   "2025-11-25T10:00:00+00:00")
+        self.write(repo, "package-lock.json", lock_json("5.6.1"),
+                   "2025-11-25T10:30:00+00:00")
+        finding = scan_repo(repo, WINDOW)
+        assert finding.exposures == []
+        assert finding.verdict is Verdict.CLEAN
+
+    def test_package_lock_still_counts_before_the_shrinkwrap_appears(self, tmp_path):
+        # Precedence is decided per commit: while no shrinkwrap existed, the
+        # package-lock is what npm read.
+        repo = self.fresh(tmp_path, "later-shrinkwrap")
+        self.write(repo, "package-lock.json", lock_json("5.6.1"),
+                   "2025-11-25T10:00:00+00:00")
+        self.write(repo, "npm-shrinkwrap.json", lock_json("5.6.0"),
+                   "2025-11-26T10:00:00+00:00")
+        finding = scan_repo(repo, WINDOW)
+        assert [e.version for e in finding.exposures] == ["5.6.1"]
+
+    def test_manifest_lookalikes_are_not_manifests(self, tmp_path):
+        # `*package.json` also matches metadata-package.json; one such file made a
+        # Python repository exit 2.
+        repo = self.fresh(tmp_path, "lookalike-manifest")
+        self.write(repo, "metadata-package.json", '{"a":1}',
+                   "2025-11-25T10:00:00+00:00")
+        finding = scan_repo(repo, WINDOW)
+        assert finding.unread_trees == []
+        assert finding.verdict is Verdict.CLEAN
+
+    def test_dependency_manifests_under_node_modules_are_not_trees(self, tmp_path):
+        # A committed node_modules holds one manifest per package; each is a
+        # dependency's own file, not a tree anybody locks.
+        repo = self.fresh(tmp_path, "vendored")
+        self.write(repo, "package-lock.json", lock_json("5.6.0"),
+                   "2025-11-25T10:00:00+00:00")
+        self.write(repo, "node_modules/chalk/package.json", '{"name":"chalk"}',
+                   "2025-11-25T10:30:00+00:00")
+        finding = scan_repo(repo, WINDOW)
+        assert finding.unread_trees == []
 
 
 class TestWindowQueryValidation:

@@ -27,7 +27,14 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 
 from .grading import Grade, GradedExposure, GradedFinding, RunHistory, grade_finding
-from .history import Exposure, GitError, Verdict, _git as _git_text, scan_repo
+from .history import (
+    Exposure,
+    GitError,
+    UnreadTree,
+    Verdict,
+    _git as _git_text,
+    scan_repo,
+)
 from .ioc import QueryPlan
 from .rotation import RepoRotation, RotationItem, Scope, rotation_for_repo
 
@@ -85,6 +92,33 @@ def _is_installed_tree(repo: Path, graded: GradedExposure) -> bool:
     directory = str(PurePosixPath(lockfile).parent)
     return graded.grade is Grade.CONFIRMED and _workflow_mentions_dir(
         repo, graded.exposure.commit, graded.workflow_paths, directory
+    )
+
+
+def _workflows_at_head(repo: Path) -> tuple[str, ...]:
+    """Workflow files as they stand now, used when no run points at a commit."""
+    try:
+        out = _git_text(repo, "ls-tree", "-r", "--name-only", "HEAD",
+                        ".github/workflows")
+    except GitError:
+        return ()
+    return tuple(line for line in out.splitlines() if line.strip())
+
+
+def _is_installed_unread_tree(repo: Path, tree: UnreadTree,
+                              workflows: tuple[str, ...]) -> bool:
+    """Whether an unread tree is one a workflow would have installed.
+
+    The directory heuristic must lose to evidence here for the same reason it does
+    for exposures: an application that really lives under ``examples/`` would
+    otherwise be filed away as sample data, and the repository would be cleared on
+    the strength of a directory name (found by review — see E13).
+    """
+    if is_probably_installed(tree.path):
+        return True
+    directory = str(PurePosixPath(tree.path).parent)
+    return bool(directory) and directory != "." and _workflow_mentions_dir(
+        repo, "HEAD", workflows, directory
     )
 
 
@@ -205,10 +239,13 @@ class OrgReport:
         if the advisory only covers part of the incident: in each case something
         was not looked at.
         """
-        readable = all(f.verdict is not Verdict.INDETERMINATE for f in self.findings)
-        # ``unread`` is checked on its own: a repository where one tree was read
-        # and exposed while another was never legible has an EXPOSED verdict, and
-        # that verdict must not be mistaken for having seen everything.
+        # Each reason is checked on its own, because an exposure wins the verdict:
+        # a repository where one tree was read and exposed while another was
+        # unreadable is EXPOSED, and that verdict must not be mistaken for having
+        # seen everything. Both an unread tree and a lost snapshot leave a
+        # question open regardless of what the aggregate verdict became.
+        readable = all(f.verdict is not Verdict.INDETERMINATE and not f.warnings
+                       for f in self.findings)
         return (not self.errors and not self.partial_coverage and readable
                 and not self.unread)
 
@@ -234,6 +271,7 @@ def scan_organization(repos: Iterable[tuple[str, Path]], plan: QueryPlan, *,
             continue
         run_cache: dict[str, RunHistory] = {}
         secret_cache: dict[str, tuple[str, ...] | None] = {}
+        workflows_now = _workflows_at_head(path)
         for entry in plan.entries:
             query = entry.query
             try:
@@ -274,7 +312,8 @@ def scan_organization(repos: Iterable[tuple[str, Path]], plan: QueryPlan, *,
             # other: it must not cost the whole repository its verdict, or every
             # tooling project that keeps such a fixture would be told its scan
             # proves nothing.
-            unread = [t for t in graded.unread_trees if is_probably_installed(t.path)]
+            unread = [t for t in graded.unread_trees
+                      if _is_installed_unread_tree(path, t, workflows_now)]
             set_aside_unread = [t for t in graded.unread_trees if t not in unread]
             installed = replace(
                 graded, graded=kept, unread_trees=unread,

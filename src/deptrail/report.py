@@ -50,6 +50,10 @@ def render_html(report: OrgReport, advisory=None) -> str:
     """One file a responder can forward as-is."""
     items = report.rotation_items
     banner_color = GRADE_COLOR[report.worst_grade]
+    # Green is reserved for a proven all-clear. A scan that found nothing but could
+    # not look everywhere is grey: the colour is read before the sentence.
+    if not report.proves_absence and report.worst_grade is Grade.NO_EVIDENCE:
+        banner_color = GRADE_COLOR[Grade.POSSIBLE]
     if items:
         headline = f"{len(items)} credential(s) to rotate"
     elif report.rotation_required:
