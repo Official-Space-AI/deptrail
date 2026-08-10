@@ -119,12 +119,17 @@ class RunHistory:
 
 @dataclass(frozen=True)
 class GradedExposure:
-    """One exposure with its grade and the facts the grade rests on."""
+    """One exposure with its grade and the facts the grade rests on.
+
+    ``workflow_path`` names the workflow behind the implicated run, so a
+    rotation list can be scoped to the secrets that workflow could reach.
+    """
 
     exposure: Exposure
     grade: Grade
     evidence: tuple[str, ...]
     run_ids: tuple[str, ...] = ()
+    workflow_path: str | None = None
 
 
 @dataclass
@@ -208,6 +213,7 @@ def grade_exposure(exposure: Exposure, query: WindowQuery,
                 f"{exposure.version} executed",
             ),
             run_ids=tuple(r.run_id for r in confirming),
+            workflow_path=run.workflow_path,
         )
 
     if during:
@@ -227,6 +233,7 @@ def grade_exposure(exposure: Exposure, query: WindowQuery,
                 f"{exposure.version} was still served, but {why}",
             ),
             run_ids=tuple(r.run_id for r in during),
+            workflow_path=run.workflow_path,
         )
 
     later = [r for r in on_commit if r.at > query.window_end]
@@ -241,6 +248,7 @@ def grade_exposure(exposure: Exposure, query: WindowQuery,
                 "longer served; the install may have failed rather than fetched it",
             ),
             run_ids=tuple(r.run_id for r in later),
+            workflow_path=run.workflow_path,
         )
 
     if not history.covers(live_start):

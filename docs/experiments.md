@@ -158,3 +158,32 @@ head-checkout allow-list cannot confirm.
 range with no activity; `axios/axios` returns all 297; per-workflow detection
 answers `True` for a `ci.yml` running `npm ci` and `False` for a `docs.yml`
 beside it at the same commit.
+
+## E7 — Does an end-to-end org scan produce a usable rotation list?
+
+**Assumption**: with the walker, the advisory loader and the grader in place, a
+scan of a real organization needs only to be wired together.
+
+**Method**: clone this organization's repository, load a live advisory, read real
+CI runs for the window through the API, read real secret names, and render the
+report.
+
+**Result**: it ran, and it flagged **this project's own test fixtures** —
+`tests/fixtures/v1|v2|v3/package-lock.json` each pin `chalk 5.6.1`, which is a
+correct finding under the rules and useless to a responder. Fixture and example
+lockfiles are committed data, not a tree any workflow installs, and letting them
+raise credentials would bury the real items in a list nobody can act on. The
+same scan also confirmed the grading path end to end: the runs were graded
+`LIKELY` rather than `CONFIRMED` because this repository's workflow installs pip
+dependencies, not npm ones.
+
+**Change**: exposures under fixture, example, spec, sample, testdata, vendor and
+`node_modules` directories are **set aside, not dropped** — they appear in the
+report under their own heading with the reason, so a human can overrule the
+classification, but they produce no rotation items and do not raise the report's
+grade.
+
+**Verification**: the same scan now reports "no exposure found in an installed
+tree", lists the three fixtures under "set aside (3)", and rotates nothing, while
+a root lockfile in the same shape still produces a `CONFIRMED` finding and a
+narrowed rotation list.
