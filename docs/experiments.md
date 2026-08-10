@@ -388,3 +388,61 @@ exit code that was wrong before. Two properties are now tested in both direction
 which is what the round was really about: a lockfile must clear the tree it governs
 and only that tree, and a foreign lockfile must count during the window and only
 during the window.
+
+## E14 — Is coverage a yes/no question?
+
+**Assumption**: after E13, coverage was computed per path, which is the right
+granularity. What remained were details.
+
+**Method**: the second review of the same branch, again told to build repositories
+rather than read code, on both sides of the ledger; plus `npm install` run locally
+against a real workspace layout to settle what a root lockfile actually covers; plus
+a 200-package monorepo timed against the previous two commits.
+
+**Result**: the granularity was right and the *type* was wrong. Coverage had become
+a boolean — "did a lockfile overlap the window" — where the honest answer is a span
+of time, and three separate false cleans followed from that plus two from reading
+the wrong event stream.
+
+- A lockfile removed in the middle of the window covered the whole of it. The rest
+  of the window was unlocked, and reported `CLEAN`.
+- An interval was closed by the first descendant deletion found on *any* ref. A
+  `main` that dropped a manifest before the incident therefore cleared a feature
+  branch that still carried it and was still being built — the same cross-branch
+  mistake E3 found in exposure intervals, repeated in the new code.
+- Ancestor inheritance ignored npm's workspace declaration. Measured with npm
+  10.9.3: `npm install` in a directory the root lists as a workspace uses the root
+  lockfile and writes none of its own, while the same command in a directory the
+  root does not list writes its own lockfile. A root lockfile was therefore clearing
+  standalone applications that had never been locked at all. The test that was
+  supposed to cover this declared no workspaces, so it proved nothing either way.
+- Precedence was read from the wrong log. Deleting an `npm-shrinkwrap.json` puts
+  the `package-lock.json` beside it back in charge without touching that file, so a
+  log of the package-lock alone never sees the moment it started to matter; the
+  malicious pin it then held went unreported.
+- Workflow evidence for an unread tree was read at `HEAD`. A workflow that
+  installed `examples/production` during the window and was deleted afterwards is
+  exactly the evidence that matters, and today's tree does not have it.
+
+One over-report came with them: every walker warning was treated as lost evidence,
+including diagnostics that cost none. A rebase that rewrote a committer date put the
+entire secret store of an otherwise cleanly-judged repository on the rotation list.
+
+**Changes**: spans replaced booleans, each carrying the commit that opened it, and
+what is left of a manifest's span after every governing lockfile's span is removed
+is what makes a tree unread. Spans are computed per ref. Governance consults the
+workspace globs declared beside the lockfile, matched with npm's `*` semantics.
+The log driving a shadowed lockfile now includes the commits that touched the file
+shadowing it. Unread trees carry a commit, and the workflow check reads that commit.
+Warnings split into evidence that was lost and observations that cost nothing;
+only the former widens anything.
+
+**Verification**: seven more repositories are pinned as tests, including two
+controls that must stay clean — a lockfile covering the whole window, and a real
+workspace member — because every check here can be satisfied by simply never
+clearing anything. Timings on a 200-package monorepo (400 tracked files, 51
+commits): 5.1 s before this branch, 12 s now. The cost is one `git log` per file per
+ref; existence questions were already batched into a single `cat-file --batch-check`.
+Recorded in #9 rather than optimised here — the obvious next step, one combined
+`--name-status` log, can miss a presence change at a merge commit, and that fails
+toward a false clean.

@@ -91,3 +91,37 @@ jobs:
           deptrail scan --ioc example-demo --repo "$yarn" --no-ci > yarn.txt || true
           grep -q "not judged" yarn.txt
           grep -q "rotate: nothing" yarn.txt
+
+  action:
+    # The composite action is the interface most users meet, and its exit-code
+    # handling is a contract of its own: a scan that could not prove absence must
+    # annotate the check rather than pass in silence.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Commit a tree this version cannot read
+        # The action always scans the repository it runs in, so the shape under
+        # test has to be in that repository's history.
+        run: |
+          set -euo pipefail
+          mkdir -p unreadable
+          printf '# yarn lockfile v1\n\n"chalk@^5.6.0":\n  version "5.6.1"\n' \
+            > unreadable/yarn.lock
+          printf '{"name":"app","dependencies":{"chalk":"^5.6.0"}}\n' \
+            > unreadable/package.json
+          git add unreadable
+          git -c user.email=ci@test -c user.name=ci commit -qm "an unreadable tree"
+      - id: scan
+        uses: ./
+        with:
+          ioc: example-demo
+      - name: exit 2 is annotated, not passed over in silence
+        run: |
+          set -euo pipefail
+          code="${{ steps.scan.outputs.exit-code }}"
+          test "$code" = "2" || { echo "expected exit 2, got $code"; exit 1; }

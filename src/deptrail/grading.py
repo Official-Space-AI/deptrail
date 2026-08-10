@@ -164,6 +164,8 @@ class GradedFinding:
     # Trees whose dependencies were never readable — a lockfile dialect this
     # version cannot parse, or no lockfile at all. See ``worst_grade``.
     unread_trees: list[UnreadTree] = field(default_factory=list)
+    # Observations that cost no evidence, printed but never acted on.
+    diagnostics: list[str] = field(default_factory=list)
 
     @property
     def worst_grade(self) -> Grade:
@@ -312,6 +314,7 @@ def grade_finding(finding: RepoFinding, query: WindowQuery, history: RunHistory,
         advisory_id=advisory_id, package=query.package,
         coverage_warning=coverage_warning,
         unread_trees=list(finding.unread_trees),
+        diagnostics=list(finding.diagnostics),
     )
     graded.graded.extend(grade_exposure(e, query, history) for e in finding.exposures)
 

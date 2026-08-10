@@ -174,7 +174,7 @@ class TestReviewRegressions:
         ])
         finding = scan_repo(repo, WINDOW)
         assert finding.verdict is Verdict.EXPOSED
-        assert any("predates its parent" in w for w in finding.warnings)
+        assert any("predates its parent" in d for d in finding.diagnostics)
 
     def test_rebase_rewritten_committer_dates_still_detected(self, tmp_path):
         # Rebase rewrites committer dates to merge day; author dates keep the truth.
@@ -191,7 +191,7 @@ class TestReviewRegressions:
             author_date="2025-11-26T10:00:00+00:00")
         finding = scan_repo(repo, WINDOW)
         assert finding.verdict is Verdict.EXPOSED
-        assert any("diverge" in w for w in finding.warnings)
+        assert any("diverge" in d for d in finding.diagnostics)
 
     def test_branch_only_exposure_is_found(self, tmp_path):
         # Malicious pin lives only on an unmerged branch; CI still built it there.
@@ -448,10 +448,10 @@ class TestLockCoverageIsPerTreeAndPerWindow:
 
     def test_one_locked_app_does_not_clear_its_unlocked_sibling(self, tmp_path):
         repo = self.fresh(tmp_path, "monorepo")
-        self.write(repo, "locked/package.json", '{"name":"l"}',
-                   "2025-11-25T10:00:00+00:00")
+        (repo / "locked").mkdir()
+        (repo / "locked/package.json").write_text('{"name":"l"}')
         self.write(repo, "locked/package-lock.json", lock_json("5.6.0"),
-                   "2025-11-25T10:30:00+00:00")
+                   "2025-11-25T10:00:00+00:00")
         self.write(repo, "unlocked/package.json", '{"name":"u"}',
                    "2025-11-25T11:00:00+00:00")
         finding = scan_repo(repo, WINDOW)
@@ -471,10 +471,12 @@ class TestLockCoverageIsPerTreeAndPerWindow:
         # The other direction: npm workspaces keep one lock at the root, so a
         # package without its own lock is governed, not unread.
         repo = self.fresh(tmp_path, "workspace")
+        (repo / "package.json").write_text(
+            '{"name":"root","private":true,"workspaces":["packages/*"]}')
+        (repo / "packages/api").mkdir(parents=True)
+        (repo / "packages/api/package.json").write_text('{"name":"api"}')
         self.write(repo, "package-lock.json", lock_json("5.6.0"),
                    "2025-11-25T10:00:00+00:00")
-        self.write(repo, "packages/api/package.json", '{"name":"api"}',
-                   "2025-11-25T10:30:00+00:00")
         finding = scan_repo(repo, WINDOW)
         assert finding.unread_trees == []
         assert finding.verdict is Verdict.CLEAN
@@ -542,14 +544,143 @@ class TestLockCoverageIsPerTreeAndPerWindow:
 
     def test_dependency_manifests_under_node_modules_are_not_trees(self, tmp_path):
         # A committed node_modules holds one manifest per package; each is a
-        # dependency's own file, not a tree anybody locks.
+        # dependency's own file, not a tree anybody locks. Asserted on discovery
+        # directly: with a root lockfile in place the exclusion cannot be seen from
+        # the verdict, so a version of this test that only checked unread_trees
+        # passed with the exclusion removed.
+        from deptrail.history import manifest_paths
         repo = self.fresh(tmp_path, "vendored")
-        self.write(repo, "package-lock.json", lock_json("5.6.0"),
+        (repo / "node_modules/chalk").mkdir(parents=True)
+        (repo / "node_modules/chalk/package.json").write_text('{"name":"chalk"}')
+        (repo / "packages/api").mkdir(parents=True)
+        (repo / "packages/api/package.json").write_text('{"name":"api"}')
+        self.write(repo, "packages/api/package-lock.json", lock_json("5.6.0"),
                    "2025-11-25T10:00:00+00:00")
-        self.write(repo, "node_modules/chalk/package.json", '{"name":"chalk"}',
-                   "2025-11-25T10:30:00+00:00")
+        assert manifest_paths(repo) == ["packages/api/package.json"]
         finding = scan_repo(repo, WINDOW)
         assert finding.unread_trees == []
+
+
+class TestPartialCoverageAndPrecedence:
+    """Second review round (E14): the interval model was still answering yes/no
+    questions where the answer is a span, and precedence was read off the wrong
+    event stream. Every case here was a wrong verdict before the fix."""
+
+    def write(self, repo, path, body, date):
+        target = repo / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(body)
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", f"write {path}", date=date)
+
+    def fresh(self, tmp_path, name):
+        repo = tmp_path / name
+        repo.mkdir()
+        git(repo, "init", "-q")
+        return repo
+
+    def test_a_lockfile_removed_mid_window_leaves_the_rest_uncovered(self, tmp_path):
+        # Covered 11-20 → 11-25, unlocked 11-25 → 11-26: overlapping the window at
+        # all used to count as covering the whole of it.
+        repo = self.fresh(tmp_path, "half-covered")
+        (repo / "package.json").write_text('{"name":"app"}')
+        self.write(repo, "package-lock.json", lock_json("5.6.0"),
+                   "2025-11-20T10:00:00+00:00")
+        (repo / "package-lock.json").unlink()
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "drop the lock", date="2025-11-25T10:00:00+00:00")
+        finding = scan_repo(repo, WINDOW)
+        assert [t.path for t in finding.unread_trees] == ["package.json"]
+        assert finding.verdict is Verdict.INDETERMINATE
+
+    def test_a_lockfile_covering_the_whole_window_clears_the_tree(self, tmp_path):
+        # The control: the same shape with no gap must stay clean, or the check
+        # above would just be a way of never clearing anything.
+        repo = self.fresh(tmp_path, "fully-covered")
+        (repo / "package.json").write_text('{"name":"app"}')
+        self.write(repo, "package-lock.json", lock_json("5.6.0"),
+                   "2025-11-20T10:00:00+00:00")
+        finding = scan_repo(repo, WINDOW)
+        assert finding.unread_trees == []
+        assert finding.verdict is Verdict.CLEAN
+
+    def test_a_root_lockfile_does_not_cover_a_directory_it_never_declared(self, tmp_path):
+        # Verified against npm 10.9.3: `npm install` in a directory the root does
+        # not list as a workspace writes its own lockfile, so the root's lockfile
+        # says nothing about it.
+        repo = self.fresh(tmp_path, "standalone")
+        (repo / "package.json").write_text(
+            '{"name":"root","private":true,"workspaces":["packages/*"]}')
+        (repo / "apps/standalone").mkdir(parents=True)
+        (repo / "apps/standalone/package.json").write_text('{"name":"standalone"}')
+        self.write(repo, "package-lock.json", lock_json("5.6.0"),
+                   "2025-11-25T10:00:00+00:00")
+        finding = scan_repo(repo, WINDOW)
+        assert [t.path for t in finding.unread_trees] == ["apps/standalone/package.json"]
+
+    def test_workspace_globs_are_matched_the_way_npm_matches_them(self, tmp_path):
+        # `packages/*` covers one level and not two.
+        repo = self.fresh(tmp_path, "glob-depth")
+        (repo / "package.json").write_text('{"name":"root","workspaces":["packages/*"]}')
+        (repo / "packages/api").mkdir(parents=True)
+        (repo / "packages/api/package.json").write_text('{"name":"api"}')
+        (repo / "packages/group/deep").mkdir(parents=True)
+        (repo / "packages/group/deep/package.json").write_text('{"name":"deep"}')
+        self.write(repo, "package-lock.json", lock_json("5.6.0"),
+                   "2025-11-25T10:00:00+00:00")
+        finding = scan_repo(repo, WINDOW)
+        assert [t.path for t in finding.unread_trees] == [
+            "packages/group/deep/package.json"
+        ]
+
+    def test_a_deletion_on_one_branch_does_not_clear_another(self, tmp_path):
+        # main dropped the manifest before the window; the feature branch still
+        # carries it and is still built. Reading main's deletion as the end of
+        # every branch's interval reported this clean.
+        repo = self.fresh(tmp_path, "branched")
+        self.write(repo, "package.json", '{"name":"app"}', "2025-11-01T10:00:00+00:00")
+        default = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--abbrev-ref", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        git(repo, "checkout", "-q", "-b", "feature")
+        git(repo, "commit", "-q", "--allow-empty", "-m", "feature work",
+            date="2025-11-25T10:00:00+00:00")
+        git(repo, "checkout", "-q", default)
+        (repo / "package.json").unlink()
+        (repo / "other.txt").write_text("x")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "main drops it", date="2025-11-10T10:00:00+00:00")
+        finding = scan_repo(repo, WINDOW)
+        assert [t.path for t in finding.unread_trees] == ["package.json"]
+
+    def test_removing_a_shrinkwrap_puts_the_package_lock_back_in_charge(self, tmp_path):
+        # The commit that deletes the shrinkwrap never touches package-lock.json,
+        # so a log of that path alone never sees the moment it started to matter.
+        repo = self.fresh(tmp_path, "unshadowed")
+        (repo / "package-lock.json").write_text(lock_json("5.6.1"))
+        self.write(repo, "npm-shrinkwrap.json", lock_json("5.6.0"),
+                   "2025-11-20T10:00:00+00:00")
+        (repo / "npm-shrinkwrap.json").unlink()
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "drop the shrinkwrap",
+            date="2025-11-25T10:00:00+00:00")
+        finding = scan_repo(repo, WINDOW)
+        assert finding.verdict is Verdict.EXPOSED
+        assert [e.version for e in finding.exposures] == ["5.6.1"]
+
+    def test_a_rewritten_date_is_a_diagnostic_and_not_lost_evidence(self, tmp_path):
+        # A rebase costs no evidence, so it must not widen anything. Treating it
+        # as lost evidence put every credential of a rebased repo on the list.
+        repo = self.fresh(tmp_path, "rebased-clean")
+        (repo / "package-lock.json").write_text(lock_json("5.6.1"))
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "pin", date="2025-12-25T10:00:00+00:00",
+            author_date="2025-11-25T10:00:00+00:00")
+        finding = scan_repo(repo, WINDOW)
+        assert finding.verdict is Verdict.EXPOSED
+        assert finding.warnings == [], finding.warnings
+        assert any("diverge" in d for d in finding.diagnostics)
 
 
 class TestWindowQueryValidation:

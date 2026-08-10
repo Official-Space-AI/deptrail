@@ -193,9 +193,9 @@ def rotation_for_repo(repo_path: Path, repo_name: str, finding: GradedFinding,
     rotation = RepoRotation(repo=repo_name)
     if finding.coverage_warning:
         rotation.notes.append(finding.coverage_warning)
-    for warning in (*finding.warnings, *finding.ci_notes,
-                    *(t.reason for t in finding.unread_trees)):
-        rotation.notes.append(warning)
+    for note in (*finding.warnings, *finding.diagnostics, *finding.ci_notes,
+                 *(t.reason for t in finding.unread_trees)):
+        rotation.notes.append(note)
 
     graded_needing = [g for g in finding.graded
                       if g.grade in (Grade.CONFIRMED, Grade.LIKELY, Grade.POSSIBLE)]

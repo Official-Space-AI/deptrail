@@ -95,18 +95,22 @@ def _is_installed_tree(repo: Path, graded: GradedExposure) -> bool:
     )
 
 
-def _workflows_at_head(repo: Path) -> tuple[str, ...]:
-    """Workflow files as they stand now, used when no run points at a commit."""
+def _workflows_at(repo: Path, sha: str) -> tuple[str, ...]:
+    """Workflow files as they stood at one commit.
+
+    Read at the commit and not at HEAD: a workflow that installed a directory
+    during the window and was deleted afterwards is exactly the evidence that
+    matters, and looking at today's tree loses it (E14).
+    """
     try:
-        out = _git_text(repo, "ls-tree", "-r", "--name-only", "HEAD",
+        out = _git_text(repo, "ls-tree", "-r", "--name-only", sha,
                         ".github/workflows")
     except GitError:
         return ()
     return tuple(line for line in out.splitlines() if line.strip())
 
 
-def _is_installed_unread_tree(repo: Path, tree: UnreadTree,
-                              workflows: tuple[str, ...]) -> bool:
+def _is_installed_unread_tree(repo: Path, tree: UnreadTree) -> bool:
     """Whether an unread tree is one a workflow would have installed.
 
     The directory heuristic must lose to evidence here for the same reason it does
@@ -117,9 +121,10 @@ def _is_installed_unread_tree(repo: Path, tree: UnreadTree,
     if is_probably_installed(tree.path):
         return True
     directory = str(PurePosixPath(tree.path).parent)
-    return bool(directory) and directory != "." and _workflow_mentions_dir(
-        repo, "HEAD", workflows, directory
-    )
+    if not directory or directory == ".":
+        return True
+    sha = tree.commit or "HEAD"
+    return _workflow_mentions_dir(repo, sha, _workflows_at(repo, sha), directory)
 
 
 @dataclass(frozen=True)
@@ -271,7 +276,6 @@ def scan_organization(repos: Iterable[tuple[str, Path]], plan: QueryPlan, *,
             continue
         run_cache: dict[str, RunHistory] = {}
         secret_cache: dict[str, tuple[str, ...] | None] = {}
-        workflows_now = _workflows_at_head(path)
         for entry in plan.entries:
             query = entry.query
             try:
@@ -313,7 +317,7 @@ def scan_organization(repos: Iterable[tuple[str, Path]], plan: QueryPlan, *,
             # tooling project that keeps such a fixture would be told its scan
             # proves nothing.
             unread = [t for t in graded.unread_trees
-                      if _is_installed_unread_tree(path, t, workflows_now)]
+                      if _is_installed_unread_tree(path, t)]
             set_aside_unread = [t for t in graded.unread_trees if t not in unread]
             installed = replace(
                 graded, graded=kept, unread_trees=unread,
