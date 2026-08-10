@@ -33,6 +33,13 @@ jobs:
           grep -q "LIKELY     ] docs-site" demo.txt
           grep -q "rotate (3 credential(s))" demo.txt
           grep -q "NPM_TOKEN" demo.txt
+          # mobile-app is locked with Yarn: named as unread, not cleared, and not
+          # turned into a rotation item either.
+          grep -q "not judged" demo.txt
+          grep -q "mobile-app" demo.txt
+          if grep -q "EXPO_TOKEN" demo.txt; then
+            echo "an unread tree must not raise a credential"; exit 1
+          fi
           # The workflow never reads AWS_ACCESS_KEY, so it must appear nowhere.
           # (`grep -qv` would pass on any single non-matching line — not the same test.)
           if grep -q "AWS_ACCESS_KEY" demo.txt; then
@@ -71,3 +78,16 @@ jobs:
             > shallow.txt || true
           grep -q "shallow clone" shallow.txt
           grep -q "cannot prove absence" shallow.txt
+
+          # A project this version cannot parse must exit 2 — "could not prove
+          # absence" — rather than 0, and must not manufacture a rotation list.
+          yarn="$RUNNER_TEMP/yarn-project"
+          mkdir -p "$yarn" && git -C "$yarn" init -q
+          printf '# yarn lockfile v1\n\n"chalk@^5.6.0":\n  version "5.6.1"\n' \
+            > "$yarn/yarn.lock"
+          git -C "$yarn" add -A
+          git -C "$yarn" -c user.email=ci@test -c user.name=ci commit -qm lock
+          expect 2 deptrail scan --ioc example-demo --repo "$yarn" --no-ci
+          deptrail scan --ioc example-demo --repo "$yarn" --no-ci > yarn.txt || true
+          grep -q "not judged" yarn.txt
+          grep -q "rotate: nothing" yarn.txt

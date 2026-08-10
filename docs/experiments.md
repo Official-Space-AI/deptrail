@@ -285,3 +285,49 @@ report. A unit test pins the same pair of outcomes.
 **Verification**: the demo job passes with the deep checkout and fails if the
 shallow assertion ever stops holding — the guard is now proven by CI rather than
 asserted in a docstring.
+
+## E12 — Does a repository shaped unlike our fixtures get a real answer?
+
+**Assumption**: 235 passing tests and 93% line coverage mean the scanner's inputs
+are covered, so the next class of defect will be in the judgment, not in what the
+scanner accepts as input.
+
+**Method**: build three throwaway repositories, each pinning `chalk@5.6.1` inside
+the advisory window, differing only in which lockfile they use — `yarn.lock`,
+`npm-shrinkwrap.json`, and none at all (a Python project) — and scan each one.
+
+**Result**: two false cleans. The Yarn and shrinkwrap repositories both reported
+`no exposure found`, `rotate: nothing`, and exit `0` — the code documented as
+"absence was proven". The Python repository reported the same three things and was
+right, and its output was byte-identical to the other two, so nothing in the report
+distinguished "you are clear" from "we could not read your project".
+
+The cause was one string: lockfile discovery matched the basename
+`package-lock.json` exactly. `npm-shrinkwrap.json` is npm's own lockfile with the
+same schema — feeding one straight to the parser returns the right version set, so
+only discovery excluded it. Meanwhile `grading.INSTALL_COMMANDS` already recognised
+`yarn install` and `pnpm install`, so on a Yarn repository the CI half of the tool
+looked like it was working while the history half silently found nothing.
+
+`grep -ric "yarn\|pnpm\|shrinkwrap" tests/*.py` returned 0. Every fixture in the
+suite used `package-lock.json`, so the corpus encoded the same assumption as the
+code. No number of passing tests could have found this, and neither of the two
+independent reviews did: they read the code against its own premise.
+
+**Changes**: `npm-shrinkwrap.json` became a first-class lockfile. A lockfile in a
+dialect this version cannot parse, or a Node project with no readable lockfile, is
+recorded as an *unread tree* — the repository is `INDETERMINATE`, the report lists
+it under "not judged" with the filename, and the scan exits `2`. Unread trees
+deliberately do not raise a grade or a credential: unlike a lost snapshot, nothing
+was hidden from us, and grading them `POSSIBLE` would put every Yarn project's
+whole secret store on a rotation list. Writing the org-level test then exposed a
+second hole — a repository where one tree was read and exposed while another was
+never legible carried an `EXPOSED` verdict and still claimed the scan was complete.
+The demo gained a fourth repository locked with Yarn, so the evaluator sees this
+answer in the first command they run.
+
+**Verification**: the three repositories are pinned as end-to-end tests on their
+exit codes (`2`, `1`, `0`), plus unit tests for each dialect, for a mixed
+repository, and for a Yarn fixture under `tests/fixtures` that must *not* cost a
+tooling project its all-clear. The demo workflow builds a Yarn project on the
+runner and asserts exit 2 with an empty rotation list.

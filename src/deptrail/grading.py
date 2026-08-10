@@ -48,6 +48,7 @@ from .history import (
     Exposure,
     GitError,
     RepoFinding,
+    UnreadTree,
     Verdict,
     WindowQuery,
     _git as _git_text,
@@ -160,17 +161,24 @@ class GradedFinding:
     # Notes about the CI evidence, kept apart from the walker's warnings: only the
     # latter mean the repository's history could not be read.
     ci_notes: list[str] = field(default_factory=list)
+    # Trees whose dependencies were never readable — a lockfile dialect this
+    # version cannot parse, or no lockfile at all. See ``worst_grade``.
+    unread_trees: list[UnreadTree] = field(default_factory=list)
 
     @property
     def worst_grade(self) -> Grade:
         for grade in (Grade.CONFIRMED, Grade.LIKELY, Grade.POSSIBLE):
             if any(g.grade is grade for g in self.graded):
                 return grade
-        if self.verdict is Verdict.INDETERMINATE:
-            # The walker could not read this repo's history, so an install was
+        if self.warnings:
+            # Evidence about a lockfile we do track was lost, so an install was
             # neither shown nor ruled out — which is what POSSIBLE means.
             # NO_EVIDENCE would claim the lockfile never held a named version.
             return Grade.POSSIBLE
+        # An unread tree is different: no version was seen, and none was hidden
+        # from us either, so there is genuinely no evidence in any direction.
+        # Grading it POSSIBLE would put every Yarn repository on a rotation list.
+        # The report still refuses to prove absence — see ``OrgReport``.
         return Grade.NO_EVIDENCE
 
     @property
@@ -303,6 +311,7 @@ def grade_finding(finding: RepoFinding, query: WindowQuery, history: RunHistory,
         repo=finding.repo, verdict=finding.verdict, warnings=list(finding.warnings),
         advisory_id=advisory_id, package=query.package,
         coverage_warning=coverage_warning,
+        unread_trees=list(finding.unread_trees),
     )
     graded.graded.extend(grade_exposure(e, query, history) for e in finding.exposures)
 

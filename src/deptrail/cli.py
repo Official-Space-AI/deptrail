@@ -113,6 +113,7 @@ def _as_dict(report: OrgReport, advisory: Advisory | None) -> dict:
         ],
         "rotate_unnamed": list(report.unnamed_rotations),
         "errors": list(report.errors),
+        "not_judged": list(report.unread),
         "caveats": list(report.notes) + list(report.rotation_notes),
     }
     if advisory is not None:

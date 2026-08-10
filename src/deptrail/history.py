@@ -25,6 +25,13 @@ Judgment model (shaped by adversarial review — see PR #8):
   failures, shallow clones, and discovered-but-unwalkable paths all become
   warnings, and a repo with warnings and no exposures is INDETERMINATE, not
   CLEAN.
+- **A tree we cannot read is not a tree without exposure.** Only npm lockfiles
+  are parsed. A project locked with Yarn or pnpm, or a Node project with no
+  lockfile in its history at all, is recorded in ``unread_trees`` and makes the
+  repo INDETERMINATE — reporting CLEAN there would answer a question nobody
+  could have looked at (found by replaying such repositories, see
+  ``docs/experiments.md`` E12). Unlike a warning, it does not raise a grade:
+  nothing suggests exposure either, so the honest outcome is "not judged".
 
 The attack window is inclusive on both ends; held intervals are half-open
 ``[since, until)``.
@@ -40,7 +47,21 @@ from pathlib import Path
 
 from .lockfile import LockfileModel, LockfileParseError, parse_lockfile
 
-LOCKFILE_BASENAME = "package-lock.json"
+# npm writes one of these two, and a published package ships the second; both use
+# the same schema, so one parser reads either.
+NPM_LOCKFILES = ("package-lock.json", "npm-shrinkwrap.json")
+# Lockfiles we can recognise but not parse yet (issue #17), and the tool that
+# writes each. Finding one means that tree's installed versions are unknown to us.
+# Every package manager that installs from the npm registry belongs here, because
+# a name missing from this table is a repository this tool would call clean.
+FOREIGN_LOCKFILES = {
+    "yarn.lock": "Yarn",
+    "pnpm-lock.yaml": "pnpm",
+    "shrinkwrap.yaml": "pnpm (v3 and earlier)",
+    "bun.lock": "Bun",
+    "bun.lockb": "Bun",
+}
+MANIFEST = "package.json"
 DATE_DIVERGENCE_WARN = timedelta(hours=48)
 
 
@@ -130,6 +151,21 @@ class Exposure:
         return self.until is None
 
 
+@dataclass(frozen=True)
+class UnreadTree:
+    """A tree whose installed versions this tool could not read.
+
+    ``path`` is the lockfile that was recognised but not parsed, or ``""`` when
+    the repository as a whole has no lockfile to read. It is kept separate from
+    ``reason`` so a caller can apply its own judgment about which trees matter —
+    a lockfile under ``tests/fixtures`` is committed data, not something a
+    workflow installs.
+    """
+
+    path: str
+    reason: str
+
+
 @dataclass
 class RepoFinding:
     """Everything the walker learned about one repository."""
@@ -138,6 +174,12 @@ class RepoFinding:
     exposures: list[Exposure] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     lockfiles_seen: int = 0
+    # Trees whose dependencies this tool cannot read at all: a lockfile in a
+    # dialect it does not parse, or a Node project with no lockfile in history.
+    # Kept apart from ``warnings`` because the two deserve different answers —
+    # a warning means evidence about a tracked lockfile was lost, so an install
+    # is possible; an unread tree means there was never anything to look at.
+    unread_trees: list[UnreadTree] = field(default_factory=list)
 
     @property
     def exposed(self) -> bool:
@@ -145,10 +187,10 @@ class RepoFinding:
 
     @property
     def verdict(self) -> Verdict:
-        """CLEAN is only claimable when nothing was exposed AND nothing was unreadable."""
+        """CLEAN is only claimable when nothing was exposed AND nothing went unread."""
         if self.exposures:
             return Verdict.EXPOSED
-        if self.warnings:
+        if self.warnings or self.unread_trees:
             return Verdict.INDETERMINATE
         return Verdict.CLEAN
 
@@ -157,17 +199,46 @@ def is_shallow(repo: Path) -> bool:
     return _git(repo, "rev-parse", "--is-shallow-repository").strip() == "true"
 
 
-def lockfile_paths(repo: Path) -> list[str]:
-    """Every path where a lockfile ever lived on any ref, exact basename only.
+def _paths_with_basename(repo: Path, basenames: tuple[str, ...]) -> list[str]:
+    """Every path where one of these files ever lived on any ref.
 
     ``-z`` output is unquoted, so paths with non-ASCII or special characters
     survive; the basename check rejects look-alikes such as
-    ``sample-package-lock.json``.
+    ``sample-package-lock.json``, which the ``*name`` pathspec would match.
     """
     out = _git(repo, "log", "--all", "--format=", "--name-only", "-z",
-               "--", f"*{LOCKFILE_BASENAME}")
+               "--", *(f"*{name}" for name in basenames))
     names = {n for n in out.replace("\n", "\0").split("\0") if n}
-    return sorted(n for n in names if posixpath.basename(n) == LOCKFILE_BASENAME)
+    wanted = set(basenames)
+    return sorted(n for n in names if posixpath.basename(n) in wanted)
+
+
+def discovered_lockfiles(repo: Path) -> tuple[list[str], list[str]]:
+    """Lockfiles this tool can parse, and lockfiles it can only recognise.
+
+    Both come from one history walk, because walking twice doubles the cost of
+    the most expensive part of a scan.
+    """
+    found = _paths_with_basename(repo, (*NPM_LOCKFILES, *FOREIGN_LOCKFILES))
+    npm = [p for p in found if posixpath.basename(p) in set(NPM_LOCKFILES)]
+    foreign = [p for p in found if posixpath.basename(p) in FOREIGN_LOCKFILES]
+    return npm, foreign
+
+
+def lockfile_paths(repo: Path) -> list[str]:
+    """Every npm lockfile path in this repository's history."""
+    return discovered_lockfiles(repo)[0]
+
+
+def has_manifest(repo: Path) -> bool:
+    """Whether any commit ever added a ``package.json``.
+
+    Asked only when no readable lockfile was found, to tell a Node project whose
+    lock we cannot see from a repository that was never a Node project at all.
+    ``-1`` lets git stop at the first hit instead of walking the whole history.
+    """
+    return bool(_git(repo, "log", "--all", "--format=%H", "-1",
+                     "--", f"*{MANIFEST}").strip())
 
 
 def _refs(repo: Path) -> list[str]:
@@ -364,12 +435,28 @@ def scan_repo(repo: Path, query: WindowQuery) -> RepoFinding:
             finding.warnings.append(
                 "shallow clone: history is truncated, absence of exposure is not evidence"
             )
-        paths = lockfile_paths(repo)
+        paths, foreign = discovered_lockfiles(repo)
         refs = _refs(repo)
         children, parents = _commit_graph(repo) if paths else ({}, {})
+        # Only worth asking when there is no lockfile at all to judge.
+        unlocked_node = not paths and not foreign and has_manifest(repo)
     except GitError as e:
         finding.warnings.append(str(e))
         return finding
+
+    for path in foreign:
+        tool = FOREIGN_LOCKFILES[posixpath.basename(path)]
+        finding.unread_trees.append(UnreadTree(
+            path=path,
+            reason=f"{path}: {tool} lockfiles are not parsed yet, so the versions this "
+                   "tree installed were not judged",
+        ))
+    if unlocked_node:
+        finding.unread_trees.append(UnreadTree(
+            path="",
+            reason=f"a {MANIFEST} is in this history but no lockfile this tool can "
+                   "read, so the versions this project installed are unknown",
+        ))
 
     for path in paths:
         finding.lockfiles_seen += 1
