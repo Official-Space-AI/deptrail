@@ -119,12 +119,27 @@ class RunHistory:
 
 @dataclass(frozen=True)
 class GradedExposure:
-    """One exposure with its grade and the facts the grade rests on."""
+    """One exposure with its grade and the facts the grade rests on.
+
+    ``workflow_paths`` names **every** workflow behind the implicated runs. One
+    push commonly fires several workflows, and each one's environment held its own
+    secrets: scoping to a single file would drop the others' credentials from the
+    rotation list. It is left empty when any implicated run's workflow is unknown,
+    because a partial list would narrow the rotation scope on incomplete evidence.
+
+    ``implicates_install`` says whether those runs could have installed the
+    malicious version. A run that only started after the artifact was pulled, or
+    one whose workflow installs nothing, is evidence *about* the exposure but not
+    evidence that CI executed it — so the rotation list must still consider a
+    local install.
+    """
 
     exposure: Exposure
     grade: Grade
     evidence: tuple[str, ...]
     run_ids: tuple[str, ...] = ()
+    workflow_paths: tuple[str, ...] = ()
+    implicates_install: bool = False
 
 
 @dataclass
@@ -142,6 +157,9 @@ class GradedFinding:
     advisory_id: str | None = None
     package: str | None = None
     coverage_warning: str | None = None
+    # Notes about the CI evidence, kept apart from the walker's warnings: only the
+    # latter mean the repository's history could not be read.
+    ci_notes: list[str] = field(default_factory=list)
 
     @property
     def worst_grade(self) -> Grade:
@@ -179,6 +197,13 @@ def _overlap(exposure: Exposure, query: WindowQuery) -> tuple[datetime, datetime
 HEAD_CHECKOUT_EVENTS = ("push", "workflow_dispatch", "schedule", "release")
 
 
+def _known_workflows(runs: list[RunRecord]) -> tuple[str, ...]:
+    """Every implicated workflow, or nothing if even one of them is unknown."""
+    if any(r.workflow_path is None for r in runs):
+        return ()
+    return tuple(sorted({r.workflow_path for r in runs if r.workflow_path}))
+
+
 def grade_exposure(exposure: Exposure, query: WindowQuery,
                    history: RunHistory) -> GradedExposure:
     """Grade one exposure against the run records. Pure: no I/O, no clock.
@@ -208,6 +233,8 @@ def grade_exposure(exposure: Exposure, query: WindowQuery,
                 f"{exposure.version} executed",
             ),
             run_ids=tuple(r.run_id for r in confirming),
+            workflow_paths=_known_workflows(confirming),
+            implicates_install=True,
         )
 
     if during:
@@ -227,6 +254,10 @@ def grade_exposure(exposure: Exposure, query: WindowQuery,
                 f"{exposure.version} was still served, but {why}",
             ),
             run_ids=tuple(r.run_id for r in during),
+            workflow_paths=_known_workflows(during),
+            # An uninspectable workflow may well have installed; one that
+            # provably installs nothing did not.
+            implicates_install=any(r.installs_dependencies is not False for r in during),
         )
 
     later = [r for r in on_commit if r.at > query.window_end]
@@ -241,6 +272,8 @@ def grade_exposure(exposure: Exposure, query: WindowQuery,
                 "longer served; the install may have failed rather than fetched it",
             ),
             run_ids=tuple(r.run_id for r in later),
+            workflow_paths=_known_workflows(later),
+            implicates_install=False,  # it ran after the artifact was gone
         )
 
     if not history.covers(live_start):
@@ -278,7 +311,7 @@ def grade_finding(finding: RepoFinding, query: WindowQuery, history: RunHistory,
         newest = max((r.at for r in history.records), default=None)
         beyond_retention = newest is not None and earliest < newest - RETENTION
         if not history.covers(earliest) or beyond_retention:
-            graded.warnings.append(
+            graded.ci_notes.append(
                 f"CI records may not reach {earliest.isoformat()} "
                 f"(GitHub keeps runs ~{RETENTION.days} days): absence of a run is "
                 "not absence of an install"
