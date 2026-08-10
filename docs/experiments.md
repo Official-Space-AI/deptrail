@@ -262,3 +262,26 @@ repository name cannot be judged with each other's history; a missing tool exits
 
 **Verification**: the truncated scan now reports `scan_complete: false`, exit 2,
 and the reason in `errors`. A CI job asserts the three codes on every push.
+
+## E11 — Does a default CI checkout read as clean?
+
+**Assumption**: the CI job that judges this repository behaves like a developer's
+clone, so the same command yields the same verdict.
+
+**Method**: none planned — the demo workflow failed on its own assertion, which is
+how the question got asked. The step expected exit 0 from scanning this repository
+and got exit 1.
+
+**Result**: correct behaviour, wrong expectation. `actions/checkout` clones at
+depth 1 by default, so the walker found a truncated history, refused to call the
+repository clean, and asked for a broad rotation — exactly the shallow-clone guard
+working end to end. Locally the same scan exits 0 because the clone is complete.
+
+**Changes**: the job that judges this repository now checks out with
+`fetch-depth: 0`, and the workflow additionally creates a shallow clone on purpose
+and asserts it exits 1 with both "shallow clone" and "cannot prove absence" in the
+report. A unit test pins the same pair of outcomes.
+
+**Verification**: the demo job passes with the deep checkout and fails if the
+shallow assertion ever stops holding — the guard is now proven by CI rather than
+asserted in a docstring.

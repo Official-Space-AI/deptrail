@@ -46,6 +46,13 @@ design, and this tool never asks for them.
 - **A workflow that reads no secrets.** The finding stands; there is simply
   nothing to rotate from it.
 
+## Shallow clones
+
+A shallow clone (including the default `actions/checkout`, which fetches depth 1)
+cannot answer when a version was installed, so a scan of one is reported as
+`POSSIBLE` with the reason, never as clean. In CI, check out with
+`fetch-depth: 0`; the bundled Action deepens the history itself.
+
 ## What the report refuses to claim
 
 A report says it **cannot prove absence** whenever a repository failed to scan or
