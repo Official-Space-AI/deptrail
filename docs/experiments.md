@@ -187,3 +187,25 @@ grade.
 tree", lists the three fixtures under "set aside (3)", and rotates nothing, while
 a root lockfile in the same shape still produces a `CONFIRMED` finding and a
 narrowed rotation list.
+
+## E8 — Does secret extraction hold on real workflows?
+
+**Assumption**: a regex over workflow files finds the secrets a run could reach.
+
+**Method**: clone `axios/axios` and `sindresorhus/got`, extract secrets from every
+workflow at HEAD, and compare against a raw grep of the same files.
+
+**Result**: extraction matched the raw grep on all nine workflows, and the two
+that reference `GITHUB_TOKEN` are correctly excluded from the rotation list as
+ephemeral. The experiment also surfaced a gap the code did not cover: axios's
+`publish.yml` declares `environment: npm-publish` and publishes through OIDC.
+Secrets defined **on a GitHub environment** resolve through the same
+`secrets.NAME` syntax but are not returned by a repository secret listing, so the
+REPO_WIDE fallback would have missed them silently.
+
+**Change**: an implicated workflow's `environment:` declarations are named in the
+report with the reason, so a responder knows to check that environment's secrets
+separately.
+
+**Verification**: the extraction comparison above, plus a regression test for a
+job with `environment: production`.

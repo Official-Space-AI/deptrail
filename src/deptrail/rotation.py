@@ -43,6 +43,10 @@ SECRET_REFERENCE = re.compile(r"secrets\.([A-Za-z_][A-Za-z0-9_-]*)")
 # Local reusable workflows are followed: the caller often names no secrets while
 # the callee reads them.
 LOCAL_USES = re.compile(r"uses:\s*[\"']?(\./[^\s\"']+\.ya?ml)")
+# Environment secrets resolve through the same ``secrets.NAME`` syntax but are not
+# returned by a repository secret listing, so an environment has to be named in
+# the report or its credentials would silently miss the REPO_WIDE fallback.
+ENVIRONMENT = re.compile(r"(?m)^\s*environment:\s*[\"']?([A-Za-z0-9._-]+)")
 REMOTE_USES = re.compile(r"uses:\s*[\"']?([A-Za-z0-9._-]+/[A-Za-z0-9._-]+/\.github/workflows/[^\s\"']+)")
 # Forms that hand a job every secret it could see, so nothing can be narrowed:
 # passing them on to a called workflow, serialising the whole context, or
@@ -162,6 +166,19 @@ def secrets_across_workflows(repo: Path, sha: str, paths: tuple[str, ...],
     return tuple(sorted(names)), Scope.WORKFLOW, "; ".join(reasons)
 
 
+def environments_in_workflows(repo: Path, sha: str, paths: tuple[str, ...],
+                              ) -> tuple[str, ...]:
+    """GitHub environments the implicated workflows enter at that commit."""
+    found: set[str] = set()
+    for path in paths:
+        try:
+            body = COMMENT.sub("", _git_text(repo, "show", f"{sha}:{path}"))
+        except GitError:
+            continue
+        found.update(ENVIRONMENT.findall(body))
+    return tuple(sorted(found))
+
+
 def rotation_for_repo(repo_path: Path, repo_name: str, finding: GradedFinding,
                       repo_secrets: tuple[str, ...] | None = None,
                       ) -> RepoRotation:
@@ -241,6 +258,15 @@ def _items_for_exposure(repo_path: Path, repo_name: str, graded: GradedExposure,
             for secret in repo_secrets if secret not in EPHEMERAL_SECRETS
         ]
 
+    environments = environments_in_workflows(
+        repo_path, exposure.commit, graded.workflow_paths
+    )
+    if environments:
+        rotation.notes.append(
+            f"the implicated run(s) entered environment(s) "
+            f"{', '.join(environments)}; secrets defined on an environment are not "
+            "in a repository secret listing, so check them separately"
+        )
     names, scope, why = secrets_across_workflows(
         repo_path, exposure.commit, graded.workflow_paths
     )

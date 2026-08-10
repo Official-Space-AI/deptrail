@@ -502,3 +502,137 @@ class TestEvidenceBeatsPathHeuristic:
         report = scan_organization([("app", repo)], plan, runs=runs_with(head(repo)),
                                   secrets=secrets_provider)
         assert report.set_aside and report.rotation_items == ()
+
+
+class TestCodexRegressions:
+    """Each test reproduces a wrong result codex found on 86dc828."""
+
+    def test_one_unknown_workflow_path_blocks_narrowing(self, tmp_path, plan):
+        repo = make_repo(tmp_path, "api", [("2025-11-25T10:00:00+00:00", "5.6.1")])
+        sha = exposing_commit(repo)
+
+        def mixed(path: Path, name: str) -> RunHistory:
+            at = datetime(2025, 11, 25, 12, tzinfo=timezone.utc)
+            return RunHistory(
+                records=(
+                    RunRecord(run_id="1", head_sha=sha, started_at=at, workflow="CI",
+                              installs_dependencies=True, event="push",
+                              workflow_path=".github/workflows/ci.yml"),
+                    RunRecord(run_id="2", head_sha=sha, started_at=at, workflow="?",
+                              installs_dependencies=True, event="push",
+                              workflow_path=None),
+                ),
+                oldest_available=datetime(2025, 11, 1, tzinfo=timezone.utc), source="t",
+            )
+
+        report = scan_organization([("api", repo)], plan, runs=mixed,
+                                  secrets=secrets_provider)
+        items = report.rotation_items
+        assert {i.scope for i in items} == {Scope.REPO_WIDE}
+        assert "AWS_KEY" in {i.secret for i in items}
+
+    def test_reusable_workflow_secrets_are_followed(self, tmp_path, plan):
+        caller = ("name: CI\non: [push]\njobs:\n  build:\n    steps:\n      - run: npm ci\n"
+                  "  ship:\n    uses: ./.github/workflows/deploy.yml\n")
+        callee = ("name: Deploy\non:\n  workflow_call:\njobs:\n  go:\n"
+                  "    environment: production\n    steps:\n      - run: ship\n"
+                  "        env:\n          T: ${{ secrets.PROD_TOKEN }}\n")
+        repo = tmp_path / "reuse"
+        repo.mkdir()
+        git(repo, "init", "-q")
+        (repo / ".github/workflows").mkdir(parents=True)
+        (repo / ".github/workflows/ci.yml").write_text(caller)
+        (repo / ".github/workflows/deploy.yml").write_text(callee)
+        (repo / "package-lock.json").write_text(lock("5.6.1"))
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "deps", date="2025-11-25T10:00:00+00:00")
+        report = scan_organization([("reuse", repo)], plan, runs=runs_with(head(repo)),
+                                  secrets=lambda p, n: ("PROD_TOKEN", "OTHER"))
+        assert {i.secret for i in report.rotation_items} == {"PROD_TOKEN"}
+
+    def test_remote_reusable_workflow_cannot_be_narrowed(self, tmp_path, plan):
+        workflow = ("name: CI\non: [push]\njobs:\n  build:\n    steps:\n      - run: npm ci\n"
+                    "  ship:\n    uses: other-org/shared/.github/workflows/deploy.yml@v1\n")
+        repo = make_repo(tmp_path, "api", [("2025-11-25T10:00:00+00:00", "5.6.1")],
+                         workflow=workflow)
+        report = scan_organization([("api", repo)], plan, runs=runs_with(head(repo)),
+                                  secrets=secrets_provider)
+        assert {i.scope for i in report.rotation_items} == {Scope.REPO_WIDE}
+
+    def test_comments_and_plain_strings_are_not_references(self, tmp_path, plan):
+        workflow = ("name: CI\non: [push]\njobs:\n  test:\n    steps:\n      - run: npm ci\n"
+                    "      # - run: echo ${{ secrets.RETIRED }}\n"
+                    "      - run: echo \"secrets.NOT_AN_EXPRESSION\"\n"
+                    "      - run: use\n        env:\n          K: ${{ secrets.REAL_KEY }}\n")
+        repo = make_repo(tmp_path, "api", [("2025-11-25T10:00:00+00:00", "5.6.1")],
+                         workflow=workflow)
+        names, scope, _ = secrets_in_workflow(repo, head(repo), ".github/workflows/ci.yml")
+        assert names == ("REAL_KEY",) and scope is Scope.WORKFLOW
+
+    def test_post_window_run_does_not_erase_the_local_install(self, tmp_path, plan):
+        # A secretless workflow ran after the artifact was pulled. That is not
+        # evidence CI installed it, so the local install must still be listed.
+        plain = "name: CI\non: [push]\njobs:\n  t:\n    steps:\n      - run: npm ci\n"
+        repo = make_repo(tmp_path, "api", [("2025-11-25T10:00:00+00:00", "5.6.1")],
+                         workflow=plain)
+        after = datetime(2025, 12, 20, tzinfo=timezone.utc)
+        report = scan_organization(
+            [("api", repo)], plan,
+            runs=runs_with(exposing_commit(repo), at=after), secrets=secrets_provider,
+        )
+        items = report.rotation_items
+        assert {i.scope for i in items} == {Scope.DEVELOPER}
+        assert {i.secret for i in items} == {"AWS_KEY", "DEPLOY_TOKEN", "NPM_TOKEN"}
+
+    def test_ci_coverage_note_does_not_make_a_repo_indeterminate(self, tmp_path, plan):
+        # A thin CI record is not an unreadable history: a clean repo stays clean.
+        clean = make_repo(tmp_path, "web", [("2025-11-25T10:00:00+00:00", "5.6.0")])
+
+        def unknown_horizon(path: Path, name: str) -> RunHistory:
+            return RunHistory(source="no horizon")
+
+        report = scan_organization([("web", clean)], plan, runs=unknown_horizon,
+                                  secrets=secrets_provider)
+        assert report.rotation_items == ()
+        assert report.worst_grade is Grade.NO_EVIDENCE
+
+    def test_merged_scope_is_order_invariant(self, tmp_path):
+        from deptrail.grading import Grade as G
+        from deptrail.org import OrgReport
+        from deptrail.rotation import RepoRotation, RotationItem
+
+        dev = RotationItem(repo="api", secret="K", scope=Scope.DEVELOPER, grade=G.POSSIBLE,
+                           reason="local")
+        wide = RotationItem(repo="api", secret="K", scope=Scope.REPO_WIDE, grade=G.POSSIBLE,
+                            reason="unreadable", run_ids=("9",))
+        first = OrgReport(advisory_id="x", advisory_name="x",
+                          rotations=[RepoRotation(repo="api", items=[dev, wide])])
+        second = OrgReport(advisory_id="x", advisory_name="x",
+                           rotations=[RepoRotation(repo="api", items=[wide, dev])])
+        assert first.rotation_items[0].scope is second.rotation_items[0].scope is Scope.REPO_WIDE
+
+    def test_indeterminate_repo_is_visible_in_the_header(self, tmp_path, plan):
+        origin = make_repo(tmp_path, "origin", [
+            ("2025-11-25T10:00:00+00:00", "5.6.1"),
+            ("2025-11-28T10:00:00+00:00", "5.6.2"),
+        ])
+        shallow = tmp_path / "shallow"
+        subprocess.run(["git", "clone", "-q", "--depth", "1", f"file://{origin}",
+                        str(shallow)], check=True, capture_output=True)
+        text = render_report(scan_organization([("shallow", shallow)], plan, runs=no_runs,
+                                             secrets=secrets_provider))
+        assert "worst grade POSSIBLE" in text
+        assert "cannot prove absence" in text
+
+
+class TestEnvironmentSecrets:
+    def test_environment_is_named_because_its_secrets_are_not_listed(self, tmp_path, plan):
+        workflow = ("name: CI\non: [push]\njobs:\n  ship:\n    environment: production\n"
+                    "    steps:\n      - run: npm ci\n      - run: deploy\n"
+                    "        env:\n          T: ${{ secrets.PROD_TOKEN }}\n")
+        repo = make_repo(tmp_path, "api", [("2025-11-25T10:00:00+00:00", "5.6.1")],
+                         workflow=workflow)
+        report = scan_organization([("api", repo)], plan, runs=runs_with(head(repo)),
+                                  secrets=lambda p, n: ("REPO_ONLY",))
+        assert {i.secret for i in report.rotation_items} == {"PROD_TOKEN"}
+        assert any("environment(s) production" in n for n in report.rotation_notes)

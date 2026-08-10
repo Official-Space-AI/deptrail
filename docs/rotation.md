@@ -17,10 +17,24 @@ and every entry names the reason it is there.
 | `REPO_WIDE` | A run is implicated but its scope cannot be narrowed — `secrets: inherit`, an unreadable workflow, an unknown workflow path, or an unreadable repository history | Every secret the repository can see |
 | `DEVELOPER` | No run is implicated at all | The repository's secrets, plus the note that whoever installed it locally held those credentials and no log will prove it |
 
-Scope is read from the workflow file **at the exposing commit** — the same file
-the grader reads for install evidence — because that file states which secrets
-that run could see. Only secret *names* are ever read; values are not accessible
-through the API by design, and this tool never asks for them.
+Scope is read from the workflow files **at the exposing commit** — the same files
+the grader reads for install evidence — because they state which secrets those
+runs could see. Every implicated workflow counts, not just the first: one push
+fires several, and each one's environment held its own credentials. Local
+reusable workflows (`uses: ./.github/workflows/deploy.yml`) are followed, since a
+caller often names nothing while the callee reads the deploy token; a reusable
+workflow in another repository cannot be read, so it falls back to `REPO_WIDE`.
+
+Only text inside `${{ ... }}` counts as a reference. A commented-out secret or
+the literal string `"secrets.FOO"` in an echo is not an access, and listing it
+would put a credential nobody used on the list.
+
+Secrets defined on a GitHub **environment** resolve through the same syntax but
+do not appear in a repository secret listing, so any environment an implicated
+run entered is named in the report as something to check separately.
+
+Only secret *names* are ever read; values are not accessible through the API by
+design, and this tool never asks for them.
 
 ## What stays off the list
 
