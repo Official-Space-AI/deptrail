@@ -325,3 +325,23 @@ class TestReportEncoding:
         html = (tmp_path / "r.html").read_text(encoding="utf-8")
         assert "installable window" in html and "2025-11-24" in html
         assert "coverage complete" in html
+
+
+class TestShallowCheckout:
+    """CI caught this: `actions/checkout` is shallow by default, and a shallow
+    clone must never read as clean."""
+
+    def test_shallow_clone_cannot_be_cleared(self, tmp_path, capsys):
+        from deptrail.demo import advisory_path
+        repos = dict(build(tmp_path / "demo"))
+        advisory = advisory_path(tmp_path / "demo")
+        shallow = tmp_path / "shallow"
+        subprocess.run(["git", "clone", "-q", "--depth", "1",
+                        f"file://{repos['web-frontend']}", str(shallow)],
+                       check=True, capture_output=True)
+        code = main(["scan", "--ioc", str(advisory), "--repo", str(shallow), "--no-ci"])
+        out = capsys.readouterr().out
+        # The same repository judged from full history exits 0 (see
+        # test_clean_repo_exits_zero); truncated, it cannot be cleared.
+        assert code == EXIT_ROTATE
+        assert "shallow clone" in out and "cannot prove absence" in out

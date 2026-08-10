@@ -12,6 +12,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # A shallow checkout cannot answer when a version was installed, and the
+          # scanner correctly refuses to call such a repository clean — so the job
+          # that judges this repository needs its real history.
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -57,3 +62,12 @@ jobs:
           expect 3 deptrail scan --ioc no-such-feed --repo .
           expect 2 deptrail scan --ioc example-demo --repo "$RUNNER_TEMP" --no-ci
           expect 3 deptrail scan --ioc example-demo --org acme --repo .
+
+          # A shallow clone must never read as clean: this is the guard that a
+          # default `actions/checkout` (depth 1) would otherwise trip silently.
+          git clone --quiet --depth 1 "file://$PWD" "$RUNNER_TEMP/shallow"
+          expect 1 deptrail scan --ioc example-demo --repo "$RUNNER_TEMP/shallow" --no-ci
+          deptrail scan --ioc example-demo --repo "$RUNNER_TEMP/shallow" --no-ci \
+            > shallow.txt || true
+          grep -q "shallow clone" shallow.txt
+          grep -q "cannot prove absence" shallow.txt
