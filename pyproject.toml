@@ -18,6 +18,9 @@ classifiers = [
   "Programming Language :: Python :: 3",
 ]
 
+[project.scripts]
+deptrail = "deptrail.cli:main"
+
 [project.optional-dependencies]
 dev = ["pytest"]
 

@@ -1,0 +1,28 @@
+name: Demo
+# Proves the evaluator path keeps working: the bundled mock infection must judge
+# itself the same way on a clean machine as it does on ours.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+jobs:
+  demo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -e .
+      - name: deptrail demo
+        run: |
+          set +e
+          deptrail demo --workdir "$RUNNER_TEMP/demo" | tee demo.txt
+          code=${PIPESTATUS[0]}
+          test "$code" -eq 1 || { echo "expected exit 1 (rotate), got $code"; exit 1; }
+          grep -q "CONFIRMED  ] api-server" demo.txt
+          grep -q "NPM_TOKEN" demo.txt
+          grep -q "rotate (3 credential(s))" demo.txt
+          { echo '## deptrail demo'; echo '```'; cat demo.txt; echo '```'; } \
+            >> "$GITHUB_STEP_SUMMARY"

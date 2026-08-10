@@ -237,9 +237,9 @@ def _items_for_exposure(repo_path: Path, repo_name: str, graded: GradedExposure,
                         rotation: RepoRotation) -> list[RotationItem]:
     exposure = graded.exposure
     if not graded.run_ids or not graded.implicates_install:
-        why_local = ("no CI run implicated" if not graded.run_ids else
-                     "the implicated run(s) could not have installed it")
-        reason = (f"{exposure.version} was pinned in {exposure.lockfile_path} with "
+        why_local = ("no CI run was implicated" if not graded.run_ids else
+                     "no implicated run could have installed it")
+        reason = (f"{exposure.version} was pinned in {exposure.lockfile_path} and "
                   f"{why_local}, so the install happened outside CI; Actions "
                   "secrets are not automatically present on a developer machine, "
                   "but the same values often are — investigate that machine's "

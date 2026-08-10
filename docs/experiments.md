@@ -209,3 +209,27 @@ separately.
 
 **Verification**: the extraction comparison above, plus a regression test for a
 job with `environment: production`.
+
+## E9 — Can an evaluator reproduce the judgment on a clean machine?
+
+**Assumption**: the demo works because it works on the machine that wrote it.
+
+**Method**: create an empty virtualenv, install the package from source the way an
+evaluator would, and run the demo with no GitHub token and no network access.
+
+**Result**: install 1.7 s, demo 0.9 s, exit code 1 (credentials to rotate). The
+report distinguishes the three cases the tool exists to tell apart — `api-server`
+CONFIRMED because its workflow ran `npm ci` on the exposing commit, `docs-site`
+LIKELY with a DEVELOPER-scope credential because its workflow installs nothing,
+`web-frontend` absent because it skipped over the window — and the rotation list
+names two credentials out of three in `api-server`, leaving out the one that
+workflow never reads. The HTML report is 3.6 KB with zero external references.
+
+**Change**: none needed; the run also fixed the demo's own gap — the first version
+did not derive install evidence from the committed workflows, so every grade came
+out LIKELY and the CONFIRMED/LIKELY distinction the demo exists to show was
+invisible.
+
+**Verification**: a CI job (`.github/workflows/demo.yml`) now runs the same path on
+a clean runner and asserts the exit code and the three lines above, so the
+evaluator path cannot rot without the build going red.

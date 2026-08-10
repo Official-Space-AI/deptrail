@@ -26,11 +26,72 @@ Current-state scanners answer a different question — "are we infected **now**?
 
 Upstream IOC feeds (OSV malicious-packages, vendor advisories, wormsign.io) are **inputs**, not competitors — DepTrail consumes them.
 
+## Try it in ten seconds
+
+No token, no network, no waiting — the bundled demo builds a mock infection and
+judges it with the production code path:
+
+```bash
+pip install deptrail
+deptrail demo
+```
+
+```
+scanned 3 repo(s); worst grade CONFIRMED
+
+timeline
+  [LIKELY     ] docs-site: chalk@5.6.1 in package-lock.json 2025-11-25 12:00 → still pinned
+                run 4415 (Docs, push) built 8c555ebf ..., but the workflows at that commit install no dependencies
+  [CONFIRMED  ] api-server: chalk@5.6.1 in package-lock.json 2025-11-25 14:30 → 2025-11-28 09:00
+                run 4412 (CI, push) built c6cd5f96 ..., while 5.6.1 was still served by the registry
+                the workflows at that commit install dependencies, so 5.6.1 executed
+
+rotate (3 credential(s))
+  [CONFIRMED  ] api-server: DEPLOY_KEY (run 4412) — named in .github/workflows/ci.yml at c6cd5f96
+  [CONFIRMED  ] api-server: NPM_TOKEN (run 4412) — named in .github/workflows/ci.yml at c6cd5f96
+  [LIKELY     ] docs-site: ALGOLIA_KEY [DEVELOPER] — no implicated run could have installed it ...
+```
+
+`api-server` holds a third secret the CI workflow never reads, so it is not on the
+list. `web-frontend` never held the version while the registry served it, so it is
+absent. Exit codes: `0` nothing to do, `1` credentials to rotate, `2` the scan
+could not prove absence, `3` malformed input.
+
+## Real use
+
+```bash
+deptrail scan --ioc advisory.json --org my-org          # clone and judge an org
+deptrail scan --ioc advisory.json --repo . --no-ci      # one local clone, no token
+deptrail scan --ioc advisory.json --org my-org --format html --output report.html
+deptrail feeds                                          # bundled advisories
+```
+
+Writing the advisory on incident day takes minutes — see
+[`docs/ioc-format.md`](docs/ioc-format.md), and read
+[the window section](docs/ioc-format.md) first: the field most easily transcribed
+wrong is the one that decides everything.
+
+As a GitHub Action:
+
+```yaml
+- uses: Official-Space-AI/deptrail@main
+  with:
+    ioc: advisories/shai-hulud.json
+    report: deptrail-report.html
+```
+
+## How it decides
+
+- [`docs/grading.md`](docs/grading.md) — what each grade requires, and why
+  `POSSIBLE` still means rotate
+- [`docs/rotation.md`](docs/rotation.md) — how the credential list is scoped
+- [`docs/experiments.md`](docs/experiments.md) — every assumption replayed against
+  real repositories, and the bugs that replay found
+
 ## Status
 
-🏗 Under active development for the **2026 Korea Open Source Developer Contest** (submission: Aug 27, 2026).
-
-The core history-judgment engine is validated as a proof of concept — see [`poc/`](poc/), which reconstructs a mock infection against a synthetic three-repo org in ~3 seconds.
+🏗 Under active development for the **2026 Korea Open Source Developer Contest**
+(submission: Aug 27, 2026). npm today; yarn and pnpm next.
 
 ## 한국어 요약
 
