@@ -4,6 +4,7 @@ Grades are asserted through their consequences, not their spelling: what a
 responder does with CONFIRMED and POSSIBLE differs, and what they must never see
 is a repo cleared because no run record survived.
 """
+import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -13,8 +14,10 @@ from deptrail.grading import (
     Grade,
     RunHistory,
     RunRecord,
+    annotate_installs,
     grade_exposure,
     grade_finding,
+    installs_from_workflows,
 )
 from deptrail.history import Exposure, RepoFinding, Verdict, WindowQuery
 
@@ -237,3 +240,57 @@ class TestRunHistoryHorizon:
         moment = datetime(2025, 11, 25, tzinfo=timezone.utc)
         assert RunHistory(oldest_available=moment).covers(moment)
         assert not RunHistory(oldest_available=moment + timedelta(seconds=1)).covers(moment)
+
+
+class TestInstallDetection:
+    """Workflow-based install detection, shaped by E4 (see docs/experiments.md)."""
+
+    def _repo(self, tmp_path, files: dict[str, str]):
+        repo = tmp_path / "wf"
+        repo.mkdir()
+        subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+        for name, body in files.items():
+            target = repo / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(body)
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t",
+             "commit", "-qm", "init"], check=True, capture_output=True,
+        )
+        sha = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                             check=True, capture_output=True, text=True).stdout.strip()
+        return repo, sha
+
+    def test_unambiguous_npm_install_is_true(self, tmp_path):
+        repo, sha = self._repo(tmp_path, {
+            ".github/workflows/ci.yml": "jobs:\n  test:\n    steps:\n      - run: npm ci\n",
+        })
+        assert installs_from_workflows(repo, sha) is True
+
+    def test_other_ecosystem_is_false(self, tmp_path):
+        repo, sha = self._repo(tmp_path, {
+            ".github/workflows/ci.yml": "jobs:\n  test:\n    steps:\n      - run: pip install -e .\n",
+        })
+        assert installs_from_workflows(repo, sha) is False
+
+    def test_no_workflows_is_undecidable(self, tmp_path):
+        repo, sha = self._repo(tmp_path, {"README.md": "hi"})
+        assert installs_from_workflows(repo, sha) is None
+
+    def test_ambiguous_step_name_cannot_confirm(self, tmp_path):
+        # A step merely named "Install" may install anything; guessing would
+        # assert an execution that never happened.
+        repo, sha = self._repo(tmp_path, {
+            ".github/workflows/ci.yml": "jobs:\n  test:\n    steps:\n      - name: Install\n        run: make bootstrap\n",
+        })
+        assert installs_from_workflows(repo, sha) is False
+
+    def test_annotate_uses_one_answer_per_commit(self, tmp_path):
+        repo, sha = self._repo(tmp_path, {
+            ".github/workflows/ci.yml": "jobs:\n  test:\n    steps:\n      - run: npm ci\n",
+        })
+        records = (run(sha=sha, installs=None, run_id="1"),
+                   run(sha=sha, installs=None, run_id="2"))
+        annotated = annotate_installs(repo, records)
+        assert [r.installs_dependencies for r in annotated] == [True, True]

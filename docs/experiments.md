@@ -86,3 +86,45 @@ deduplicated per repository.
 **Verification**: six windows, six matches — including the two that had been
 wrong — at roughly 7 seconds per query over that history. Regression tests cover
 the merge-borne exposure and the deletion boundary.
+
+## E4 — Can a run be shown to have installed the dependencies?
+
+**Assumption**: reading a run's step names through `gh run view` tells us whether
+it installed dependencies, which `CONFIRMED` depends on.
+
+**Method**: resolve step names for real runs in this repository and in
+`axios/axios`, then compare against what those workflows actually do.
+
+**Result**: two problems. Some runs return `{"jobs": []}` — queued, skipped, or
+past their job retention — and the first implementation read that empty list as
+"installs nothing", a false statement in the evidence text. And real step names
+do not carry the command: axios installs in steps named `Install (pass 1)` and
+`Clean and reinstall (pass 2)`, which no honest hint list matches, while a step
+named `Install` in another repository might install anything at all.
+
+**Change**: install detection reads the workflow files **from git at the run's own
+commit** instead of the API. They are versioned alongside the lockfile, so the
+answer matches what that commit's CI would have run, needs no network, no token,
+and no run retention. Only unambiguous commands (`npm ci`, `npm install`, `yarn
+install`, `pnpm install`, …) return `True`; anything else is `False` or `None`,
+and neither can raise a grade to `CONFIRMED`.
+
+**Verification**: `axios/axios` at HEAD → `True` (its workflows run `npm ci`);
+this repository at HEAD → `False` (it installs with pip); axios's root commit,
+which has no workflows → `None`.
+
+## E5 — Does run metadata survive re-runs?
+
+**Assumption**: `startedAt` is when the install happened.
+
+**Method**: read `createdAt` alongside `startedAt` for real runs and check how
+they relate.
+
+**Result**: they are identical for every run in this repository, so nothing is
+visible here — but GitHub rewrites `startedAt` when a run is re-run, which would
+move an install out of the window it actually happened in.
+
+**Change**: a run's effective time is the earlier of `createdAt`/`startedAt`, so
+a re-run months later cannot erase an in-window install. Covered by a regression
+test rather than by this experiment, which could only establish that the field
+exists and is populated.

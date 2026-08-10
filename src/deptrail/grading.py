@@ -44,12 +44,24 @@ from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
 
-from .history import Exposure, RepoFinding, Verdict, WindowQuery, _parse_iso
+from .history import (
+    Exposure,
+    GitError,
+    RepoFinding,
+    Verdict,
+    WindowQuery,
+    _git as _git_text,
+    _parse_iso,
+)
 
 # Workflow steps that fetch dependencies; a run containing one of these executed
 # whatever the lockfile pinned, including any install scripts it carried.
-INSTALL_HINTS = ("npm ci", "npm install", "npm i ", "yarn install", "pnpm install",
-                 "setup-node", "install dependencies", "install deps")
+# Commands that unambiguously install this ecosystem's dependencies. Only these
+# can raise a grade to CONFIRMED: a step merely named "Install" may be
+# installing anything, and guessing would assert an execution that never
+# happened (measured against real workflows — see docs/experiments.md).
+INSTALL_COMMANDS = ("npm ci", "npm i ", "npm install", "yarn install", "yarn --frozen",
+                    "pnpm install", "pnpm i ", "npm-run-all install")
 # GitHub's default run retention; used only to say "the records for that window
 # are probably gone", never to claim a run did or did not happen.
 RETENTION = timedelta(days=90)
@@ -299,37 +311,50 @@ def runs_from_github(repo_slug: str, *, limit: int = 200) -> RunHistory:
     )
 
 
-def resolve_installs(repo_slug: str, records: tuple[RunRecord, ...],
-                     ) -> tuple[RunRecord, ...]:
-    """Fill in ``installs_dependencies`` by reading each run's step names.
+def installs_from_workflows(repo: Path, sha: str) -> bool | None:
+    """Whether the workflows committed at ``sha`` unambiguously install deps.
 
-    CONFIRMED requires showing that a run installed dependencies, so the step
-    names are read for the candidate runs only (one call each). A run we cannot
-    inspect keeps ``None`` and therefore cannot confirm anything.
+    The workflow files are read from git rather than from the API: they are
+    versioned alongside the lockfile, so this answers what that commit's CI
+    would have run — and it needs no network, no tokens, and no run retention.
+    ``None`` means undecidable (no workflow files, or only ambiguous steps such
+    as a bare "Install"), which can never raise a grade to CONFIRMED.
     """
-    resolved = []
-    for record in records:
-        installs: bool | None = None
+    try:
+        listing = _git_text(repo, "ls-tree", "-r", "--name-only", sha,
+                            "--", ".github/workflows")
+    except GitError:
+        return None
+    paths = [line for line in listing.splitlines()
+             if line.endswith((".yml", ".yaml"))]
+    if not paths:
+        return None
+    decided = False
+    for path in paths:
         try:
-            raw = subprocess.run(
-                ["gh", "run", "view", record.run_id, "--repo", repo_slug,
-                 "--json", "jobs"],
-                capture_output=True, text=True, check=True,
-            ).stdout
-            steps = " ".join(
-                step.get("name", "").lower()
-                for job in json.loads(raw or "{}").get("jobs", [])
-                for step in job.get("steps", [])
-            )
-            installs = any(hint in steps for hint in INSTALL_HINTS)
-        except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
-            installs = None
-        resolved.append(
+            body = _git_text(repo, "show", f"{sha}:{path}").lower()
+        except GitError:
+            continue
+        decided = True
+        if any(command in body for command in INSTALL_COMMANDS):
+            return True
+    return False if decided else None
+
+
+def annotate_installs(repo: Path, records: tuple[RunRecord, ...],
+                      ) -> tuple[RunRecord, ...]:
+    """Fill ``installs_dependencies`` for each run from its own commit's workflows."""
+    cache: dict[str, bool | None] = {}
+    annotated = []
+    for record in records:
+        if record.head_sha not in cache:
+            cache[record.head_sha] = installs_from_workflows(repo, record.head_sha)
+        annotated.append(
             RunRecord(
                 run_id=record.run_id, head_sha=record.head_sha,
                 started_at=record.started_at, workflow=record.workflow,
-                installs_dependencies=installs, created_at=record.created_at,
-                event=record.event,
+                installs_dependencies=cache[record.head_sha],
+                created_at=record.created_at, event=record.event,
             )
         )
-    return tuple(resolved)
+    return tuple(annotated)
