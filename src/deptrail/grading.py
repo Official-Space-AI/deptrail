@@ -121,15 +121,17 @@ class RunHistory:
 class GradedExposure:
     """One exposure with its grade and the facts the grade rests on.
 
-    ``workflow_path`` names the workflow behind the implicated run, so a
-    rotation list can be scoped to the secrets that workflow could reach.
+    ``workflow_paths`` names **every** workflow behind the implicated runs. One
+    push commonly fires several workflows, and each one's environment held its own
+    secrets: scoping to a single file would drop the others' credentials from the
+    rotation list.
     """
 
     exposure: Exposure
     grade: Grade
     evidence: tuple[str, ...]
     run_ids: tuple[str, ...] = ()
-    workflow_path: str | None = None
+    workflow_paths: tuple[str, ...] = ()
 
 
 @dataclass
@@ -213,7 +215,8 @@ def grade_exposure(exposure: Exposure, query: WindowQuery,
                 f"{exposure.version} executed",
             ),
             run_ids=tuple(r.run_id for r in confirming),
-            workflow_path=run.workflow_path,
+            workflow_paths=tuple(sorted({r.workflow_path for r in confirming
+                                        if r.workflow_path})),
         )
 
     if during:
@@ -233,7 +236,8 @@ def grade_exposure(exposure: Exposure, query: WindowQuery,
                 f"{exposure.version} was still served, but {why}",
             ),
             run_ids=tuple(r.run_id for r in during),
-            workflow_path=run.workflow_path,
+            workflow_paths=tuple(sorted({r.workflow_path for r in during
+                                        if r.workflow_path})),
         )
 
     later = [r for r in on_commit if r.at > query.window_end]
@@ -248,7 +252,8 @@ def grade_exposure(exposure: Exposure, query: WindowQuery,
                 "longer served; the install may have failed rather than fetched it",
             ),
             run_ids=tuple(r.run_id for r in later),
-            workflow_path=run.workflow_path,
+            workflow_paths=tuple(sorted({r.workflow_path for r in later
+                                        if r.workflow_path})),
         )
 
     if not history.covers(live_start):

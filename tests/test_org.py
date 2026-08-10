@@ -288,3 +288,167 @@ class TestFixtureLockfiles:
                                               runs=runs_with(head(repo))))
         assert "set aside (1)" in text and "tests/fixtures/package-lock.json" in text
         assert "no exposure found in an installed tree" in text
+
+
+class TestMultipleWorkflows:
+    """One push fires several workflows; each one's secrets were in scope."""
+
+    def _two_workflow_repo(self, tmp_path, second: str):
+        repo = tmp_path / "multi"
+        repo.mkdir()
+        git(repo, "init", "-q")
+        (repo / ".github/workflows").mkdir(parents=True)
+        (repo / ".github/workflows/ci.yml").write_text(CI_WORKFLOW)
+        (repo / ".github/workflows/deploy.yml").write_text(second)
+        (repo / "package-lock.json").write_text(lock("5.6.1"))
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "deps", date="2025-11-25T10:00:00+00:00")
+        return repo
+
+    def _runs_for(self, sha, paths):
+        def provider(path: Path, name: str) -> RunHistory:
+            return RunHistory(
+                records=tuple(
+                    RunRecord(run_id=str(i), head_sha=sha,
+                              started_at=datetime(2025, 11, 25, 12, i, tzinfo=timezone.utc),
+                              workflow=f"W{i}", installs_dependencies=True,
+                              event="push", workflow_path=p)
+                    for i, p in enumerate(paths, start=1)
+                ),
+                oldest_available=datetime(2025, 11, 1, tzinfo=timezone.utc), source="test",
+            )
+        return provider
+
+    def test_secrets_of_every_implicated_workflow_are_rotated(self, tmp_path, plan):
+        deploy = ("name: Deploy\non: [push]\njobs:\n  ship:\n    steps:\n"
+                  "      - run: npm ci\n      - run: ship\n        env:\n"
+                  "          KEY: ${{ secrets.AWS_KEY }}\n")
+        repo = self._two_workflow_repo(tmp_path, deploy)
+        report = scan_organization(
+            [("multi", repo)], plan,
+            runs=self._runs_for(head(repo), (".github/workflows/ci.yml",
+                                             ".github/workflows/deploy.yml")),
+            secrets=secrets_provider,
+        )
+        assert {i.secret for i in report.rotation_items} == {
+            "DEPLOY_TOKEN", "NPM_TOKEN", "AWS_KEY"
+        }
+
+    def test_a_secretless_workflow_does_not_empty_the_list(self, tmp_path, plan):
+        # ci.yml here reads no secrets; deploy.yml does. Narrowing to the first
+        # implicated workflow alone would report nothing to rotate.
+        plain = "name: CI\non: [push]\njobs:\n  test:\n    steps:\n      - run: npm ci\n"
+        repo = tmp_path / "multi2"
+        repo.mkdir()
+        git(repo, "init", "-q")
+        (repo / ".github/workflows").mkdir(parents=True)
+        (repo / ".github/workflows/ci.yml").write_text(plain)
+        (repo / ".github/workflows/deploy.yml").write_text(
+            "name: Deploy\non: [push]\njobs:\n  ship:\n    steps:\n      - run: npm ci\n"
+            "      - run: ship\n        env:\n          KEY: ${{ secrets.AWS_KEY }}\n"
+        )
+        (repo / "package-lock.json").write_text(lock("5.6.1"))
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "deps", date="2025-11-25T10:00:00+00:00")
+        report = scan_organization(
+            [("multi2", repo)], plan,
+            runs=self._runs_for(head(repo), (".github/workflows/ci.yml",
+                                             ".github/workflows/deploy.yml")),
+            secrets=secrets_provider,
+        )
+        assert report.worst_grade is Grade.CONFIRMED
+        assert {i.secret for i in report.rotation_items} == {"AWS_KEY"}
+
+
+class TestSecretWildcards:
+    @pytest.mark.parametrize("body,marker", [
+        ("      - run: echo ${{ toJSON(secrets) }}\n", "whole `secrets` context"),
+        ("      - run: echo ${{ secrets[format('T_{0}', matrix.e)] }}\n", "at runtime"),
+        ("    secrets: inherit\n", "secrets: inherit"),
+    ])
+    def test_wildcards_cannot_be_narrowed(self, tmp_path, plan, body, marker):
+        workflow = f"name: CI\non: [push]\njobs:\n  test:\n    steps:\n      - run: npm ci\n{body}"
+        repo = make_repo(tmp_path, "wild", [("2025-11-25T10:00:00+00:00", "5.6.1")],
+                         workflow=workflow)
+        report = scan_organization([("wild", repo)], plan,
+                                  runs=runs_with(head(repo)), secrets=secrets_provider)
+        items = report.rotation_items
+        assert items, "a job holding every secret must not report nothing to rotate"
+        assert {i.scope for i in items} == {Scope.REPO_WIDE}
+        assert any(marker in i.reason for i in items)
+
+
+class TestDeduplicationAndHonesty:
+    def test_one_credential_appears_once_across_packages(self, tmp_path):
+        two = dict(ADVISORY, packages=[
+            {"name": "chalk", "versions": ["5.6.1"], "sources": ["https://a.test"]},
+            {"name": "debug", "versions": ["4.4.2"], "sources": ["https://a.test"]},
+        ])
+        plan = parse_advisory(json.dumps(two)).plan()
+        repo = make_repo(tmp_path, "api", [("2025-11-25T10:00:00+00:00", "5.6.1")])
+        report = scan_organization([("api", repo)], plan,
+                                  runs=runs_with(exposing_commit(repo)),
+                                  secrets=secrets_provider)
+        secrets_listed = [i.secret for i in report.rotation_items]
+        assert sorted(secrets_listed) == ["DEPLOY_TOKEN", "NPM_TOKEN"]
+        assert len(secrets_listed) == len(set(secrets_listed))
+
+    def test_unlistable_secrets_produce_a_note_not_a_fake_credential(self, tmp_path, plan):
+        repo = make_repo(tmp_path, "api", [("2025-11-25T10:00:00+00:00", "5.6.1")])
+        report = scan_organization([("api", repo)], plan, runs=no_runs)
+        assert report.rotation_items == ()
+        assert any("could not be listed" in n for n in report.rotation_notes)
+        text = render_report(report)
+        assert "unavailable" not in text.split("rotate")[1].split("caveats")[0]
+
+    def test_github_token_is_context_not_an_action(self, tmp_path, plan):
+        workflow = ("name: CI\non: [push]\njobs:\n  test:\n    steps:\n      - run: npm ci\n"
+                    "      - run: gh pr list\n        env:\n"
+                    "          GH: ${{ secrets.GITHUB_TOKEN }}\n"
+                    "          KEY: ${{ secrets.AWS_KEY }}\n")
+        repo = make_repo(tmp_path, "api", [("2025-11-25T10:00:00+00:00", "5.6.1")],
+                         workflow=workflow)
+        report = scan_organization([("api", repo)], plan,
+                                  runs=runs_with(head(repo)), secrets=secrets_provider)
+        assert {i.secret for i in report.rotation_items} == {"AWS_KEY"}
+        assert any("expires with its run" in n for n in report.rotation_notes)
+
+    def test_fixture_exposure_does_not_silence_unreadable_history(self, tmp_path, plan):
+        origin = tmp_path / "origin"
+        origin.mkdir()
+        git(origin, "init", "-q")
+        (origin / "tests/fixtures").mkdir(parents=True)
+        (origin / "tests/fixtures/package-lock.json").write_text(lock("5.6.1"))
+        git(origin, "add", "-A")
+        git(origin, "commit", "-qm", "fixtures", date="2025-11-25T10:00:00+00:00")
+        (origin / "README.md").write_text("x")
+        git(origin, "add", "-A")
+        git(origin, "commit", "-qm", "more", date="2025-11-26T10:00:00+00:00")
+        shallow = tmp_path / "shallow"
+        subprocess.run(["git", "clone", "-q", "--depth", "1", f"file://{origin}",
+                        str(shallow)], check=True, capture_output=True)
+        report = scan_organization([("shallow", shallow)], plan, runs=no_runs,
+                                  secrets=secrets_provider)
+        assert report.rotation_items, "unreadable history must still raise credentials"
+        assert not report.proves_absence
+
+    def test_secrets_provider_failure_keeps_the_findings(self, tmp_path, plan):
+        repo = make_repo(tmp_path, "api", [("2025-11-25T10:00:00+00:00", "5.6.1")])
+
+        def broken(path: Path, name: str) -> tuple[str, ...]:
+            raise RuntimeError("gh auth expired")
+
+        report = scan_organization([("api", repo)], plan,
+                                  runs=runs_with(exposing_commit(repo)), secrets=broken)
+        assert report.exposed_repos == ("api",)
+        assert any("gh auth expired" in e for e in report.errors)
+        assert not report.proves_absence
+
+    def test_report_cites_package_grade_and_runs(self, tmp_path, plan):
+        repo = make_repo(tmp_path, "api", [("2025-11-25T10:00:00+00:00", "5.6.1")])
+        text = render_report(scan_organization(
+            [("api", repo)], plan, runs=runs_with(exposing_commit(repo)),
+            secrets=secrets_provider,
+        ))
+        assert "chalk@5.6.1" in text
+        assert "run 99" in text and "[CONFIRMED  ]" in text

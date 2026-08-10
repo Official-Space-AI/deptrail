@@ -31,12 +31,21 @@ from enum import Enum
 from pathlib import Path
 
 from .grading import Grade, GradedExposure, GradedFinding
-from .history import GitError, _git as _git_text
+from .history import GitError, Verdict, _git as _git_text
 
-# ``${{ secrets.NAME }}`` in any of its spacings, plus the wildcard form that
-# hands a called workflow everything the caller can see.
+# ``${{ secrets.NAME }}`` in any of its spacings.
 SECRET_REFERENCE = re.compile(r"secrets\.([A-Za-z_][A-Za-z0-9_-]*)")
-SECRETS_INHERIT = re.compile(r"secrets:\s*inherit")
+# Forms that hand a job every secret it could see, so nothing can be narrowed:
+# passing them on to a called workflow, serialising the whole context, or
+# selecting a name at runtime.
+WILDCARDS = (
+    (re.compile(r"secrets:\s*inherit"), "passes `secrets: inherit`"),
+    (re.compile(r"toJSON\(\s*secrets\s*\)"), "serialises the whole `secrets` context"),
+    (re.compile(r"secrets\s*\["), "selects a secret name at runtime (`secrets[...]`)"),
+)
+# Rotating GITHUB_TOKEN is not a thing a responder can do: it is minted per run
+# and expires when the run ends. It is reported as context, never as an action.
+EPHEMERAL_SECRETS = frozenset({"GITHUB_TOKEN"})
 
 
 class Scope(str, Enum):
@@ -72,10 +81,11 @@ class RepoRotation:
 
 def secrets_in_workflow(repo: Path, sha: str, workflow_path: str | None,
                         ) -> tuple[tuple[str, ...], Scope, str]:
-    """Secrets the workflow at ``sha`` could reach, and how firmly we know it.
+    """Secrets one workflow at ``sha`` could reach, and how firmly we know it.
 
     Returns the names, the scope they justify, and a one-line reason for the
-    report. A workflow we cannot attribute or read never narrows the list.
+    report. A workflow we cannot attribute or read never narrows the list, and
+    neither does one that can reach secrets it does not name.
     """
     if workflow_path is None:
         return (), Scope.REPO_WIDE, "the run's workflow file is unknown"
@@ -83,12 +93,36 @@ def secrets_in_workflow(repo: Path, sha: str, workflow_path: str | None,
         body = _git_text(repo, "show", f"{sha}:{workflow_path}")
     except GitError:
         return (), Scope.REPO_WIDE, f"{workflow_path} could not be read at {sha[:8]}"
-    if SECRETS_INHERIT.search(body):
-        return (), Scope.REPO_WIDE, f"{workflow_path} passes `secrets: inherit`"
+    for pattern, description in WILDCARDS:
+        if pattern.search(body):
+            return (), Scope.REPO_WIDE, f"{workflow_path} {description}"
     names = tuple(sorted(set(SECRET_REFERENCE.findall(body))))
     if not names:
         return (), Scope.WORKFLOW, f"{workflow_path} references no secrets"
     return names, Scope.WORKFLOW, f"named in {workflow_path} at {sha[:8]}"
+
+
+def secrets_across_workflows(repo: Path, sha: str, paths: tuple[str, ...],
+                             ) -> tuple[tuple[str, ...], Scope, str]:
+    """Union the secrets of every implicated workflow.
+
+    One push fires several workflows and each one's environment held its own
+    secrets, so narrowing to the first file would silently drop the rest. If any
+    of them cannot be narrowed, the whole exposure cannot be.
+    """
+    if not paths:
+        return (), Scope.REPO_WIDE, "no workflow file could be attributed to the run"
+    names: set[str] = set()
+    reasons = []
+    for path in paths:
+        found, scope, why = secrets_in_workflow(repo, sha, path)
+        if scope is Scope.REPO_WIDE:
+            return (), Scope.REPO_WIDE, why
+        names.update(found)
+        reasons.append(why)
+    if not names:
+        return (), Scope.WORKFLOW, "; ".join(reasons)
+    return tuple(sorted(names)), Scope.WORKFLOW, "; ".join(reasons)
 
 
 def rotation_for_repo(repo_path: Path, repo_name: str, finding: GradedFinding,
@@ -103,61 +137,83 @@ def rotation_for_repo(repo_path: Path, repo_name: str, finding: GradedFinding,
 
     graded_needing = [g for g in finding.graded
                       if g.grade in (Grade.CONFIRMED, Grade.LIKELY, Grade.POSSIBLE)]
-    if not graded_needing:
-        if finding.needs_rotation:
-            # No exposure was found, yet the verdict is not clean: the history
-            # itself was unreadable, so nothing can be narrowed or cleared.
-            rotation.items.extend(
-                RotationItem(repo=repo_name, secret=secret, scope=Scope.REPO_WIDE,
-                             grade=Grade.POSSIBLE,
-                             reason="this repository's history could not be read, "
-                                    "so exposure was neither shown nor ruled out")
-                for secret in repo_secrets or ("(secret names unavailable)",)
-            )
-        return rotation
+    if finding.verdict is Verdict.INDETERMINATE:
+        # The history itself was unreadable, so nothing can be narrowed or
+        # cleared — independent of whatever exposures were found elsewhere.
+        rotation.items.extend(_repo_wide_items(
+            repo_name, repo_secrets, Grade.POSSIBLE, rotation,
+            "this repository's history could not be read, so exposure was "
+            "neither shown nor ruled out",
+        ))
 
     for item in graded_needing:
         rotation.items.extend(
-            _items_for_exposure(repo_path, repo_name, item, repo_secrets)
+            _items_for_exposure(repo_path, repo_name, item, repo_secrets, rotation)
         )
     return rotation
 
 
-def _items_for_exposure(repo_path: Path, repo_name: str, graded: GradedExposure,
-                        repo_secrets: tuple[str, ...]) -> list[RotationItem]:
-    exposure = graded.exposure
-    if not graded.run_ids:
-        return [
-            RotationItem(
-                repo=repo_name, secret=secret, scope=Scope.DEVELOPER,
-                grade=graded.grade,
-                reason=f"{exposure.version} was pinned in {exposure.lockfile_path} "
-                       "with no CI run implicated; whoever installed it locally "
-                       "held these credentials",
-            )
-            for secret in repo_secrets or ("(secret names unavailable)",)
-        ]
+def _repo_wide_items(repo_name: str, repo_secrets: tuple[str, ...], grade: Grade,
+                     rotation: RepoRotation, reason: str,
+                     run_ids: tuple[str, ...] = ()) -> list[RotationItem]:
+    """Items covering every secret the repo can see, or a note if we cannot list them.
 
-    names, scope, why = secrets_in_workflow(
-        repo_path, exposure.commit, _workflow_path_of(graded)
-    )
-    if scope is Scope.WORKFLOW and names:
-        return [
-            RotationItem(repo=repo_name, secret=secret, scope=scope,
-                         grade=graded.grade, reason=why, run_ids=graded.run_ids)
-            for secret in names
-        ]
-    if scope is Scope.WORKFLOW:
-        # The implicated workflow reads no secrets at all; nothing to rotate from
-        # this exposure, but the finding still stands and is reported as a note.
+    A placeholder entry would be counted and read as a credential; saying plainly
+    that the names are unavailable is the honest alternative.
+    """
+    if not repo_secrets:
+        rotation.notes.append(
+            f"{reason} — and this repository's secret names could not be listed, "
+            "so rotate everything it can see"
+        )
         return []
     return [
         RotationItem(repo=repo_name, secret=secret, scope=Scope.REPO_WIDE,
-                     grade=graded.grade, reason=why, run_ids=graded.run_ids)
-        for secret in repo_secrets or ("(secret names unavailable)",)
+                     grade=grade, reason=reason, run_ids=run_ids)
+        for secret in repo_secrets if secret not in EPHEMERAL_SECRETS
     ]
 
 
-def _workflow_path_of(graded: GradedExposure) -> str | None:
-    """The workflow file behind a grade, if the grader recorded one."""
-    return graded.workflow_path
+def _items_for_exposure(repo_path: Path, repo_name: str, graded: GradedExposure,
+                        repo_secrets: tuple[str, ...],
+                        rotation: RepoRotation) -> list[RotationItem]:
+    exposure = graded.exposure
+    if not graded.run_ids:
+        reason = (f"{exposure.version} was pinned in {exposure.lockfile_path} with "
+                  "no CI run implicated; whoever installed it locally held these "
+                  "credentials")
+        if not repo_secrets:
+            rotation.notes.append(
+                f"{reason} — and this repository's secret names could not be listed"
+            )
+            return []
+        return [
+            RotationItem(repo=repo_name, secret=secret, scope=Scope.DEVELOPER,
+                         grade=graded.grade, reason=reason)
+            for secret in repo_secrets if secret not in EPHEMERAL_SECRETS
+        ]
+
+    names, scope, why = secrets_across_workflows(
+        repo_path, exposure.commit, graded.workflow_paths
+    )
+    if scope is Scope.WORKFLOW and names:
+        actionable = [n for n in names if n not in EPHEMERAL_SECRETS]
+        skipped = sorted(set(names) - set(actionable))
+        if skipped:
+            rotation.notes.append(
+                f"{', '.join(skipped)} was in scope but expires with its run, so it "
+                "is not on the rotation list"
+            )
+        return [
+            RotationItem(repo=repo_name, secret=secret, scope=scope,
+                         grade=graded.grade, reason=why, run_ids=graded.run_ids)
+            for secret in actionable
+        ]
+    if scope is Scope.WORKFLOW:
+        rotation.notes.append(
+            f"{exposure.version} ran in {repo_name} but {why}, so no credential "
+            "from this exposure needs rotating"
+        )
+        return []
+    return _repo_wide_items(repo_name, repo_secrets, graded.grade, rotation, why,
+                            graded.run_ids)

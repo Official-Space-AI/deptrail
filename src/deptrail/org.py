@@ -27,7 +27,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 
 from .grading import Grade, GradedFinding, RunHistory, grade_finding
-from .history import Exposure, scan_repo
+from .history import Exposure, Verdict, scan_repo
 from .ioc import QueryPlan
 from .rotation import RepoRotation, RotationItem, rotation_for_repo
 
@@ -59,6 +59,7 @@ class TimelineEntry:
     """One exposure, placed in the organization-wide order of events."""
 
     repo: str
+    package: str
     exposure: Exposure
     grade: Grade
     evidence: tuple[str, ...]
@@ -78,6 +79,7 @@ class OrgReport:
     errors: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     repos_scanned: int = 0
+    partial_coverage: bool = False
 
     @property
     def exposed_repos(self) -> tuple[str, ...]:
@@ -91,10 +93,46 @@ class OrgReport:
 
     @property
     def rotation_items(self) -> tuple[RotationItem, ...]:
-        """Every credential to rotate, worst grade first, then repo and name."""
+        """Every credential to rotate, once each, worst grade first.
+
+        One credential can be implicated by several packages of the same advisory
+        and by several lockfiles in the same repo. A responder rotates it once, so
+        the duplicates are merged and the strongest grade and every run id are
+        kept — otherwise the count at the top of the report is simply wrong.
+        """
         order = {Grade.CONFIRMED: 0, Grade.LIKELY: 1, Grade.POSSIBLE: 2}
-        items = [item for rotation in self.rotations for item in rotation.items]
-        return tuple(sorted(items, key=lambda i: (order.get(i.grade, 3), i.repo, i.secret)))
+        merged: dict[tuple[str, str], RotationItem] = {}
+        for rotation in self.rotations:
+            for item in rotation.items:
+                key = (item.repo, item.secret)
+                existing = merged.get(key)
+                if existing is None:
+                    merged[key] = item
+                    continue
+                stronger = min(existing, item, key=lambda i: order.get(i.grade, 3))
+                widest = (existing.scope if not existing.is_narrowed
+                          else item.scope if not item.is_narrowed else item.scope)
+                reasons = existing.reason if existing.reason == item.reason else (
+                    f"{existing.reason}; {item.reason}"
+                )
+                merged[key] = replace(
+                    stronger, scope=widest, reason=reasons,
+                    run_ids=tuple(sorted(set(existing.run_ids) | set(item.run_ids))),
+                )
+        return tuple(sorted(merged.values(),
+                            key=lambda i: (order.get(i.grade, 3), i.repo, i.secret)))
+
+    @property
+    def rotation_notes(self) -> tuple[str, ...]:
+        """Per-repository caveats, deduplicated, prefixed with the repo they came from."""
+        seen, notes = set(), []
+        for rotation in self.rotations:
+            for note in rotation.notes:
+                line = f"{rotation.repo}: {note}"
+                if line not in seen:
+                    seen.add(line)
+                    notes.append(line)
+        return tuple(notes)
 
     @property
     def worst_grade(self) -> Grade:
@@ -110,9 +148,8 @@ class OrgReport:
         False if any repository failed to scan or the advisory only covers part of
         the incident: in both cases something was not looked at.
         """
-        return not self.errors and not any(
-            note.startswith("advisory ") for note in self.notes
-        )
+        readable = all(f.verdict is not Verdict.INDETERMINATE for f in self.findings)
+        return not self.errors and not self.partial_coverage and readable
 
 
 def scan_organization(repos: Iterable[tuple[str, Path]], plan: QueryPlan, *,
@@ -124,7 +161,8 @@ def scan_organization(repos: Iterable[tuple[str, Path]], plan: QueryPlan, *,
     injected so the scan is testable without a network and so a caller can supply
     cached data for a large organization.
     """
-    report = OrgReport(advisory_id=plan.advisory_id, advisory_name=plan.advisory_name)
+    report = OrgReport(advisory_id=plan.advisory_id, advisory_name=plan.advisory_name,
+                       partial_coverage=not plan.proves_absence)
     if plan.coverage_warning:
         report.notes.append(plan.coverage_warning)
 
@@ -145,22 +183,40 @@ def scan_organization(repos: Iterable[tuple[str, Path]], plan: QueryPlan, *,
                 finding, query, history,
                 advisory_id=plan.advisory_id, coverage_warning=plan.coverage_warning,
             )
-            report.findings.append(graded)
             report.timeline.extend(
                 TimelineEntry(
-                    repo=name, exposure=g.exposure, grade=g.grade,
-                    evidence=g.evidence, run_ids=g.run_ids,
+                    repo=name, package=query.package, exposure=g.exposure,
+                    grade=g.grade, evidence=g.evidence, run_ids=g.run_ids,
                     probably_installed=is_probably_installed(g.exposure.lockfile_path),
                 )
                 for g in graded.graded
             )
+            kept = [g for g in graded.graded
+                    if is_probably_installed(g.exposure.lockfile_path)]
+            # The verdict has to be recomputed for the kept set: a repo whose only
+            # exposures are fixtures but whose history was unreadable is still
+            # INDETERMINATE, and carrying the original EXPOSED verdict here would
+            # drop its repo-wide rotation items.
             installed = replace(
-                graded,
-                graded=[g for g in graded.graded
-                        if is_probably_installed(g.exposure.lockfile_path)],
+                graded, graded=kept,
+                verdict=(Verdict.EXPOSED if kept
+                         else Verdict.INDETERMINATE if graded.warnings
+                         else Verdict.CLEAN),
             )
+            # The report keeps the finding the decisions were made on, so its
+            # verdict is the one `proves_absence` must answer to.
+            report.findings.append(installed)
             if installed.needs_rotation:
-                repo_secrets = secrets(path, name) if secrets else ()
+                repo_secrets: tuple[str, ...] = ()
+                if secrets:
+                    try:
+                        repo_secrets = secrets(path, name)
+                    except Exception as e:
+                        # One repo's secret listing failing must not lose the
+                        # findings already collected for the rest.
+                        report.errors.append(
+                            f"{name}: secret names unavailable ({type(e).__name__}: {e})"
+                        )
                 report.rotations.append(
                     rotation_for_repo(path, name, installed, repo_secrets)
                 )
@@ -184,7 +240,8 @@ def render_report(report: OrgReport) -> str:
                      if entry.exposure.until else "still pinned")
             lines.append(
                 f"  [{entry.grade.value:11s}] {entry.repo}: "
-                f"{entry.exposure.version} in {entry.exposure.lockfile_path} "
+                f"{entry.package}@{entry.exposure.version} in "
+                f"{entry.exposure.lockfile_path} "
                 f"{entry.exposure.since:%Y-%m-%d %H:%M} → {until}"
             )
             for fact in entry.evidence:
@@ -198,7 +255,8 @@ def render_report(report: OrgReport) -> str:
                      "not installed by any workflow")
         for entry in report.set_aside:
             lines.append(f"  [{entry.grade.value:11s}] {entry.repo}: "
-                         f"{entry.exposure.version} in {entry.exposure.lockfile_path}")
+                         f"{entry.package}@{entry.exposure.version} in "
+                         f"{entry.exposure.lockfile_path}")
         lines.append("")
 
     items = report.rotation_items
@@ -206,15 +264,18 @@ def render_report(report: OrgReport) -> str:
         lines.append(f"rotate ({len(items)} credential(s))")
         for item in items:
             scope = "" if item.is_narrowed else f" [{item.scope.value}]"
-            lines.append(f"  {item.repo}: {item.secret}{scope} — {item.reason}")
+            runs_cited = f" (run {', '.join(item.run_ids)})" if item.run_ids else ""
+            lines.append(f"  [{item.grade.value:11s}] {item.repo}: {item.secret}"
+                         f"{scope}{runs_cited} — {item.reason}")
     else:
         lines.append("rotate: nothing")
 
     if report.errors:
         lines += ["", "could not scan (verdict is not complete)"]
         lines += [f"  {e}" for e in report.errors]
-    if report.notes:
-        lines += ["", "caveats"] + [f"  {n}" for n in report.notes]
+    caveats = list(report.notes) + list(report.rotation_notes)
+    if caveats:
+        lines += ["", "caveats"] + [f"  {c}" for c in caveats]
     if not report.proves_absence:
         lines += ["", "this scan cannot prove absence of exposure"]
     return "\n".join(lines)
