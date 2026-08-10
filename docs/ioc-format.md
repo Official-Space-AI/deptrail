@@ -5,22 +5,29 @@ An advisory is the question DepTrail answers: *which package versions were malic
 ```json
 {
   "schema_version": 1,
-  "id": "GHSA-g7cv-rxg3-hmpx",
-  "name": "TanStack npm supply-chain compromise",
+  "id": "GHSA-0000-0000-0000",
+  "name": "EXAMPLE — replace every value below",
   "ecosystem": "npm",
   "coverage": "partial",
-  "window": { "start": "2026-05-11T11:29:00+00:00", "end": "2026-05-11T19:15:00+00:00" },
+  "window": {
+    "start": "2026-01-02T19:20:42+00:00",
+    "end": "2026-01-03T04:10:00+00:00"
+  },
   "packages": [
     {
-      "name": "@mistralai/mistralai",
-      "versions": ["2.2.2", "2.2.3", "2.2.4"],
-      "sources": ["https://nvd.nist.gov/vuln/detail/CVE-2026-45321"],
-      "notes": "Secondary victim package."
+      "name": "example-package",
+      "versions": ["1.2.3", "1.2.4"],
+      "sources": ["https://example.test/advisory"],
+      "notes": "start = publish time of 1.2.3; end = when the registry no longer served either version (verified, see notes)."
     }
   ],
-  "sources": ["https://github.com/advisories/GHSA-g7cv-rxg3-hmpx"]
+  "sources": ["https://example.test/advisory"]
 }
 ```
+
+The window above is a **placeholder with the right shape**: start at the first
+malicious publish, end after the artifact stopped being installable. Do not copy
+timestamps from an advisory's headline — read the next section first.
 
 ## Fields
 
@@ -53,11 +60,18 @@ any repo could install the bad artifact, so every scan returns CLEAN.
 
 - **Start**: the publish time of the earliest malicious version (npm's registry
   `time` map gives this per version).
-- **End**: when the registry removed those versions. If nobody published that
-  time, choose a deliberately late bound — the advisory's publication time, or
-  later — and say so in `notes`. A wide window over-reports exposure; a narrow
-  one hides it, and only one of those two errors is recoverable by a human
-  reading the report.
+- **End**: a time you can state the artifact was **no longer installable**. The
+  advisory's publication time is not that time — advisories are published while
+  the bad versions are still up, and an end bound set there hides everyone who
+  installed in the gap. Use whichever you can establish:
+  1. a removal time the registry or advisory states, or
+  2. the moment you personally checked and found the versions gone (`npm view
+     <pkg> versions` no longer lists them) — record that check in `notes`, or
+  3. failing both, the time you are writing the feed, which is by construction
+     after the removal you already know happened.
+
+  A wide window over-reports exposure; a narrow one hides it. Only one of those
+  two errors is recoverable by a human reading the report.
 - A package-level `window` must sit **inside** the advisory window; it narrows,
   never extends (extending is a transcription error, and the loader rejects it).
 

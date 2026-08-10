@@ -7,17 +7,20 @@ Two hard rules shape this module, both learned from the walker's review:
   scanning for the wrong thing; every unknown key is an error, not a shrug.
 - **Coverage is part of the evidence.** Advisories are published incrementally,
   so a feed declares whether its package list is ``complete`` or ``partial``.
-  A partial feed can prove exposure but can never prove its absence, and
-  consumers must surface that (see ``Advisory.coverage_warning``).
+  A partial feed can prove exposure but can never prove its absence, so the
+  caveat travels with the work: consumers scan an ``Advisory.plan()``, whose
+  ``coverage_warning`` and ``proves_absence`` cannot be dropped by accident.
 
 A window is the interval in which the malicious artifact was **installable** —
 first malicious publish until the registry removed it — not the interval in which
 the attacker was active. Vendors usually publish the latter, and the two differ
 by hours: the TanStack wave's CI compromise ran 11:29-19:15 UTC while the
 poisoned versions only appeared at 19:20 and later, so a feed transcribing the
-attacker-activity window could only ever return CLEAN. When the removal time is
-not published, a deliberately late end bound is the safe error: a wide window
-over-reports exposure, a narrow one hides it.
+attacker-activity window could only ever return CLEAN. The end bound must be a
+time the artifact was no longer installable — not the advisory's publication
+time, which is typically hours before removal — and when it is not published, a
+deliberately late bound is the safe error: a wide window over-reports exposure,
+a narrow one hides it.
 
 Windows are inclusive on both ends and must be written as full ISO-8601
 timestamps with a UTC offset — no bare dates, because deciding which instants a
@@ -38,12 +41,24 @@ FEEDS_DIR = Path(__file__).parent / "feeds"
 SCHEMA_VERSION = 1
 COVERAGE_VALUES = ("complete", "partial")
 
-# npm's own name rule (lowercase since 2014), and an exact-version shape: a
-# lockfile stores a resolved version string, so anything a range or tag could
-# expand to would match nothing and read as CLEAN.
-_NPM_NAME = re.compile(r"^(?:@[a-z0-9-~][a-z0-9._~-]*/)?[a-z0-9-~][a-z0-9._~-]*$")
-_EXACT_VERSION = re.compile(r"^\d+(?:\.\d+)*(?:[-+][0-9A-Za-z.+-]+)?$")
-_URL = re.compile(r"^https?://\S+$")
+# npm's own name rule (lowercase since 2014) and strict ASCII SemVer, which is
+# what a lockfile records. Everything is ASCII-anchored on purpose: a full-width
+# "５.６.１" or a two-part "1.0" would pass a looser pattern, match no lockfile
+# entry, and read as CLEAN.
+_NPM_NAME = re.compile(r"^(?:@[a-z0-9-~][a-z0-9._~-]*/)?[a-z0-9-~][a-z0-9._~-]*$", re.ASCII)
+_NPM_NAME_RESERVED = {"node_modules", "favicon.ico"}
+_NPM_NAME_MAX = 214
+_SEMVER = re.compile(
+    r"^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)"
+    r"(?:-(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)"
+    r"(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*)?"
+    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$",
+    re.ASCII,
+)
+_URL = re.compile(r"^https?://\S+$", re.ASCII)
+# A bound must name the second it happens at; fromisoformat would otherwise
+# zero-fill a missing field and quietly move the edge of the window.
+_HAS_SECONDS = re.compile(r"[T ]\d{2}:\d{2}:\d{2}", re.ASCII)
 
 _ADVISORY_KEYS = {
     "schema_version", "id", "name", "ecosystem", "window", "coverage",
@@ -82,6 +97,18 @@ def _parse_bound(value: object, *, where: str) -> datetime:
         raise IocError(
             f"{where}: {value!r} has no time of day — write a full timestamp with "
             f"an offset, e.g. {text[:10]}T00:00:00+00:00 for the start of that day"
+        )
+    if not _HAS_SECONDS.search(text):
+        if re.match(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}", text, re.ASCII):
+            raise IocError(
+                f"{where}: {value!r} omits seconds — write them out (a missing second "
+                "would silently become :00 and move the edge of the window)"
+            )
+        raise IocError(f"{where}: {value!r} is not an ISO-8601 timestamp")
+    if text.endswith("-00:00"):
+        raise IocError(
+            f"{where}: {value!r} uses -00:00, which means 'offset unknown'; "
+            "write +00:00 if the bound really is UTC"
         )
     try:
         stamp = datetime.fromisoformat(text)
@@ -142,17 +169,69 @@ class Advisory:
             "is not evidence of safety for packages this feed does not list"
         )
 
-    def queries(self) -> list[WindowQuery]:
-        """One WindowQuery per package — the walker's unit of work."""
-        return [
-            WindowQuery(
-                package=pkg.name,
-                malicious_versions=frozenset(pkg.versions),
-                window_start=(pkg.window or self.window)[0],
-                window_end=(pkg.window or self.window)[1],
-            )
-            for pkg in self.packages
-        ]
+    def plan(self) -> QueryPlan:
+        """The walker's work, with the coverage caveat and provenance attached.
+
+        Consumers get a plan rather than a bare list of queries so that a
+        ``partial`` feed cannot be scanned without its caveat travelling to the
+        report: a list of queries would let "no exposure found" read as CLEAN
+        for packages the feed never listed.
+        """
+        return QueryPlan(
+            advisory_id=self.id,
+            advisory_name=self.name,
+            coverage=self.coverage,
+            coverage_warning=self.coverage_warning,
+            sources=self.sources,
+            entries=tuple(
+                PlannedQuery(
+                    query=WindowQuery(
+                        package=pkg.name,
+                        malicious_versions=frozenset(pkg.versions),
+                        window_start=(pkg.window or self.window)[0],
+                        window_end=(pkg.window or self.window)[1],
+                    ),
+                    package=pkg,
+                )
+                for pkg in self.packages
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class PlannedQuery:
+    """One walker query with the advisory entry it came from."""
+
+    query: WindowQuery
+    package: CompromisedPackage
+
+    @property
+    def sources(self) -> tuple[str, ...]:
+        return self.package.sources
+
+
+@dataclass(frozen=True)
+class QueryPlan:
+    """Everything a scan needs from an advisory, caveat included."""
+
+    advisory_id: str
+    advisory_name: str
+    coverage: str
+    coverage_warning: str | None
+    sources: tuple[str, ...]
+    entries: tuple[PlannedQuery, ...]
+
+    @property
+    def queries(self) -> tuple[WindowQuery, ...]:
+        return tuple(entry.query for entry in self.entries)
+
+    @property
+    def proves_absence(self) -> bool:
+        """Whether 'nothing found' may be reported as CLEAN for this advisory."""
+        return self.coverage_warning is None
+
+    def __len__(self) -> int:
+        return len(self.entries)
 
 
 def _no_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
@@ -245,6 +324,11 @@ def _package_name(raw: object, where: str) -> str:
     _require(isinstance(raw, str), f"{where}: must be a string")
     name = str(raw).strip()
     _require(name != "", f"{where}: must not be empty")
+    _require(len(name) <= _NPM_NAME_MAX,
+             f"{where}: npm names are at most {_NPM_NAME_MAX} characters")
+    _require(name.lower() not in _NPM_NAME_RESERVED,
+             f"{where}: {name!r} is a name npm reserves and no package can have "
+             "(a column header copied out of a table?)")
     if not _NPM_NAME.fullmatch(name):
         hint = ""
         if "@" in name[1:]:
@@ -268,11 +352,15 @@ def _versions(raw: object, where: str) -> tuple[str, ...]:
     versions = _string_list(raw, where, required=True)
     _require(len(set(versions)) == len(versions), f"{where}: duplicate versions")
     for version in versions:
-        if not _EXACT_VERSION.fullmatch(version):
+        if not _SEMVER.fullmatch(version):
             hint = " — ranges and tags cannot match a resolved lockfile version"
             if version.startswith(("v", "V")):
                 hint = " — drop the leading 'v'"
-            raise IocError(f"{where}: {version!r} is not an exact version{hint}")
+            elif not version.isascii():
+                hint = " — contains non-ASCII digits or characters"
+            elif version.count(".") < 2:
+                hint = " — npm versions have three parts (major.minor.patch)"
+            raise IocError(f"{where}: {version!r} is not an exact SemVer version{hint}")
     return versions
 
 

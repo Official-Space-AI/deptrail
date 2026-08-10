@@ -49,12 +49,12 @@ class TestHappyPath:
         assert adv.packages[0].versions == ("5.6.1",)
         assert adv.coverage_warning is None
 
-    def test_queries_map_one_per_package(self):
+    def test_plan_maps_one_query_per_package(self):
         adv = parse_advisory(advisory_with(packages=[
             {"name": "chalk", "versions": ["5.6.1"], "sources": ["https://a.test"]},
             {"name": "debug", "versions": ["4.4.2", "4.4.3"], "sources": ["https://a.test"]},
         ]))
-        queries = adv.queries()
+        queries = adv.plan().queries
         assert [q.package for q in queries] == ["chalk", "debug"]
         assert queries[1].malicious_versions == frozenset({"4.4.2", "4.4.3"})
         assert all(q.window_start == adv.window[0] for q in queries)
@@ -63,7 +63,7 @@ class TestHappyPath:
         adv = parse_advisory(package_with(
             window={"start": "2025-11-25T00:00:00+00:00", "end": "2025-11-25T12:00:00+00:00"}
         ))
-        query = adv.queries()[0]
+        query = adv.plan().queries[0]
         assert query.window_start == datetime(2025, 11, 25, tzinfo=timezone.utc)
         assert query.window_start != adv.window[0]
 
@@ -211,7 +211,7 @@ class TestBundledFeeds:
 
     def test_demo_feed_matches_the_poc_scenario(self):
         advisory = load_advisory("example-demo")
-        query = advisory.queries()[0]
+        query = advisory.plan().queries[0]
         assert query.package == "chalk"
         assert query.malicious_versions == frozenset({"5.6.1"})
 
@@ -229,7 +229,7 @@ class TestNameAndVersionShape:
     def test_surrounding_whitespace_is_stripped(self, name):
         adv = parse_advisory(package_with(name=name))
         assert adv.packages[0].name == "chalk"
-        assert adv.queries()[0].package == "chalk"
+        assert adv.plan().queries[0].package == "chalk"
 
     @pytest.mark.parametrize("name,hint", [
         ("chalk@5.6.1", "put the version in 'versions'"),
@@ -247,10 +247,17 @@ class TestNameAndVersionShape:
 
     @pytest.mark.parametrize("version", ["^5.6.1", "~5.6", ">=5.0.0", "5.x", "*", "latest", "v5.6.1"])
     def test_ranges_and_tags_rejected(self, version):
-        with pytest.raises(IocError, match="not an exact version"):
+        with pytest.raises(IocError, match="not an exact SemVer version"):
             parse_advisory(package_with(versions=[version]))
 
-    @pytest.mark.parametrize("version", ["5.6.1", "1.0", "1.2.3-beta.1", "1.2.3+build.5"])
+    @pytest.mark.parametrize("version", ["５.６.１", "1.0", "01.2.3", "1.2.3-+", "1.2", ""])
+    def test_versions_no_lockfile_can_contain_are_rejected(self, version):
+        # Each of these passed a looser check and then matched nothing: a CLEAN
+        # verdict for a repo that may well have been exposed.
+        with pytest.raises(IocError):
+            parse_advisory(package_with(versions=[version]))
+
+    @pytest.mark.parametrize("version", ["5.6.1", "0.0.1", "1.2.3-beta.1", "1.2.3+build.5"])
     def test_exact_versions_accepted(self, version):
         assert parse_advisory(package_with(versions=[version])).packages[0].versions == (version,)
 
@@ -297,7 +304,7 @@ class TestProvenanceAndAmbiguity:
             {"name": "chalk", "versions": ["5.6.3"], "sources": ["https://a.test"],
              "window": {"start": "2025-11-26T00:00:00+00:00", "end": "2025-11-26T12:00:00+00:00"}},
         ]))
-        assert len(adv.queries()) == 2
+        assert len(adv.plan()) == 2
 
     def test_same_package_twice_with_same_window_rejected(self):
         with pytest.raises(IocError, match="duplicate entry"):
@@ -313,3 +320,47 @@ class TestProvenanceAndAmbiguity:
                 "start": "2025-11-24T00:00:00+00:00", "end": "2025-11-25T00:00:00+00:00",
                 "timezone": "KST",
             }))
+
+
+class TestBoundPrecision:
+    @pytest.mark.parametrize("bound", ["2025-11-24T10:15+00:00", "2025-11-24T10+00:00"])
+    def test_missing_seconds_rejected(self, bound):
+        # fromisoformat would zero-fill, silently moving the edge of the window.
+        with pytest.raises(IocError, match="omits seconds"):
+            parse_advisory(advisory_with(window={
+                "start": "2025-11-24T00:00:00+00:00", "end": bound,
+            }))
+
+    def test_negative_zero_offset_rejected(self):
+        with pytest.raises(IocError, match="offset unknown"):
+            parse_advisory(advisory_with(window={
+                "start": "2025-11-24T00:00:00-00:00", "end": "2025-11-25T00:00:00+00:00",
+            }))
+
+
+class TestReservedNames:
+    @pytest.mark.parametrize("name", ["node_modules", "favicon.ico"])
+    def test_names_npm_reserves_are_rejected(self, name):
+        with pytest.raises(IocError, match="reserves"):
+            parse_advisory(package_with(name=name))
+
+    def test_over_length_name_rejected(self):
+        with pytest.raises(IocError, match="at most 214"):
+            parse_advisory(package_with(name="a" * 215))
+
+
+class TestQueryPlan:
+    def test_partial_coverage_travels_with_the_queries(self):
+        plan = parse_advisory(advisory_with(coverage="partial")).plan()
+        assert plan.coverage_warning and not plan.proves_absence
+        assert len(plan) == len(plan.queries) == 1
+
+    def test_complete_coverage_may_prove_absence(self):
+        plan = parse_advisory(advisory_with(coverage="complete")).plan()
+        assert plan.coverage_warning is None and plan.proves_absence
+
+    def test_entries_carry_their_provenance(self):
+        plan = parse_advisory(json.dumps(MINIMAL)).plan()
+        entry = plan.entries[0]
+        assert entry.sources == entry.package.sources
+        assert entry.query.package == entry.package.name
