@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -92,19 +93,28 @@ LAYOUT = (
 )
 
 
+SENTINEL = ".deptrail-demo-repo"
+
+
 def _git(repo: Path, *args: str, when: str | None = None) -> None:
     env = dict(os.environ)
     if when:
         env["GIT_AUTHOR_DATE"] = env["GIT_COMMITTER_DATE"] = when
+    # The demo must run identically on a machine with no git identity, and must
+    # not pick up a global commit.gpgsign or template that would fail or differ.
+    env.update({"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull,
+                "GIT_TERMINAL_PROMPT": "0"})
     subprocess.run(
         ["git", "-C", str(repo), "-c", "user.email=demo@deptrail", "-c",
-         "user.name=deptrail demo", *args],
+         "user.name=deptrail demo", "-c", "commit.gpgsign=false",
+         "-c", "init.defaultBranch=main", *args],
         check=True, capture_output=True, env=env,
     )
 
 
 def _lockfile(chalk_version: str) -> str:
-    """A lockfile where chalk arrives through express -> debug, as in the real wave."""
+    """A synthetic lockfile: chalk enters through express -> debug so the report
+    shows a transitive chain. The real express does not depend on chalk."""
     return json.dumps({
         "name": "app", "version": "1.0.0", "lockfileVersion": 3,
         "packages": {
@@ -125,8 +135,17 @@ def build(root: Path) -> list[tuple[str, Path]]:
     for name, _, workflows, states in LAYOUT:
         repo = root / name
         if repo.exists():
-            subprocess.run(["rm", "-rf", str(repo)], check=True)
+            # Only a directory this command created may be replaced: someone
+            # running `deptrail demo --workdir .` in a real workspace must not
+            # lose their own api-server.
+            if not (repo / SENTINEL).exists():
+                raise FileExistsError(
+                    f"{repo} already exists and was not created by deptrail demo; "
+                    "choose an empty --workdir"
+                )
+            shutil.rmtree(repo)
         repo.mkdir()
+        (repo / SENTINEL).write_text("created by `deptrail demo`\n")
         _git(repo, "init", "-q")
         for path, body in workflows.items():
             target = repo / path
@@ -147,6 +166,22 @@ def advisory_path(root: Path) -> Path:
     return path
 
 
+def _commit_pinning(repo: Path, version: str) -> str:
+    """The commit whose lockfile pins ``version``, found by reading the snapshots."""
+    shas = subprocess.run(
+        ["git", "-C", str(repo), "log", "--format=%H", "--", "package-lock.json"],
+        check=True, capture_output=True, text=True,
+    ).stdout.split()
+    for sha in shas:
+        body = subprocess.run(
+            ["git", "-C", str(repo), "show", f"{sha}:package-lock.json"],
+            check=True, capture_output=True, text=True,
+        ).stdout
+        if f'"version": "{version}"' in body:
+            return sha
+    raise LookupError(f"no commit in {repo} pins {version}")
+
+
 def runs_provider(root: Path):
     """Synthetic CI history: api-server and docs-site built during the window.
 
@@ -154,23 +189,20 @@ def runs_provider(root: Path):
     grades a responder must be able to tell apart.
     """
     def provider(path: Path, name: str) -> RunHistory:
-        head = subprocess.run(
-            ["git", "-C", str(path), "log", "--format=%H", "--", "package-lock.json"],
-            check=True, capture_output=True, text=True,
-        ).stdout.split()
         records: list[RunRecord] = []
         if name == "api-server":
-            # The run that built the exposing commit, one hour after it landed.
-            exposing = head[1]  # newest first: [5.6.2, 5.6.1, 5.6.0]
+            # The run that built the exposing commit, an hour after it landed. The
+            # commit is found by its content, so adding a state to LAYOUT cannot
+            # silently point the run at the wrong tree.
             records.append(RunRecord(
-                run_id="4412", head_sha=exposing,
+                run_id="4412", head_sha=_commit_pinning(path, "5.6.1"),
                 started_at=datetime(2025, 11, 25, 15, 30, tzinfo=timezone.utc),
                 workflow="CI", event="push",
                 workflow_path=".github/workflows/ci.yml",
             ))
         if name == "docs-site":
             records.append(RunRecord(
-                run_id="4415", head_sha=head[0],
+                run_id="4415", head_sha=_commit_pinning(path, "5.6.1"),
                 started_at=datetime(2025, 11, 25, 13, 0, tzinfo=timezone.utc),
                 workflow="Docs", event="push",
                 workflow_path=".github/workflows/docs.yml",

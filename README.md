@@ -32,7 +32,7 @@ No token, no network, no waiting — the bundled demo builds a mock infection an
 judges it with the production code path:
 
 ```bash
-pip install deptrail
+pip install git+https://github.com/Official-Space-AI/deptrail
 deptrail demo
 ```
 
@@ -74,11 +74,16 @@ wrong is the one that decides everything.
 As a GitHub Action:
 
 ```yaml
+- uses: actions/checkout@v4
 - uses: Official-Space-AI/deptrail@main
   with:
     ioc: advisories/shai-hulud.json
     report: deptrail-report.html
 ```
+
+The action installs the version it is pinned to, so the ref you write is the code
+that runs. It fails the job when credentials need rotating, and always fails when
+the scan could not run at all — a green check must never mean "we could not look".
 
 ## How it decides
 
@@ -91,7 +96,8 @@ As a GitHub Action:
 ## Status
 
 🏗 Under active development for the **2026 Korea Open Source Developer Contest**
-(submission: Aug 27, 2026). npm today; yarn and pnpm next.
+(submission: Aug 27, 2026). Install from git until the first PyPI release; npm
+today, yarn and pnpm next.
 
 ## 한국어 요약
 

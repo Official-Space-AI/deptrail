@@ -214,8 +214,9 @@ job with `environment: production`.
 
 **Assumption**: the demo works because it works on the machine that wrote it.
 
-**Method**: create an empty virtualenv, install the package from source the way an
-evaluator would, and run the demo with no GitHub token and no network access.
+**Method**: create an empty virtualenv, install the package from the checkout —
+the same path the README's `pip install git+https://…` line takes once the source
+is fetched — and run the demo with no GitHub token and no network access.
 
 **Result**: install 1.7 s, demo 0.9 s, exit code 1 (credentials to rotate). The
 report distinguishes the three cases the tool exists to tell apart — `api-server`
@@ -233,3 +234,31 @@ invisible.
 **Verification**: a CI job (`.github/workflows/demo.yml`) now runs the same path on
 a clean runner and asserts the exit code and the three lines above, so the
 evaluator path cannot rot without the build going red.
+
+## E10 — Does the exit-code contract survive the process boundary?
+
+**Assumption**: the four exit codes describe every outcome, so a CI gate can act
+on them without reading the report.
+
+**Method**: drive the CLI with a fake `gh` on `PATH` that truncates its listing
+the way the real one does, with a stale cache whose fetch fails, with `gh` absent
+entirely, and with a malformed advisory — checking the code and the machine-readable
+report each time.
+
+**Result**: three ways to report a clean that was never established.
+`--limit` truncation dropped the unscanned repositories with no trace: three
+infected repositories and three credentials collapsed into `rotate: nothing`,
+exit 0, and an HTML artifact whose only verdict line was "No exposure found".
+A failed `git fetch` on a cached clone was ignored, so an old clean history was
+judged as current. And a missing `gh` escaped as a traceback with exit 1 — which
+in this contract reads as "rotate these credentials".
+
+**Changes**: a listing that reaches `--limit` is an error that forces exit 2; a
+failed fetch is an error naming the stale cache; clones are keyed by
+organization *and* name with the remote verified, so two organizations sharing a
+repository name cannot be judged with each other's history; a missing tool exits
+3; argparse usage errors exit 3 rather than colliding with "incomplete"; and
+`--org` together with `--repo` is refused instead of silently ignoring the latter.
+
+**Verification**: the truncated scan now reports `scan_complete: false`, exit 2,
+and the reason in `errors`. A CI job asserts the three codes on every push.

@@ -85,11 +85,18 @@ class RotationItem:
 
 @dataclass
 class RepoRotation:
-    """Rotation items for one repository, plus what limited the scoping."""
+    """Rotation items for one repository, plus what limited the scoping.
+
+    ``unnamed`` is for the case a caller must not confuse with safety: credentials
+    are at risk but could not be named, so an empty ``items`` list does not mean
+    an empty rotation list. ``notes`` is everything else — caveats that inform but
+    demand nothing.
+    """
 
     repo: str
     items: list[RotationItem] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    unnamed: list[str] = field(default_factory=list)
 
 
 def _expressions(body: str) -> str:
@@ -217,7 +224,7 @@ def _repo_wide_items(repo_name: str, repo_secrets: tuple[str, ...] | None, grade
     alternative. ``None`` means the listing failed, ``()`` means it returned empty.
     """
     if repo_secrets is None:
-        rotation.notes.append(
+        rotation.unnamed.append(
             f"{reason} — and this repository's secret names could not be listed, "
             "so rotate everything it can see"
         )
@@ -240,13 +247,14 @@ def _items_for_exposure(repo_path: Path, repo_name: str, graded: GradedExposure,
         why_local = ("no CI run was implicated" if not graded.run_ids else
                      "no implicated run could have installed it")
         reason = (f"{exposure.version} was pinned in {exposure.lockfile_path} and "
-                  f"{why_local}, so the install happened outside CI; Actions "
-                  "secrets are not automatically present on a developer machine, "
-                  "but the same values often are — investigate that machine's "
-                  "credentials as well")
+                  f"{why_local}, so if it was installed at all it was outside CI; "
+                  "Actions secrets are not automatically present on a developer "
+                  "machine, but the same values often are — investigate that "
+                  "machine's credentials as well")
         if repo_secrets is None:
-            rotation.notes.append(
-                f"{reason} — and this repository's secret names could not be listed"
+            rotation.unnamed.append(
+                f"{reason} — and this repository's secret names could not be listed, "
+                "so rotate everything it can see"
             )
             return []
         if not repo_secrets:

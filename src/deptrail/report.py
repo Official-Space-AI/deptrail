@@ -46,12 +46,16 @@ def _grade(grade: Grade) -> str:
             f'{escape(grade.value)}</span>')
 
 
-def render_html(report: OrgReport) -> str:
+def render_html(report: OrgReport, advisory=None) -> str:
     """One file a responder can forward as-is."""
     items = report.rotation_items
     banner_color = GRADE_COLOR[report.worst_grade]
-    headline = (f"{len(items)} credential(s) to rotate" if items
-                else "no credential to rotate")
+    if items:
+        headline = f"{len(items)} credential(s) to rotate"
+    elif report.rotation_required:
+        headline = "credentials are at risk but could not be named — rotate broadly"
+    else:
+        headline = "no credential to rotate"
     if not report.proves_absence:
         headline += " — this scan cannot prove absence of exposure"
 
@@ -66,6 +70,18 @@ def render_html(report: OrgReport) -> str:
         f"scanned · worst grade {_grade(report.worst_grade)}</p>",
         f"<p class='banner' style='border-color:{banner_color}'>{escape(headline)}</p>",
     ]
+
+    if advisory is not None:
+        window = (f"{advisory.window[0]:%Y-%m-%d %H:%M %Z} → "
+                  f"{advisory.window[1]:%Y-%m-%d %H:%M %Z}")
+        sources = " · ".join(escape(s) for s in advisory.sources)
+        out.append(
+            "<h2>Advisory</h2><p class='sub'>installable window "
+            f"<strong>{escape(window)}</strong> · coverage "
+            f"{escape(advisory.coverage)} · packages "
+            + ", ".join(f"<code>{escape(p.name)}</code>" for p in advisory.packages)
+            + f"<br>{sources}</p>"
+        )
 
     out.append("<h2>Rotate</h2>")
     if items:
@@ -82,8 +98,10 @@ def render_html(report: OrgReport) -> str:
                 f"<td>{escape(item.reason)}{runs}</td></tr>"
             )
         out.append("</table>")
-    elif report.rotation_notes:
-        out.append("<p>No credential could be named — read the caveats below.</p>")
+    elif report.rotation_required:
+        out.append("<p>Credentials are at risk but could not be named:</p><ul>")
+        out += [f"<li>{escape(n)}</li>" for n in report.unnamed_rotations]
+        out.append("</ul>")
     else:
         out.append("<p>Nothing.</p>")
 

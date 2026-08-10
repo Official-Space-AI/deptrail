@@ -8,8 +8,9 @@ inputs:
     required: true
   fail-on:
     description: >-
-      When to fail the job: "rotate" (credentials to rotate), "incomplete"
-      (also when the scan cannot prove absence), or "never".
+      When to fail the job: "rotate" (credentials to rotate, plus any bad input),
+      "incomplete" (also when the scan cannot prove absence), or "never" (report
+      only; bad input still fails, because a scan that never ran is not a pass).
     required: false
     default: rotate
   report:
@@ -19,32 +20,57 @@ inputs:
 runs:
   using: composite
   steps:
-    # A shallow checkout cannot answer when a version was installed, so the
-    # action fetches the full history rather than reporting a clean it cannot know.
-    - name: Deepen history
-      shell: bash
-      run: git fetch --prune --unshallow || git fetch --prune
+    # The action installs the version it was pinned to, so the workflow's ref and
+    # the code that runs can never drift apart.
     - name: Install deptrail
       shell: bash
-      run: pip install --quiet deptrail
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+      run: pip install --quiet "$ACTION_PATH"
+    # A shallow checkout cannot answer when a version was installed, so the action
+    # deepens the history rather than reporting a clean it cannot know.
+    - name: Deepen history
+      shell: bash
+      run: git fetch --prune --unshallow --quiet || git fetch --prune --quiet || true
     - name: Scan
       id: scan
       shell: bash
       env:
+        # Inputs travel through the environment: interpolating them into the
+        # script would let a quote in an input run arbitrary commands.
+        IOC: ${{ inputs.ioc }}
+        FAIL_ON: ${{ inputs.fail-on }}
+        REPORT: ${{ inputs.report }}
+        SLUG: ${{ github.repository }}
         GH_TOKEN: ${{ github.token }}
       run: |
-        set +e
-        deptrail scan --ioc "${{ inputs.ioc }}" --repo . --format text | tee scan.txt
+        set -uo pipefail
+        case "$FAIL_ON" in
+          rotate|incomplete|never) ;;
+          *) echo "::error::unknown fail-on value: $FAIL_ON"; exit 1 ;;
+        esac
+
+        deptrail scan --ioc "$IOC" --repo . --slug "$SLUG" --format text | tee scan.txt
         code=${PIPESTATUS[0]}
         echo "exit-code=$code" >> "$GITHUB_OUTPUT"
-        { echo '## deptrail'; echo '```'; cat scan.txt; echo '```'; } \
-          >> "$GITHUB_STEP_SUMMARY"
-        if [ -n "${{ inputs.report }}" ]; then
-          deptrail scan --ioc "${{ inputs.ioc }}" --repo . --format html \
-            --output "${{ inputs.report }}"
+        {
+          echo "## deptrail"
+          echo '```'
+          cat scan.txt
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        if [ -n "$REPORT" ]; then
+          deptrail scan --ioc "$IOC" --repo . --slug "$SLUG" --format html \
+            --output "$REPORT" || { echo "::error::report generation failed"; exit 1; }
         fi
-        case "${{ inputs.fail-on }}" in
-          never) exit 0 ;;
-          incomplete) [ "$code" -eq 0 ] && exit 0 || exit 1 ;;
-          *) [ "$code" -eq 1 ] && exit 1 || exit 0 ;;
+
+        # A scan that never ran (3) fails regardless of fail-on: a green check must
+        # never mean "we could not look".
+        case "$code" in
+          3) echo "::error::deptrail could not run: see the log"; exit 1 ;;
+          1) [ "$FAIL_ON" = never ] && exit 0 || { echo "::error::credentials to rotate"; exit 1 ;} ;;
+          2) [ "$FAIL_ON" = incomplete ] && { echo "::error::scan could not prove absence"; exit 1 ;} || exit 0 ;;
+          0) exit 0 ;;
+          *) echo "::error::unexpected exit code $code"; exit 1 ;;
         esac
