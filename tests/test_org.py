@@ -229,8 +229,15 @@ class TestOrgAggregation:
                         str(shallow)], check=True, capture_output=True)
         report = scan_organization([("shallow", shallow)], plan, runs=no_runs,
                                   secrets=secrets_provider)
-        assert report.rotation_items, "a repo we could not read must not be cleared"
-        assert {i.scope for i in report.rotation_items} == {Scope.REPO_WIDE}
+        # A repository we could not read is not cleared — and it is not turned into a
+        # credential list either. The clone is shallow, nothing was found in what is
+        # visible, and no evidence points at any secret, so the honest answer is
+        # "could not prove absence" and not "rotate everything you own" (#20).
+        assert not report.proves_absence
+        assert report.worst_grade is Grade.POSSIBLE
+        assert report.incomplete and "shallow" in report.incomplete[0]
+        assert report.rotation_items == ()
+        assert report.rotation_required is False
 
 
 class TestRendering:
@@ -576,8 +583,12 @@ class TestDeduplicationAndHonesty:
                         str(shallow)], check=True, capture_output=True)
         report = scan_organization([("shallow", shallow)], plan, runs=no_runs,
                                   secrets=secrets_provider)
-        assert report.rotation_items, "unreadable history must still raise credentials"
+        # The fixture exposure is set aside, so nothing was found in an installed
+        # tree; the clone is shallow, so absence cannot be claimed either. Both
+        # statements have to survive together.
         assert not report.proves_absence
+        assert report.set_aside, "the fixture finding stays visible"
+        assert report.rotation_items == ()
 
     def test_secrets_provider_failure_keeps_the_findings(self, tmp_path, plan):
         repo = make_repo(tmp_path, "api", [("2025-11-25T10:00:00+00:00", "5.6.1")])

@@ -51,12 +51,33 @@ design, and this tool never asks for them.
 Both are refusals to claim an all-clear, and they are deliberately not the same
 refusal, because "rotate" and "I could not look" are different instructions.
 
-**Evidence about a lockfile we do track was lost** — a shallow clone (including
-the default `actions/checkout`, which fetches depth 1), an unreadable snapshot, a
-lockfile that failed to parse. A pin may be hidden in the part we could not see,
-so the repository is graded `POSSIBLE`, every credential it can reach goes on the
-list with the reason, and the run exits `1`. In CI, check out with `fetch-depth: 0`;
-the bundled Action deepens the history itself.
+**Evidence about a lockfile we do track was lost** — an unreadable snapshot, a
+lockfile that failed to parse, a path discovered with no walkable history. A pin may
+be hidden there, so the repository is graded `POSSIBLE` and cannot be cleared.
+
+Whether that *widens* the rotation list depends on there being a list to widen. When
+something was found, every credential the repository can reach goes on it with the
+reason: a second, unreadable tree is exactly the reason the found scope cannot be
+trusted as complete. When **nothing** was found, no credential is named — no evidence
+points at one, and "rotate everything you own" is a false alarm rather than caution.
+The run exits `2` and says what it could not read.
+
+**The clone itself held less than the repository does** — shallow (including the
+default `actions/checkout`, which fetches depth 1), partial (`--filter=blob:none`,
+which has the commits but not the blobs), or single-branch (a refspec with no
+wildcard, so "every ref testifies" is false). Each is named, each forces exit `2`, and
+none of them raises a credential. The remedy is a deeper clone, which is why this is
+kept apart from an unreadable artifact: nothing fixes a corrupt lockfile, and
+`--allow-incomplete-history` may waive only this kind — off by default, and the reason
+is printed either way.
+
+This distinction exists because the alternative had a property no responder should have
+to reason about: **deepening a clone lowered the reported risk.** A shallow clone
+exited `1` and asked for the whole secret store; the same repository cloned in full
+exited `0`. Both independent reviews of #16 found it, and the field agrees on the shape
+of the fix — OSV-Scanner puts "found nothing to analyse" outside its result range
+entirely and requires `--allow-no-lockfiles` to downgrade it, and Snyk's
+`strictOutOfSync` refuses by default.
 
 **There was no lockfile we could read at all** — a tree locked with Yarn, pnpm,
 Bun or Deno, present while the malicious version was installable. Nothing was seen,

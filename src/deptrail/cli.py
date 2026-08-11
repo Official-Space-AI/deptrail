@@ -32,10 +32,17 @@ from .ioc import Advisory, IocError, bundled_feeds, load_advisory
 from .org import OrgReport, render_report, scan_organization
 from .report import render_html
 
-EXIT_CLEAN = 0
-EXIT_ROTATE = 1
-EXIT_INCOMPLETE = 2
-EXIT_BAD_INPUT = 3
+# Codes 0 and 1 are verdicts about evidence that was read; everything above says
+# the tool did not reach a verdict. The split follows what shipped scanners do —
+# OSV-Scanner puts "no packages found" at 128, outside its result range entirely,
+# and reserves another range for failures that are nobody's fault but the tool's;
+# Snyk keeps "insufficient evidence" and "could not run" on separate codes. Folding
+# them together tells a caller to retry when retrying cannot help, or the reverse.
+EXIT_CLEAN = 0        # absence of exposure was established
+EXIT_ROTATE = 1       # credentials to rotate
+EXIT_INCOMPLETE = 2   # looked, and could not prove absence
+EXIT_BAD_INPUT = 3    # the request was malformed; fixing it is the caller's move
+EXIT_TRANSIENT = 4    # the tool could not run; retrying may help
 
 
 class Parser(argparse.ArgumentParser):
@@ -113,6 +120,7 @@ def _as_dict(report: OrgReport, advisory: Advisory | None) -> dict:
         ],
         "rotate_unnamed": list(report.unnamed_rotations),
         "errors": list(report.errors),
+        "incomplete_view": list(report.incomplete),
         "not_judged": list(report.unread),
         "caveats": list(report.notes) + list(report.rotation_notes),
     }
@@ -275,7 +283,8 @@ def cmd_scan(args: argparse.Namespace) -> int:
 
     # Even when every repository was skipped, the report must carry why: dropping
     # the errors here would turn "we could not look" into "there was nothing".
-    report = scan_organization(repos, advisory.plan(), runs=runs, secrets=secrets)
+    report = scan_organization(repos, advisory.plan(), runs=runs, secrets=secrets,
+                               allow_incomplete=args.allow_incomplete_history)
     report.errors[:0] = errors
     written = _emit(report, args, advisory)
     return written or _exit_code(report)
@@ -319,6 +328,11 @@ def build_parser() -> argparse.ArgumentParser:
                       help="where organization clones are kept")
     scan.add_argument("--limit", type=int, default=200,
                       help="maximum repositories to list from the organization")
+    scan.add_argument("--allow-incomplete-history", action="store_true",
+                      help="accept a shallow, partial or single-branch clone as "
+                           "grounds for an all-clear; off by default, because a "
+                           "clone that holds less than the repository cannot "
+                           "establish what the repository did")
     scan.add_argument("--no-ci", action="store_true",
                       help="skip CI and secret lookups (no token needed)")
     add_output(scan)
@@ -338,14 +352,17 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return args.func(args)
     except FileNotFoundError as e:
-        # A missing tool is bad input, not a verdict: exiting 1 here would read as
-        # "rotate these credentials".
+        # An absent `git` or `gh` is an environment that cannot answer, not a
+        # malformed request and not a verdict — exiting 1 here would read as
+        # "rotate these credentials", and 3 would blame the caller's arguments.
         print(f"a required tool is missing: {e}", file=sys.stderr)
-        return EXIT_BAD_INPUT
+        return EXIT_TRANSIENT
     except subprocess.CalledProcessError as e:
+        # Distinct from EXIT_INCOMPLETE: "the API call failed" is worth retrying and
+        # "this history genuinely holds no lockfile" is not.
         detail = (e.stderr or "").strip()[:300]
         print(f"a command failed: {' '.join(e.cmd)}\n{detail}", file=sys.stderr)
-        return EXIT_INCOMPLETE
+        return EXIT_TRANSIENT
 
 
 if __name__ == "__main__":  # pragma: no cover

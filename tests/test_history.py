@@ -249,7 +249,11 @@ class TestReviewRegressions:
         )
         finding = scan_repo(shallow, WINDOW)
         assert finding.verdict is not Verdict.CLEAN
-        assert any("shallow" in w for w in finding.warnings)
+        # An incomplete clone is its own kind of not-knowing: a deeper clone is the
+        # remedy, and unlike a corrupt lockfile it points at no artifact, so it never
+        # widens a rotation list (#20).
+        assert any("shallow" in reason for reason in finding.incomplete)
+        assert finding.warnings == []
 
     def test_ours_merge_does_not_fake_still_pinned(self, tmp_path):
         # A -s ours merge hides the replacing commit from a plain path log; the

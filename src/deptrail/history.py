@@ -194,6 +194,11 @@ class RepoFinding:
     # them as lost evidence put every credential of a rebased repository on the
     # rotation list (E14).
     diagnostics: list[str] = field(default_factory=list)
+    # Ways this *clone* holds less than the repository does: shallow, partial,
+    # single-branch. Kept apart from ``warnings`` because the remedy differs — a
+    # deeper clone fixes these and nothing fixes a corrupt lockfile — and because
+    # only these may be waived by ``--allow-incomplete-history``.
+    incomplete: list[str] = field(default_factory=list)
     lockfiles_seen: int = 0
     # Trees whose dependencies this tool cannot read at all: a lockfile in a
     # dialect it does not parse, or a Node project with no lockfile in history.
@@ -211,7 +216,7 @@ class RepoFinding:
         """CLEAN is only claimable when nothing was exposed AND nothing went unread."""
         if self.exposures:
             return Verdict.EXPOSED
-        if self.warnings or self.unread_trees:
+        if self.warnings or self.unread_trees or self.incomplete:
             return Verdict.INDETERMINATE
         return Verdict.CLEAN
 
@@ -583,7 +588,7 @@ def scan_repo(repo: Path, query: WindowQuery) -> RepoFinding:
     finding = RepoFinding(repo=repo)
     warned: set[str] = set()
     try:
-        finding.warnings.extend(incomplete_history(repo))
+        finding.incomplete.extend(incomplete_history(repo))
         paths, foreign = discovered_lockfiles(repo)
         refs = _refs(repo)
         children, parents = _commit_graph(repo) if paths or foreign else ({}, {})

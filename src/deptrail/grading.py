@@ -166,16 +166,21 @@ class GradedFinding:
     unread_trees: list[UnreadTree] = field(default_factory=list)
     # Observations that cost no evidence, printed but never acted on.
     diagnostics: list[str] = field(default_factory=list)
+    # Ways the clone holds less than the repository does. Like a warning they stop
+    # an all-clear; unlike a warning they point at no artifact, so they name no
+    # credential either.
+    incomplete: list[str] = field(default_factory=list)
 
     @property
     def worst_grade(self) -> Grade:
         for grade in (Grade.CONFIRMED, Grade.LIKELY, Grade.POSSIBLE):
             if any(g.grade is grade for g in self.graded):
                 return grade
-        if self.warnings:
-            # Evidence about a lockfile we do track was lost, so an install was
-            # neither shown nor ruled out — which is what POSSIBLE means.
-            # NO_EVIDENCE would claim the lockfile never held a named version.
+        if self.warnings or self.incomplete:
+            # Evidence about a lockfile we do track was lost, or the clone never
+            # held it, so an install was neither shown nor ruled out — which is
+            # what POSSIBLE means. NO_EVIDENCE would claim the lockfile never held
+            # a named version.
             return Grade.POSSIBLE
         # An unread tree is different: no version was seen, and none was hidden
         # from us either, so there is genuinely no evidence in any direction.
@@ -315,6 +320,7 @@ def grade_finding(finding: RepoFinding, query: WindowQuery, history: RunHistory,
         coverage_warning=coverage_warning,
         unread_trees=list(finding.unread_trees),
         diagnostics=list(finding.diagnostics),
+        incomplete=list(finding.incomplete),
     )
     graded.graded.extend(grade_exposure(e, query, history) for e in finding.exposures)
 

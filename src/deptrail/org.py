@@ -154,6 +154,9 @@ class OrgReport:
     # Trees nothing could be said about, as "repo: reason". Distinct from
     # ``errors``: the scan worked, there was simply no lockfile it could read.
     unread: list[str] = field(default_factory=list)
+    # Repositories whose clone held less than the repository does, as
+    # "repo: reason". A deeper clone is the remedy, so the report says which.
+    incomplete: list[str] = field(default_factory=list)
     repos_scanned: int = 0
     partial_coverage: bool = False
 
@@ -252,12 +255,12 @@ class OrgReport:
         readable = all(f.verdict is not Verdict.INDETERMINATE and not f.warnings
                        for f in self.findings)
         return (not self.errors and not self.partial_coverage and readable
-                and not self.unread)
+                and not self.unread and not self.incomplete)
 
 
 def scan_organization(repos: Iterable[tuple[str, Path]], plan: QueryPlan, *,
                       runs: RunsProvider, secrets: SecretsProvider | None = None,
-                      ) -> OrgReport:
+                      allow_incomplete: bool = False) -> OrgReport:
     """Judge every repository against every package the advisory names.
 
     ``repos`` are (name, local clone path) pairs; ``runs`` and ``secrets`` are
@@ -316,6 +319,19 @@ def scan_organization(repos: Iterable[tuple[str, Path]], plan: QueryPlan, *,
             # other: it must not cost the whole repository its verdict, or every
             # tooling project that keeps such a fixture would be told its scan
             # proves nothing.
+            # An incomplete clone stops an all-clear unless the caller took
+            # responsibility for it, in which case it stays visible as a caveat.
+            if allow_incomplete and graded.incomplete:
+                report.notes.extend(
+                    f"{name}: {reason} — accepted with --allow-incomplete-history"
+                    for reason in graded.incomplete
+                    if f"{name}: {reason}" not in report.notes
+                )
+                graded = replace(graded, incomplete=[])
+            for reason in graded.incomplete:
+                line = f"{name}: {reason}"
+                if line not in report.incomplete:
+                    report.incomplete.append(line)
             unread = [t for t in graded.unread_trees
                       if _is_installed_unread_tree(path, t)]
             set_aside_unread = [t for t in graded.unread_trees if t not in unread]
@@ -417,12 +433,15 @@ def render_report(report: OrgReport) -> str:
     if report.errors:
         lines += ["", "could not scan (verdict is not complete)"]
         lines += [f"  {e}" for e in report.errors]
+    if report.incomplete:
+        lines += ["", "incomplete view (a deeper clone would say more)"]
+        lines += [f"  {i}" for i in report.incomplete]
     if report.unread:
         lines += ["", "not judged (no lockfile this tool can read)"]
         lines += [f"  {u}" for u in report.unread]
     # The same reasons reach `rotation_notes` for a repo that also rotates; print
     # each once, under the heading that explains it.
-    seen_above = set(report.unread)
+    seen_above = set(report.unread) | set(report.incomplete)
     caveats = [c for c in [*report.notes, *report.rotation_notes] if c not in seen_above]
     if caveats:
         lines += ["", "caveats"] + [f"  {c}" for c in caveats]

@@ -664,3 +664,63 @@ npmjs.org removed it are all unmodelled.
 merge-discovery test and both truncation branches fail when their production line is
 disabled. Every scenario from the four earlier review rounds still returns the exit code
 it should, the demo still exits 1, and this repository still clears itself at exit 0.
+
+## E17 — Does a truncated clone mean "rotate" or "I could not tell"?
+
+**Assumption**: an incomplete view is a reason for caution, and caution means putting
+every credential the repository can reach on the rotation list.
+
+**Method**: both independent reviews of #16 reproduced the consequence, so the question
+was not whether it happens but which answer is right. Judged against what shipped
+scanners do, then re-measured here across all three kinds of incomplete clone.
+
+**Result**: the assumption produced a property no responder should have to reason about.
+
+```
+git clone --depth 1 <repo>   → exit 1, rotate every secret it can see
+git clone <the same repo>     → exit 0, nothing to do
+```
+
+**Deepening a clone lowered the reported risk.** And the rule was applied to every
+truncated clone, including repositories with no Node signal at all — a shallow clone of
+this Python project exited 1. E16 then multiplied the problem by three, because partial
+and single-branch clones started being detected too.
+
+The field does not do this. OSV-Scanner puts "no packages found" at 128, **outside its
+result range entirely**, and requires an explicit `--allow-no-lockfiles` to downgrade
+insufficient evidence to success. Snyk's `strictOutOfSync` defaults to refusing and
+returns 422 rather than analysing a guess, and it keeps "insufficient evidence" and
+"could not run" on separate codes. Neither silently degrades to clean, and neither
+manufactures a finding out of a gap.
+
+**Changes.** Three separations, each of which was one conflated thing before:
+
+*Clone completeness is not artifact unreadability.* `RepoFinding.incomplete` now carries
+shallow, partial and single-branch separately from `warnings`. Both stop an all-clear.
+Only the first can be waived, because a deeper clone is a remedy and nothing fixes a
+corrupt lockfile.
+
+*Widening needs something to widen.* A lost snapshot still broadens the scope of what
+**was** found — that is E14's fix and it stands. With nothing found, no credential is
+named, because none is pointed at. The repository is still not cleared: exit `2`, with
+the reason printed.
+
+*"Could not run" is not "bad input".* `EXIT_TRANSIENT = 4` for an absent `git`/`gh` or a
+failed API call, which used to land on 3 ("your arguments are wrong") and 2 ("the history
+was looked at"). Only one of the three is worth retrying. The Action fails on 3 and 4
+alike regardless of `fail-on`, because a green check must never mean "we could not look".
+
+`--allow-incomplete-history` is off by default and, when passed, prints the gap it
+accepted rather than hiding it.
+
+**Verification**: measured across the matrix — partial `2`, single-branch `2`, shallow
+`2`, full clone `0`, waived `0` with the reason still printed, missing tooling `4`. A
+test asserts the removed property directly, comparing the same repository cloned deep
+and shallow. Every scenario from the five earlier review rounds returns the code it did
+before, the demo still exits 1, and this repository still clears itself. 271 tests.
+
+**Reversal recorded.** An earlier round deliberately decided the opposite — that an
+unreadable history should raise credentials — and two tests encoded it. Those tests now
+assert the same intent by the new mechanism: the repository is still not cleared, its
+worst grade is still `POSSIBLE`, and the reason is still named; what changed is that it
+no longer invents a credential list from an absence of evidence.

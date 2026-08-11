@@ -71,13 +71,39 @@ jobs:
           expect 3 deptrail scan --ioc example-demo --org acme --repo .
 
           # A shallow clone must never read as clean: this is the guard that a
-          # default `actions/checkout` (depth 1) would otherwise trip silently.
+          # default `actions/checkout` (depth 1) would otherwise trip silently. It
+          # exits 2 — "looked and could not prove absence" — and not 1, because
+          # deepening a clone must never lower the reported risk.
           git clone --quiet --depth 1 "file://$PWD" "$RUNNER_TEMP/shallow"
-          expect 1 deptrail scan --ioc example-demo --repo "$RUNNER_TEMP/shallow" --no-ci
+          expect 2 deptrail scan --ioc example-demo --repo "$RUNNER_TEMP/shallow" --no-ci
           deptrail scan --ioc example-demo --repo "$RUNNER_TEMP/shallow" --no-ci \
             > shallow.txt || true
           grep -q "shallow clone" shallow.txt
           grep -q "cannot prove absence" shallow.txt
+          grep -q "rotate: nothing" shallow.txt
+          # The same clone with the gap accepted on purpose clears, and still says so.
+          expect 0 deptrail scan --ioc example-demo --repo "$RUNNER_TEMP/shallow" \
+            --no-ci --allow-incomplete-history
+          deptrail scan --ioc example-demo --repo "$RUNNER_TEMP/shallow" --no-ci \
+            --allow-incomplete-history > waived.txt || true
+          grep -q "allow-incomplete-history" waived.txt
+
+          # A partial clone has the commits but not the blobs, so it cannot clear
+          # either — and this is the clone type CI tooling reaches for to go faster.
+          git clone --quiet --filter=blob:none "file://$PWD" "$RUNNER_TEMP/partial" \
+            2>/dev/null || git clone --quiet "file://$PWD" "$RUNNER_TEMP/partial"
+          if git -C "$RUNNER_TEMP/partial" config --get remote.origin.promisor \
+               > /dev/null; then
+            expect 2 deptrail scan --ioc example-demo \
+              --repo "$RUNNER_TEMP/partial" --no-ci
+          else
+            echo "note: this git/server pair did not produce a partial clone; skipped"
+          fi
+
+          # An environment that cannot answer is 4, not 1 and not 3: retrying may help.
+          mkdir -p "$RUNNER_TEMP/nobin"
+          expect 4 env PATH="$RUNNER_TEMP/nobin" deptrail scan \
+            --ioc example-demo --org acme
 
           # A project this version cannot parse must exit 2 — "could not prove
           # absence" — rather than 0, and must not manufacture a rotation list.

@@ -11,7 +11,14 @@ from pathlib import Path
 
 import pytest
 
-from deptrail.cli import EXIT_BAD_INPUT, EXIT_CLEAN, EXIT_INCOMPLETE, EXIT_ROTATE, main
+from deptrail.cli import (
+    EXIT_BAD_INPUT,
+    EXIT_CLEAN,
+    EXIT_INCOMPLETE,
+    EXIT_ROTATE,
+    EXIT_TRANSIENT,
+    main,
+)
 from deptrail.demo import build
 
 
@@ -193,12 +200,16 @@ class TestExitCodeContract:
         assert code == EXIT_BAD_INPUT
         assert "not both" in capsys.readouterr().err
 
-    def test_missing_tool_is_bad_input_not_rotate(self, tmp_path, capsys, monkeypatch):
+    def test_missing_tool_is_transient_not_rotate_and_not_the_callers_fault(
+            self, tmp_path, capsys, monkeypatch):
+        # An absent git or gh is an environment that cannot answer. Exit 1 would read
+        # as "rotate these credentials", 3 would blame the arguments, and 2 would say
+        # the history was looked at.
         advisory = self._advisory(tmp_path)
         monkeypatch.setenv("PATH", str(tmp_path / "empty"))  # no gh, no git
         code = main(["scan", "--ioc", str(advisory), "--org", "acme"])
-        assert code in (EXIT_BAD_INPUT, EXIT_INCOMPLETE)
-        assert code != EXIT_ROTATE
+        assert code == EXIT_TRANSIENT
+        assert code not in (EXIT_ROTATE, EXIT_CLEAN)
 
     def test_write_failure_is_not_a_verdict(self, tmp_path, capsys):
         advisory = self._advisory(tmp_path)
@@ -455,7 +466,43 @@ class TestShallowCheckout:
                        check=True, capture_output=True)
         code = main(["scan", "--ioc", str(advisory), "--repo", str(shallow), "--no-ci"])
         out = capsys.readouterr().out
-        # The same repository judged from full history exits 0 (see
-        # test_clean_repo_exits_zero); truncated, it cannot be cleared.
-        assert code == EXIT_ROTATE
+        # The same repository judged from full history exits 0; truncated, it cannot be
+        # cleared — and "could not prove absence" is what that is, not "rotate" (#20).
+        assert code == EXIT_INCOMPLETE
         assert "shallow clone" in out and "cannot prove absence" in out
+        assert "rotate: nothing" in out
+
+    def test_deepening_a_clone_never_lowers_the_reported_risk(self, tmp_path, capsys):
+        # The property this contract exists to remove: the truncated clone must not
+        # look more urgent than the complete one it came from.
+        from deptrail.demo import advisory_path
+        repos = dict(build(tmp_path / "demo"))
+        advisory = advisory_path(tmp_path / "demo")
+        shallow = tmp_path / "shallow"
+        subprocess.run(["git", "clone", "-q", "--depth", "1",
+                        f"file://{repos['web-frontend']}", str(shallow)],
+                       check=True, capture_output=True)
+        truncated = main(["scan", "--ioc", str(advisory), "--repo", str(shallow),
+                          "--no-ci"])
+        capsys.readouterr()
+        complete = main(["scan", "--ioc", str(advisory),
+                         "--repo", str(repos["web-frontend"]), "--no-ci"])
+        capsys.readouterr()
+        assert (complete, truncated) == (EXIT_CLEAN, EXIT_INCOMPLETE)
+
+    def test_an_incomplete_clone_can_be_accepted_on_purpose(self, tmp_path, capsys):
+        # Off by default, mirroring OSV-Scanner's --allow-no-lockfiles: the caller may
+        # take responsibility for the gap, and the report still names it.
+        from deptrail.demo import advisory_path
+        repos = dict(build(tmp_path / "demo"))
+        advisory = advisory_path(tmp_path / "demo")
+        shallow = tmp_path / "shallow"
+        subprocess.run(["git", "clone", "-q", "--depth", "1",
+                        f"file://{repos['web-frontend']}", str(shallow)],
+                       check=True, capture_output=True)
+        code = main(["scan", "--ioc", str(advisory), "--repo", str(shallow), "--no-ci",
+                     "--allow-incomplete-history"])
+        out = capsys.readouterr().out
+        assert code == EXIT_CLEAN
+        assert "shallow clone" in out, "the gap is accepted, not hidden"
+        assert "allow-incomplete-history" in out
