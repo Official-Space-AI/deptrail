@@ -50,6 +50,10 @@ def render_html(report: OrgReport, advisory=None) -> str:
     """One file a responder can forward as-is."""
     items = report.rotation_items
     banner_color = GRADE_COLOR[report.worst_grade]
+    # Green is reserved for a proven all-clear. A scan that found nothing but could
+    # not look everywhere is grey: the colour is read before the sentence.
+    if not report.proves_absence and report.worst_grade is Grade.NO_EVIDENCE:
+        banner_color = GRADE_COLOR[Grade.POSSIBLE]
     if items:
         headline = f"{len(items)} credential(s) to rotate"
     elif report.rotation_required:
@@ -125,6 +129,9 @@ def render_html(report: OrgReport, advisory=None) -> str:
                 f"<td><ul>{facts}</ul></td></tr>"
             )
         out.append("</table>")
+    elif report.unread:
+        out.append("<p>No exposure found in what could be read — see "
+                   "<em>Not judged</em> below.</p>")
     else:
         out.append("<p>No exposure found in a tree a workflow would install.</p>")
 
@@ -143,7 +150,14 @@ def render_html(report: OrgReport, advisory=None) -> str:
         out += [f"<li>{escape(e)}</li>" for e in report.errors]
         out.append("</ul>")
 
-    caveats = list(report.notes) + list(report.rotation_notes)
+    if report.unread:
+        out.append("<h2>Not judged</h2><p class='sub'>No lockfile this tool can read, "
+                   "so these trees were neither cleared nor implicated.</p><ul>")
+        out += [f"<li>{escape(u)}</li>" for u in report.unread]
+        out.append("</ul>")
+
+    seen_above = set(report.unread)
+    caveats = [c for c in [*report.notes, *report.rotation_notes] if c not in seen_above]
     if caveats:
         out.append("<h2>Caveats</h2><ul>")
         out += [f"<li>{escape(c)}</li>" for c in caveats]

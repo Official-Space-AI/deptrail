@@ -5,6 +5,7 @@ and on its exit code — a scan that finds credentials to rotate must say so in 
 way a script can act on, without anyone reading prose.
 """
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -34,6 +35,14 @@ class TestDemo:
         # Its CI installs nothing, so the credential is a local-install candidate.
         assert "ALGOLIA_KEY" in out and "DEVELOPER" in out
 
+    def test_demo_shows_the_repository_it_could_not_read(self, tmp_path, capsys):
+        # mobile-app is locked with Yarn: neither cleared nor rotated, and named.
+        main(["demo", "--workdir", str(tmp_path / "demo")])
+        out = capsys.readouterr().out
+        assert "not judged" in out and "mobile-app" in out
+        assert "cannot prove absence" in out
+        assert "EXPO_TOKEN" not in out, "an unread tree must not raise a credential"
+
     def test_demo_is_reproducible(self, tmp_path, capsys):
         main(["demo", "--workdir", str(tmp_path / "a")])
         first = capsys.readouterr().out
@@ -44,11 +53,17 @@ class TestDemo:
     def test_demo_json_is_machine_readable(self, tmp_path, capsys):
         main(["demo", "--workdir", str(tmp_path / "demo"), "--format", "json"])
         payload = json.loads(capsys.readouterr().out)
-        # The decision comes first: a consumer must not have to infer it.
+        # The decision comes first: a consumer must not have to infer it. The demo
+        # includes a Yarn repository, so the scan is deliberately not complete —
+        # one credential list plus one honest gap is what a real incident looks like.
         assert payload["decision"] == {
             "exit_code": EXIT_ROTATE, "rotation_required": True,
-            "scan_complete": True, "worst_grade": "CONFIRMED",
+            "scan_complete": False, "worst_grade": "CONFIRMED",
         }
+        assert payload["not_judged"] == [
+            "mobile-app: yarn.lock: Yarn lockfiles are not parsed yet, so the versions "
+            "this tree installed were not judged"
+        ]
         assert payload["exposed_repos"] == ["api-server", "docs-site"]
         rotate = {(r["repo"], r["secret"]) for r in payload["rotate"]}
         assert ("api-server", "NPM_TOKEN") in rotate
@@ -325,6 +340,105 @@ class TestReportEncoding:
         html = (tmp_path / "r.html").read_text(encoding="utf-8")
         assert "installable window" in html and "2025-11-24" in html
         assert "coverage complete" in html
+
+
+class TestUnreadableLockfileDialects:
+    """#16: found by pointing the tool at repositories shaped unlike its fixtures.
+
+    All three exited 0 with `rotate: nothing` before the fix, including the two
+    that pinned the malicious version inside the window.
+    """
+
+    def _repo(self, tmp_path, name, files):
+        """A one-commit repo dated inside the demo advisory's window."""
+        repo = tmp_path / name
+        repo.mkdir(parents=True)
+        env = dict(os.environ)
+        env["GIT_AUTHOR_DATE"] = env["GIT_COMMITTER_DATE"] = "2025-11-25T12:00:00+00:00"
+
+        def git(*args):
+            subprocess.run(
+                ["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t",
+                 *args], check=True, capture_output=True, env=env,
+            )
+
+        git("init", "-q")
+        for path, body in files.items():
+            target = repo / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(body)
+        git("add", "-A")
+        git("commit", "-qm", "init")
+        return repo
+
+    def _advisory(self, tmp_path):
+        from deptrail.demo import advisory_path
+        build(tmp_path / "demo")
+        return advisory_path(tmp_path / "demo")
+
+    def test_yarn_repository_cannot_be_cleared(self, tmp_path, capsys):
+        advisory = self._advisory(tmp_path)
+        repo = self._repo(tmp_path, "yarnapp", {
+            "yarn.lock": '"chalk@^5.6.0":\n  version "5.6.1"\n',
+            "package.json": '{"name":"app","dependencies":{"chalk":"^5.6.0"}}',
+        })
+        code = main(["scan", "--ioc", str(advisory), "--repo", str(repo), "--no-ci"])
+        out = capsys.readouterr().out
+        assert code == EXIT_INCOMPLETE
+        assert "not judged" in out and "yarn.lock" in out
+        assert "cannot prove absence" in out
+
+    def test_shrinkwrap_repository_is_scanned_like_a_lockfile(self, tmp_path, capsys):
+        advisory = self._advisory(tmp_path)
+        repo = self._repo(tmp_path, "shrinkwrapped", {
+            "npm-shrinkwrap.json": json.dumps({
+                "name": "app", "lockfileVersion": 3,
+                "packages": {"": {"dependencies": {"chalk": "^5.6.0"}},
+                             "node_modules/chalk": {"version": "5.6.1"}},
+            }),
+        })
+        code = main(["scan", "--ioc", str(advisory), "--repo", str(repo), "--no-ci"])
+        out = capsys.readouterr().out
+        assert code == EXIT_ROTATE
+        assert "npm-shrinkwrap.json" in out
+        assert "not judged" not in out
+
+    def test_deno_lockfile_is_recognised(self, tmp_path, capsys):
+        # Deno installs from the npm registry through npm: specifiers, so a name
+        # missing from the table is a repository this tool would call clean.
+        advisory = self._advisory(tmp_path)
+        repo = self._repo(tmp_path, "denoapp", {"deno.lock": '{"version":"4"}'})
+        code = main(["scan", "--ioc", str(advisory), "--repo", str(repo), "--no-ci"])
+        assert code == EXIT_INCOMPLETE
+        assert "deno.lock" in capsys.readouterr().out
+
+    def test_an_incomplete_scan_is_not_painted_green(self, tmp_path):
+        # The banner colour is read before the sentence next to it, so green must
+        # mean a proven all-clear and nothing else.
+        from deptrail.report import GRADE_COLOR
+        from deptrail.grading import Grade
+        advisory = self._advisory(tmp_path)
+        repo = self._repo(tmp_path, "yarnapp2", {
+            "yarn.lock": '"chalk@^5.6.0":\n  version "5.6.1"\n',
+        })
+        target = tmp_path / "r.html"
+        main(["scan", "--ioc", str(advisory), "--repo", str(repo), "--no-ci",
+              "--format", "html", "--output", str(target)])
+        html = target.read_text(encoding="utf-8")
+        banner = next(line for line in html.splitlines() if "class='banner'" in line)
+        assert "cannot prove absence" in banner
+        assert GRADE_COLOR[Grade.NO_EVIDENCE] not in banner, \
+            "an incomplete scan must not wear the all-clear colour"
+
+    def test_repository_with_nothing_to_read_is_genuinely_clean(self, tmp_path, capsys):
+        advisory = self._advisory(tmp_path)
+        repo = self._repo(tmp_path, "pythonapp", {"main.py": "print(1)\n"})
+        code = main(["scan", "--ioc", str(advisory), "--repo", str(repo), "--no-ci"])
+        out = capsys.readouterr().out
+        assert code == EXIT_CLEAN
+        # The distinction the old output could not make: this one really is clear.
+        assert "not judged" not in out
+        assert "cannot prove absence" not in out
 
 
 class TestShallowCheckout:

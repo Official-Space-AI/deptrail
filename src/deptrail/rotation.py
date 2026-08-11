@@ -193,14 +193,20 @@ def rotation_for_repo(repo_path: Path, repo_name: str, finding: GradedFinding,
     rotation = RepoRotation(repo=repo_name)
     if finding.coverage_warning:
         rotation.notes.append(finding.coverage_warning)
-    for warning in (*finding.warnings, *finding.ci_notes):
-        rotation.notes.append(warning)
+    for note in (*finding.warnings, *finding.diagnostics, *finding.ci_notes,
+                 *(t.reason for t in finding.unread_trees)):
+        rotation.notes.append(note)
 
     graded_needing = [g for g in finding.graded
                       if g.grade in (Grade.CONFIRMED, Grade.LIKELY, Grade.POSSIBLE)]
-    if finding.verdict is Verdict.INDETERMINATE:
-        # The history itself was unreadable, so nothing can be narrowed or
-        # cleared — independent of whatever exposures were found elsewhere.
+    if finding.warnings:
+        # Evidence about a lockfile we track was lost, so nothing can be narrowed
+        # or cleared. Gated on the warnings themselves rather than on the verdict:
+        # a separate confirmed exposure makes the verdict EXPOSED, and that used to
+        # drop this fallback exactly when a second tree in the same repository had
+        # gone unread. A tree that was never readable is excluded on purpose: it
+        # gives no reason to suspect any credential, and listing them all would be
+        # a false alarm for every project this version cannot parse.
         rotation.items.extend(_repo_wide_items(
             repo_name, repo_secrets, Grade.POSSIBLE, rotation,
             "this repository's history could not be read, so exposure was "

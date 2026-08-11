@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Scratch organization written by `deptrail demo` when no --workdir is given
+.deptrail-demo/

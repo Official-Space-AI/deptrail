@@ -285,3 +285,382 @@ report. A unit test pins the same pair of outcomes.
 **Verification**: the demo job passes with the deep checkout and fails if the
 shallow assertion ever stops holding — the guard is now proven by CI rather than
 asserted in a docstring.
+
+## E12 — Does a repository shaped unlike our fixtures get a real answer?
+
+**Assumption**: 235 passing tests and 93% line coverage mean the scanner's inputs
+are covered, so the next class of defect will be in the judgment, not in what the
+scanner accepts as input.
+
+**Method**: build three throwaway repositories, each pinning `chalk@5.6.1` inside
+the advisory window, differing only in which lockfile they use — `yarn.lock`,
+`npm-shrinkwrap.json`, and none at all (a Python project) — and scan each one.
+
+**Result**: two false cleans. The Yarn and shrinkwrap repositories both reported
+`no exposure found`, `rotate: nothing`, and exit `0` — the code documented as
+"absence was proven". The Python repository reported the same three things and was
+right, and its output was byte-identical to the other two, so nothing in the report
+distinguished "you are clear" from "we could not read your project".
+
+The cause was one string: lockfile discovery matched the basename
+`package-lock.json` exactly. `npm-shrinkwrap.json` is npm's own lockfile with the
+same schema — feeding one straight to the parser returns the right version set, so
+only discovery excluded it. Meanwhile `grading.INSTALL_COMMANDS` already recognised
+`yarn install` and `pnpm install`, so on a Yarn repository the CI half of the tool
+looked like it was working while the history half silently found nothing.
+
+`grep -ric "yarn\|pnpm\|shrinkwrap" tests/*.py` returned 0. Every fixture in the
+suite used `package-lock.json`, so the corpus encoded the same assumption as the
+code. No number of passing tests could have found this, and neither of the two
+independent reviews did: they read the code against its own premise.
+
+**Changes**: `npm-shrinkwrap.json` became a first-class lockfile. A lockfile in a
+dialect this version cannot parse, or a Node project with no readable lockfile, is
+recorded as an *unread tree* — the repository is `INDETERMINATE`, the report lists
+it under "not judged" with the filename, and the scan exits `2`. Unread trees
+deliberately do not raise a grade or a credential: unlike a lost snapshot, nothing
+was hidden from us, and grading them `POSSIBLE` would put every Yarn project's
+whole secret store on a rotation list. Writing the org-level test then exposed a
+second hole — a repository where one tree was read and exposed while another was
+never legible carried an `EXPOSED` verdict and still claimed the scan was complete.
+The demo gained a fourth repository locked with Yarn, so the evaluator sees this
+answer in the first command they run.
+
+**Verification**: the three repositories are pinned as end-to-end tests on their
+exit codes (`2`, `1`, `0`), plus unit tests for each dialect, for a mixed
+repository, and for a Yarn fixture under `tests/fixtures` that must *not* cost a
+tooling project its all-clear. The demo workflow builds a Yarn project on the
+runner and asserts exit 2 with an empty rotation list.
+
+## E13 — Is "no lockfile we can read" a property of a repository?
+
+**Assumption**: the E12 fix was complete. A repository either had a lockfile this
+tool can read or it did not, so one question per repository was enough.
+
+**Method**: both reviews of the E12 commit were told to build repositories rather
+than read code, and to hunt in two directions at once — shapes that still get a
+false clean, and honest shapes pushed to a false alarm. Nine such repositories were
+built with real git history and scanned.
+
+**Result**: the single per-repository question was wrong in both directions
+simultaneously, which is why it looked right.
+
+*Too permissive.* Any lockfile anywhere in history silenced the check, so exit 0
+came back for: a `package-lock.json` deleted before the window with its
+`package.json` still there — the tree ran unlocked exactly when the malicious
+version was installable; a monorepo where one app was locked and the app beside it
+was not; and a repository whose only lockfile was a test fixture, which cleared the
+deployed root tree it says nothing about. A deployed application under `examples/`
+was also filed away as sample data, even when a workflow named that directory as
+its `working-directory` — the escape hatch that already existed for exposures had
+not been extended to unread trees.
+
+*Too strict.* Every foreign lockfile ever committed denied an all-clear forever, so
+a project that migrated off Yarn years before the incident could never be cleared
+again. `has_manifest` omitted the exact-basename check its sibling function
+documents, so a single `metadata-package.json` in a Python repository produced exit
+2; and because it returned a boolean rather than paths, a `tests/fixtures/package.json`
+could not be set aside the way a fixture lockfile is.
+
+Two further defects came from the same "per repository" habit elsewhere. An
+exposure wins the aggregate verdict, and both the completeness claim and the
+repo-wide rotation fallback were keyed on that verdict — so in a repository where
+one tree was exposed and a second npm lockfile failed to parse, the report claimed
+`scan_complete: true` and dropped every credential the narrow evidence did not
+name. And adding `npm-shrinkwrap.json` support in E12 had created a false
+*exposure*: npm ignores `package-lock.json` when a shrinkwrap sits beside it, so a
+malicious pin in the file npm never read was reported as real.
+
+**Changes**: lock coverage is now judged per path over the window. Existence
+intervals are read from git — a file whose contents cannot be parsed still says
+exactly when it was there — and a lockfile governs only its own directory and the
+directories beneath it, which is how npm workspaces actually resolve. A
+`package.json` no lockfile governed during the window becomes an unread tree
+carrying its own path, so the fixture rule and the workflow-names-the-directory
+rule both apply to it. Precedence is decided per commit. `proves_absence` and the
+rotation fallback check lost evidence independently of the aggregate verdict.
+`deno.lock` joined the table. The HTML banner no longer wears the all-clear colour
+when the scan could not prove absence, and the Action annotates exit 2 as a warning
+instead of passing silently.
+
+**Verification**: the nine repositories are pinned as tests, each asserting the
+exit code that was wrong before. Two properties are now tested in both directions,
+which is what the round was really about: a lockfile must clear the tree it governs
+and only that tree, and a foreign lockfile must count during the window and only
+during the window.
+
+## E14 — Is coverage a yes/no question?
+
+**Assumption**: after E13, coverage was computed per path, which is the right
+granularity. What remained were details.
+
+**Method**: two more review rounds on the same branch, each told to build
+repositories rather than read code, on both sides of the ledger; `npm install` run
+locally against real workspace layouts to settle what a root lockfile covers; a
+200-package monorepo timed against earlier commits; and a check of what
+`git cat-file --batch-check -z` actually emits.
+
+**Result**: the granularity was right and the *type* was wrong, twice over.
+
+Round two: coverage had become a boolean — "did a lockfile overlap the window" —
+where the honest answer is which parts of the window it covered. A lockfile removed
+mid-window covered the whole of it. An interval was closed by the first descendant
+deletion found on *any* ref, so a `main` that dropped a manifest before the incident
+cleared a feature branch that still carried it — the cross-branch mistake E3 found
+in exposure intervals, repeated in new code. Ancestor inheritance ignored npm's
+workspace declaration, clearing standalone applications that had never been locked;
+the test meant to cover this declared no workspaces, so it proved nothing. Precedence
+was read from the wrong log: deleting an `npm-shrinkwrap.json` puts the
+`package-lock.json` beside it back in charge without touching that file. And every
+walker warning counted as lost evidence, so a rebase that rewrote a committer date
+put a whole secret store on the rotation list.
+
+Round three, on the fix for round two: spans still lose the lineage they came from.
+Within one ref's reachable history, a lockfile that only ever existed on a side
+branch covers `main`'s unlocked window on the time axis — a branch that added a lock
+before the incident and merged after it cleared a `main` that was unlocked
+throughout. Two more followed from the same loss: the workspace declaration was read
+only at the commit that opened the lockfile's span, so dropping a member from
+`workspaces` without touching the lockfile kept it "covered"; and the reported
+witness was the manifest span's start rather than a commit inside the uncovered gap,
+so the workflow-evidence check looked at the wrong tree. Four smaller defects came
+with them: a span of zero length was discarded, so a file added at the window's
+closing instant was ignored though the window is documented as inclusive; a
+shrinkwrap appearing did not close an existing exposure, which then read as "still
+pinned" about a file nothing installs; `-z` output was split on newlines as well as
+NUL, turning `line\nbreak/package-lock.json` into a file called
+`break/package-lock.json`; and the composite action never declared its `exit-code`
+output, so the new job asserting it would have failed on a blank value.
+
+The performance claim from round two was also wrong. `cat-file --batch-check -z`
+takes NUL-delimited *input* and writes LF-delimited *output* — `-Z` is the one that
+does both — so the batch never matched its own length check and fell back to one
+call per pair.
+
+**Changes**: the manifest-coverage feature was **removed from the branch** and given
+its own issue (#22) with the npm measurements, the three failed designs, and the 13
+scenarios as acceptance criteria. What ships is the part that survived three rounds
+of attack: dialect recognition scoped to the window, lockfile precedence decided per
+commit and closing an interval when it changes hands, the warnings/diagnostics split,
+the inclusive window boundary, correct NUL parsing, and the action's declared output.
+
+Judgment behind the split: every finding in rounds two and three was in the
+manifest-coverage code, and each fix revealed the next because spans of presence are
+the wrong abstraction for it — the next attempt needs state evaluated per commit,
+which is a different design rather than another patch. Shipping the rest now leaves
+that one case where it already was on `main`, unreported and documented, while the
+false clean that started #16 — a Yarn or shrinkwrap repository reported clean — is
+fixed.
+
+**Verification**: the surviving behaviour is pinned by tests for the closing
+instant, the shrinkwrap handover in both directions, the newline path, and the
+foreign-lockfile window in all three positions (before, during, after). Removing the
+coverage pass also removed its cost: the 200-package monorepo is back to 5.4 s
+against a 5.1 s baseline, from 12 s.
+
+## E15 — What does the prior art do about all this?
+
+**Assumption**: after three rounds of review on the same sub-problem, the model was
+being reinvented rather than borrowed. Someone must already have solved "which
+lockfile governed which tree, when".
+
+**Method**: a five-angle survey — production dependency tooling read as source, the
+package managers' own libraries, the research literature, published incident practice,
+and the general technique of modelling state over a git DAG — with each angle's
+load-bearing claims re-checked against primary sources by a second reader. Two angles
+were cut short by a session limit; the three that completed are the basis for what
+follows, and the gaps are named at the end.
+
+**Result, in the order it changes what we do.**
+
+*A false clean in code that was already merged.* Git's default history simplification
+follows only one parent of a merge that is TREESAME to it. So a branch that pinned the
+malicious version and then **lost the merge conflict** disappears from
+`git log <ref> -- package-lock.json` completely, and if the branch was deleted after
+merging there is no ref left to walk either. Built that repository: the malicious blob
+is reachable from the merge, a pull-request run would have installed it, and deptrail
+returned exit 0. `--full-history` shows the commit; the default does not. This is the
+E3 lesson — a merge hides the pin — in a form no amount of reasoning about intervals
+would have caught, because the commit was never in the input. Fixed, with a test that
+fails when the flag is removed. Cost on a 200-package monorepo: 5.4 s → 5.6 s.
+
+*Nobody has solved the coverage question, and the reason is structural.* Every
+production scanner analyses exactly one checkout, so it never asks "which lockfile
+governed D at commit C" — only "which lockfile is next to D right now". Renovate's
+association logic, the most mature in the field, returns *true for every path* as soon
+as the `workspaces` array contains one negated pattern, so an undeclared sibling
+inherits the root lockfile; Dependabot mishandles the same negation differently. Both
+err toward **over-crediting** governance, which is the false-clean direction. Porting
+either would have imported the bug we were trying to avoid. The literature avoids the
+case by construction: the first systematic study of lockfiles detects them in the root
+only and discards repositories with more than one, and the closest history-
+reconstruction work walks the default branch and lists our lineage failure as a threat
+to validity, mitigated by averaging over 33 000 projects — an escape hatch a
+per-repository verdict does not have.
+
+*npm's own algorithm is borrowable; its lockfile shortcut is not.* The survey's headline
+claim — that a lockfile is self-describing about its governance, so
+`mapWorkspaces.virtual({lockfile})` answers the question from one blob — was **refuted by
+the check attached to it**, and the refutation is the more useful result.
+`virtual` intersects the declaration and the member set *as of the lockfile's last
+write*; governance at a commit is a function of that commit's root `package.json`. When
+the two have drifted, a **narrowed** declaration leaves `virtual` still calling a
+directory a member that npm now treats as undeclared — the false-clean direction. It is
+also not a public API, and it returns an empty map with no error for lockfileVersion 1,
+so it cannot distinguish "no workspaces" from "cannot tell".
+
+What survives is worth more than what was claimed: the *authority* is the manifest at the
+commit (npm's own installer uses the filesystem `mapWorkspaces({cwd, pkg})`, and only
+`load-virtual` touches the virtual variant — to detect lockfile/manifest inconsistency,
+not to establish governance); the lockfile's recorded declaration is a **staleness
+detector**, which is what arborist's `flagsSuspect` uses it for; and the ordered-negation
+pattern semantics can be taken from npm through the documented entry point rather than
+rewritten. One production data point cuts the other way and is worth weighing: Dependabot
+does **not** walk to parent directories for npm lockfiles at all, so the largest
+deployment of this logic errs toward over-reporting rather than toward a false clean.
+Recorded in #22, including the correction.
+
+*The window we consume does not exist as data.* OSV and the GHSA malware records model
+malice as a bare version list. The left edge is derivable — the registry keeps
+`time[version]` after an unpublish — but **the right edge is recorded nowhere**, and it
+is not even one interval per incident: for a range-resolving install the window closes
+when the next satisfying good version is published, which differed from the unpublish
+time by five days in a real case. Our schema's closed per-advisory window is therefore
+wrong in shape. Filed as #23.
+
+*Practice is much coarser than this tool, and that cuts both ways.* CISA prescribes
+rotation unconditionally, in parallel with the dependency review rather than downstream
+of it, so precise scoping buys nothing at the level of the decision that costs money.
+What responders actually reconstruct is the (run, secret) join — "identified CI runs
+affected, identified secrets available to those runs" — which is exactly what our
+rotation list is, and is *not* a list of paths and intervals. Meanwhile the detector
+script that responders actually ran classifies the no-lockfile case as LOW risk and
+prints "Your current installation is safe" for it: the failure is a missing **tier**,
+not a missing algorithm, which is a strong argument that refusing to credit what we
+cannot read already beats what shipped, without #22 being finished.
+
+**Changes**: `--full-history` on every path log, with the regression test. #22 rewritten
+around npm's own resolver and a per-commit tree predicate. #23 opened for window
+semantics. #20 given the exit-code precedent from Snyk and OSV-Scanner, which both
+reserve a distinct code for "insufficient evidence" and refuse by default. #24 opened
+for the npm cache index as dated install evidence. Regenerating a lockfile at analysis
+time is now explicitly forbidden — the published move for a missing lockfile is
+`npm i --package-lock-only`, which resolves against *today's* registry and would
+manufacture a clean answer.
+
+**Verification**: the merge-loss repository is a test that fails without the flag. The
+prior-art claims behind each change above were re-checked against primary sources by a
+second reader, and the two angles that did not complete — how other systems model state
+over a DAG, and independent verification of the literature and incident claims — are
+named as open in #22 rather than treated as settled.
+
+### Status of the evidence in E15
+
+Two of five angles did not complete, and the independent checks landed unevenly. The
+record, so the reader can weight each claim:
+
+- **Checked and held**: Renovate's negation over-match (with the refinement that it fires
+  when the workspace root is the repository root), Dependabot's different mishandling of
+  the same negation, and Dependabot's npm lockfile lookup being same-directory only.
+- **Checked and refuted**: the lockfile-is-self-describing claim, corrected above.
+- **Checked by me directly**: git's path-log simplification hiding a merge-losing branch
+  (a test in this repository), and OSV-Scanner's documented exit codes.
+- **Not yet independently checked**: every claim from the literature and
+  incident-practice angles, including the ~26% no-lockfile base rate, the
+  `npm i --package-lock-only` hazard, the community detector's "safe" output, and the npm
+  cache index as a dated ledger. They are recorded in #22, #23 and #24 as the reasoning
+  behind those issues, not as settled fact, and the verification is in flight.
+- **Not surveyed at all**: how other systems model state over a git DAG at scale, which
+  is the angle that would most directly inform #22's second step.
+
+## E16 — Finishing the survey: what the last two angles and the critic found
+
+**Assumption**: E15 recorded the three angles that completed. The remaining two — how
+other systems model state over a git DAG, and independent verification of the literature
+and incident claims — would refine the design but not change what ships.
+
+**Method**: resumed the survey so the missing angle, the eight outstanding
+verifications, the synthesis and a completeness critic all ran. Every claim the synthesis
+made about *this* repository's code was then re-measured here before being acted on.
+
+**Result: two more false cleans in shipped code, and a design conclusion that closes the
+question of representation.**
+
+*A lockfile introduced by a merge was never discovered at all.* `git log --name-only`
+prints **nothing** for a merge commit unless `--diff-merges` is given, and it defaults to
+off. Built a repository whose `yarn.lock` is present at HEAD, added by the merge commit
+itself and in neither parent: discovery found zero paths and the scan returned exit 0.
+This is worse than E15's case, where the file at least no longer existed — here the
+unreadable lockfile is sitting in the current tree. `--diff-merges=first-parent` finds
+it. The same command also needed `--no-renames`, because rename detection collapses
+"`package-lock.json` deleted, `npm-shrinkwrap.json` added" into a single `R` record and
+hides a precedence handover. Measured loss on real repositories, from the survey: two
+paths on next.js, five on vscode, one of them a `yarn.lock` that would have forced
+INDETERMINATE.
+
+*Two kinds of truncated clone were silent.* Only shallow clones were detected. A
+**partial** clone (`remote.origin.promisor=true`, filter `blob:none`) has the commits but
+not the blobs; a **single-branch** clone has a refspec with no wildcard, which makes
+"every ref testifies" false while nothing said so. Both verified against clones of this
+repository, both now named in the report, and a full clone is still cleared — the control
+matters, because every check of this kind can be satisfied by never clearing anything.
+
+*Presence was being asked of the blob instead of the tree.* `cat-file -e <sha>:<path>`
+needs the blob, so on a partial clone it either fetches from the promisor remote one
+object at a time or answers "missing" for a file plainly in the tree. `ls-tree` answers
+from local data; trees are never filtered out by `blob:none`.
+
+*The representation question is settled, and not by preference.* Interval models
+presuppose a single line of time evolution; branched evolution is a separate indexing
+problem (Jiang, Salzberg, Lomet, Barrena, *The BT-tree: A Branched and Temporal Access
+Method*, VLDB 2000), and interval temporal logics are defined over linearly ordered
+domains, so "the interval during which F was present" is not well-formed over a DAG
+until a lineage is chosen. Design #3 failed for a reason identified 26 years ago. The
+established shape is per-commit state as the stored fact, with intervals **derived per
+lineage at report time** — which is what LGTM/Semmle and Software Heritage both do. The
+survey validated a fold, `state(C) = state(firstParent(C)) ⊕ delta(C vs first parent)`
+over `--topo-order --reverse --all --diff-merges=first-parent`, against `git ls-tree` on
+four real repositories: 2 336 sampled commits, 1 105 of them merges, zero mismatches,
+and 0.76 s for npm/cli through 24.3 s for vscode's 184 000 commits.
+
+*The workspace matcher can be ported rather than delegated, and now has an oracle.*
+Delegation does not survive: `mapWorkspaces.virtual` is the retracted shortcut, the
+documented `mapWorkspaces()` needs trees materialised to disk (~1.3 s per commit) plus a
+Node runtime, and `@npmcli/config`'s `loadLocalPrefix()` never reads a lockfile and walks
+past the checkout to the filesystem root. A 141-line stdlib-only Python port was written
+and differentially tested against npm 10.9.3's own `@npmcli/map-workspaces`: 1 234 cases
+across hand-written adversarial, random and path-derived suites, zero disagreements. The
+fuzzer earned its place by finding a semantics no angle had reported — **positive
+patterns skip dotfiles, negated ones do not**, because negations are handed to glob's
+`ignore` list, which is always parsed `dot: true`. Three different dot policies inside one
+function.
+
+*And the sub-problem is narrower than we thought.* On npm/cli's own history, "a manifest
+with no governing lockfile" fires roughly 366 times per commit, and every one is a test
+fixture nobody installs. The predicate has to be **installable *and* unlocked**, which
+means the existing `is_probably_installed` gate and the workflow-names-the-directory
+escape hatch are load-bearing rather than polish. That measurement is n=1 and on the
+least representative repository imaginable, so it is recorded as a reason to keep the
+gate, not as a rate.
+
+**Changes**: `--diff-merges=first-parent --no-renames` on discovery, `--no-renames` on
+path logs, presence via `ls-tree`, and partial/single-branch clone detection — each with a
+test that fails when the fix is removed, plus a full-clone control. #22 rewritten again
+around per-commit state and the ported matcher.
+
+**What the critic found that nobody looked at**, now recorded in the issues rather than
+lost: Turborepo's `crates/turborepo-lockfiles` implements exactly this primitive per
+ecosystem, with `Ok(None)` as a first-class "not governed" and a `global_change` guard for
+lockfile-format changes — the closest prior art in existence, and no angle opened it. For
+`pull_request` events, which were 62% of npm/cli's last hundred runs, the tree CI
+installed is a GitHub-synthesised `refs/pull/N/merge` commit that is reachable from **no
+branch** and absent from every clone, though it is fetchable on demand. The
+`actions/setup-node` cache key is `(ref, lockfile content hash, timestamp)` published by
+CI itself. And `overrides`/`resolutions`, pnpm `catalog:` ranges that live outside the
+member manifest, and private-registry mirrors that served the malicious tarball after
+npmjs.org removed it are all unmodelled.
+
+**Verification**: 269 tests. Each of the three fixes above was mutation-checked — the
+merge-discovery test and both truncation branches fail when their production line is
+disabled. Every scenario from the four earlier review rounds still returns the exit code
+it should, the demo still exits 1, and this repository still clears itself at exit 0.

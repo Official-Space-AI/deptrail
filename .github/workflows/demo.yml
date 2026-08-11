@@ -33,6 +33,13 @@ jobs:
           grep -q "LIKELY     ] docs-site" demo.txt
           grep -q "rotate (3 credential(s))" demo.txt
           grep -q "NPM_TOKEN" demo.txt
+          # mobile-app is locked with Yarn: named as unread, not cleared, and not
+          # turned into a rotation item either.
+          grep -q "not judged" demo.txt
+          grep -q "mobile-app" demo.txt
+          if grep -q "EXPO_TOKEN" demo.txt; then
+            echo "an unread tree must not raise a credential"; exit 1
+          fi
           # The workflow never reads AWS_ACCESS_KEY, so it must appear nowhere.
           # (`grep -qv` would pass on any single non-matching line — not the same test.)
           if grep -q "AWS_ACCESS_KEY" demo.txt; then
@@ -71,3 +78,106 @@ jobs:
             > shallow.txt || true
           grep -q "shallow clone" shallow.txt
           grep -q "cannot prove absence" shallow.txt
+
+          # A project this version cannot parse must exit 2 — "could not prove
+          # absence" — rather than 0, and must not manufacture a rotation list.
+          yarn="$RUNNER_TEMP/yarn-project"
+          mkdir -p "$yarn" && git -C "$yarn" init -q
+          printf '# yarn lockfile v1\n\n"chalk@^5.6.0":\n  version "5.6.1"\n' \
+            > "$yarn/yarn.lock"
+          git -C "$yarn" add -A
+          # Dated inside the bundled advisory's window. A lockfile committed "now"
+          # did not exist while the version was installable, and the scanner is right
+          # to say nothing about it — which is what this assertion got wrong.
+          GIT_AUTHOR_DATE="2025-11-25T10:00:00+00:00" \
+          GIT_COMMITTER_DATE="2025-11-25T10:00:00+00:00" \
+            git -C "$yarn" -c user.email=ci@test -c user.name=ci commit -qm lock
+          expect 2 deptrail scan --ioc example-demo --repo "$yarn" --no-ci
+          deptrail scan --ioc example-demo --repo "$yarn" --no-ci > yarn.txt || true
+          grep -q "not judged" yarn.txt
+          grep -q "rotate: nothing" yarn.txt
+
+  action:
+    # The composite action is the interface most users meet, and its exit-code
+    # handling is a contract of its own: a scan that could not prove absence must
+    # annotate the check rather than pass in silence.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Commit a tree this version cannot read
+        # The action always scans the repository it runs in, so the shape under
+        # test has to be in that repository's history.
+        run: |
+          set -euo pipefail
+          mkdir -p unreadable
+          printf '# yarn lockfile v1\n\n"chalk@^5.6.0":\n  version "5.6.1"\n' \
+            > unreadable/yarn.lock
+          printf '{"name":"app","dependencies":{"chalk":"^5.6.0"}}\n' \
+            > unreadable/package.json
+          git add unreadable
+          # Inside the bundled advisory's window, for the same reason as above.
+          GIT_AUTHOR_DATE="2025-11-25T10:00:00+00:00" \
+          GIT_COMMITTER_DATE="2025-11-25T10:00:00+00:00" \
+            git -c user.email=ci@test -c user.name=ci commit -qm "an unreadable tree"
+      - id: scan
+        uses: ./
+        with:
+          ioc: example-demo
+          report: deptrail-report.html
+      - name: exit 2 is annotated, not passed over in silence
+        run: |
+          set -euo pipefail
+          code="${{ steps.scan.outputs.exit-code }}"
+          test "$code" = "2" || { echo "expected exit 2, got $code"; exit 1; }
+      - name: and the report the action was asked for exists
+        run: test -s deptrail-report.html
+  action-rotate:
+    # The other half of the contract: a scan that finds credentials must fail the job
+    # by default, and must not fail it under `fail-on: never`. Both were broken by the
+    # same inherited errexit, so both need a job.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Commit an exposure in a tree a workflow installs
+        run: |
+          set -euo pipefail
+          mkdir -p app
+          printf '%s' '{"name":"app","lockfileVersion":3,"packages":{"":{"dependencies":{"chalk":"^5.6.0"}},"node_modules/chalk":{"version":"5.6.1"}}}' \
+            > app/package-lock.json
+          git add app
+          GIT_AUTHOR_DATE="2025-11-25T10:00:00+00:00" \
+          GIT_COMMITTER_DATE="2025-11-25T10:00:00+00:00" \
+            git -c user.email=ci@test -c user.name=ci commit -qm "an exposed tree"
+      - id: permissive
+        uses: ./
+        continue-on-error: true
+        with:
+          ioc: example-demo
+          fail-on: never
+      - name: fail-on never reports without failing
+        run: |
+          set -euo pipefail
+          test "${{ steps.permissive.outcome }}" = "success" \
+            || { echo "fail-on: never must not fail the job"; exit 1; }
+          test "${{ steps.permissive.outputs.exit-code }}" = "1" \
+            || { echo "expected the scan to find credentials"; exit 1; }
+      - id: strict
+        uses: ./
+        continue-on-error: true
+        with:
+          ioc: example-demo
+      - name: the default fails the job when credentials must be rotated
+        run: |
+          set -euo pipefail
+          test "${{ steps.strict.outcome }}" = "failure" \
+            || { echo "the default fail-on must fail on exit 1"; exit 1; }

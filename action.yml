@@ -17,6 +17,15 @@ inputs:
     description: Path to write an HTML report to; skipped when empty.
     required: false
     default: ""
+outputs:
+  exit-code:
+    # A composite action's step outputs are not visible to the calling workflow
+    # unless they are mapped here, so without this block a caller reading
+    # `steps.<id>.outputs.exit-code` gets an empty string.
+    description: >-
+      The scan's exit code: 0 nothing to do, 1 credentials to rotate, 2 the scan
+      could not prove absence, 3 malformed input.
+    value: ${{ steps.scan.outputs.exit-code }}
 runs:
   using: composite
   steps:
@@ -45,6 +54,13 @@ runs:
         GH_TOKEN: ${{ github.token }}
       run: |
         set -uo pipefail
+        # GitHub runs `shell: bash` as `bash -e -o pipefail`, and `set -uo pipefail`
+        # does not clear the inherited errexit. The scan's non-zero exit is this
+        # action's input, not a reason to abort, so errexit is turned off explicitly:
+        # without this the step died at the scan line and the whole `fail-on`
+        # contract below never ran — every outcome failed the job, including the
+        # ones documented not to. Every failure past this point is handled by hand.
+        set +e
         case "$FAIL_ON" in
           rotate|incomplete|never) ;;
           *) echo "::error::unknown fail-on value: $FAIL_ON"; exit 1 ;;
@@ -61,8 +77,14 @@ runs:
         } >> "$GITHUB_STEP_SUMMARY"
 
         if [ -n "$REPORT" ]; then
+          # The verdict is already in $code. This run's exit status is that same
+          # verdict, not a statement about the file, so judging the report by it
+          # turned every finding into "report generation failed" — asking for a
+          # report and finding anything was a hard failure whatever fail-on said.
+          # The only question here is whether the file got written.
           deptrail scan --ioc "$IOC" --repo . --slug "$SLUG" --format html \
-            --output "$REPORT" || { echo "::error::report generation failed"; exit 1; }
+            --output "$REPORT"
+          [ -s "$REPORT" ] || { echo "::error::report generation failed"; exit 1; }
         fi
 
         # A scan that never ran (3) fails regardless of fail-on: a green check must
@@ -70,7 +92,11 @@ runs:
         case "$code" in
           3) echo "::error::deptrail could not run: see the log"; exit 1 ;;
           1) [ "$FAIL_ON" = never ] && exit 0 || { echo "::error::credentials to rotate"; exit 1 ;} ;;
-          2) [ "$FAIL_ON" = incomplete ] && { echo "::error::scan could not prove absence"; exit 1 ;} || exit 0 ;;
+          # A scan that could not prove absence is only a failure when asked for,
+          # but it is never silent: the annotation says so on the check itself,
+          # because nobody opens the log of a green run.
+          2) [ "$FAIL_ON" = incomplete ] && { echo "::error::scan could not prove absence"; exit 1 ;} \
+               || { echo "::warning::deptrail could not prove absence of exposure: see the job summary"; exit 0 ;} ;;
           0) exit 0 ;;
           *) echo "::error::unexpected exit code $code"; exit 1 ;;
         esac

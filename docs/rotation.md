@@ -46,15 +46,36 @@ design, and this tool never asks for them.
 - **A workflow that reads no secrets.** The finding stands; there is simply
   nothing to rotate from it.
 
-## Shallow clones
+## Two ways of not knowing, two different answers
 
-A shallow clone (including the default `actions/checkout`, which fetches depth 1)
-cannot answer when a version was installed, so a scan of one is reported as
-`POSSIBLE` with the reason, never as clean. In CI, check out with
-`fetch-depth: 0`; the bundled Action deepens the history itself.
+Both are refusals to claim an all-clear, and they are deliberately not the same
+refusal, because "rotate" and "I could not look" are different instructions.
+
+**Evidence about a lockfile we do track was lost** — a shallow clone (including
+the default `actions/checkout`, which fetches depth 1), an unreadable snapshot, a
+lockfile that failed to parse. A pin may be hidden in the part we could not see,
+so the repository is graded `POSSIBLE`, every credential it can reach goes on the
+list with the reason, and the run exits `1`. In CI, check out with `fetch-depth: 0`;
+the bundled Action deepens the history itself.
+
+**There was no lockfile we could read at all** — a tree locked with Yarn, pnpm,
+Bun or Deno, present while the malicious version was installable. Nothing was seen,
+and nothing was hidden from us either: no version, no window overlap, no run. Such a
+tree is listed under **not judged** with the file that caused it, the report refuses
+to prove absence, and the run exits `2`. It raises no credentials, because grading it
+`POSSIBLE` would hand every Yarn user a list of their entire secret store — a false
+alarm, not caution.
+
+A tree with *no* lockfile at all belongs in this category too and is not yet reported;
+see issue #22 for why that needs npm's workspace rules to answer correctly.
+
+A lockfile of either kind under `tests/fixtures`, `examples` and the like is
+committed data: it is named in the caveats and does not cost the repository its
+verdict, the same treatment a fixture exposure gets.
 
 ## What the report refuses to claim
 
-A report says it **cannot prove absence** whenever a repository failed to scan or
-the advisory declares partial coverage. In both cases something was not looked
-at, and "nothing found" would be the wrong sentence to hand a responder.
+A report says it **cannot prove absence** whenever a repository failed to scan, a
+tree could not be read, or the advisory declares partial coverage. In each case
+something was not looked at, and "nothing found" would be the wrong sentence to
+hand a responder.

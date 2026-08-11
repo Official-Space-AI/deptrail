@@ -27,7 +27,14 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 
 from .grading import Grade, GradedExposure, GradedFinding, RunHistory, grade_finding
-from .history import Exposure, GitError, Verdict, _git as _git_text, scan_repo
+from .history import (
+    Exposure,
+    GitError,
+    UnreadTree,
+    Verdict,
+    _git as _git_text,
+    scan_repo,
+)
 from .ioc import QueryPlan
 from .rotation import RepoRotation, RotationItem, Scope, rotation_for_repo
 
@@ -88,6 +95,38 @@ def _is_installed_tree(repo: Path, graded: GradedExposure) -> bool:
     )
 
 
+def _workflows_at(repo: Path, sha: str) -> tuple[str, ...]:
+    """Workflow files as they stood at one commit.
+
+    Read at the commit and not at HEAD: a workflow that installed a directory
+    during the window and was deleted afterwards is exactly the evidence that
+    matters, and looking at today's tree loses it (E14).
+    """
+    try:
+        out = _git_text(repo, "ls-tree", "-r", "--name-only", sha,
+                        ".github/workflows")
+    except GitError:
+        return ()
+    return tuple(line for line in out.splitlines() if line.strip())
+
+
+def _is_installed_unread_tree(repo: Path, tree: UnreadTree) -> bool:
+    """Whether an unread tree is one a workflow would have installed.
+
+    The directory heuristic must lose to evidence here for the same reason it does
+    for exposures: an application that really lives under ``examples/`` would
+    otherwise be filed away as sample data, and the repository would be cleared on
+    the strength of a directory name (found by review — see E13).
+    """
+    if is_probably_installed(tree.path):
+        return True
+    directory = str(PurePosixPath(tree.path).parent)
+    if not directory or directory == ".":
+        return True
+    sha = tree.commit or "HEAD"
+    return _workflow_mentions_dir(repo, sha, _workflows_at(repo, sha), directory)
+
+
 @dataclass(frozen=True)
 class TimelineEntry:
     """One exposure, placed in the organization-wide order of events."""
@@ -112,6 +151,9 @@ class OrgReport:
     rotations: list[RepoRotation] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    # Trees nothing could be said about, as "repo: reason". Distinct from
+    # ``errors``: the scan worked, there was simply no lockfile it could read.
+    unread: list[str] = field(default_factory=list)
     repos_scanned: int = 0
     partial_coverage: bool = False
 
@@ -198,11 +240,19 @@ class OrgReport:
     def proves_absence(self) -> bool:
         """Whether "nothing found" may be reported as an all-clear.
 
-        False if any repository failed to scan or the advisory only covers part of
-        the incident: in both cases something was not looked at.
+        False if any repository failed to scan, if any tree could not be read, or
+        if the advisory only covers part of the incident: in each case something
+        was not looked at.
         """
-        readable = all(f.verdict is not Verdict.INDETERMINATE for f in self.findings)
-        return not self.errors and not self.partial_coverage and readable
+        # Each reason is checked on its own, because an exposure wins the verdict:
+        # a repository where one tree was read and exposed while another was
+        # unreadable is EXPOSED, and that verdict must not be mistaken for having
+        # seen everything. Both an unread tree and a lost snapshot leave a
+        # question open regardless of what the aggregate verdict became.
+        readable = all(f.verdict is not Verdict.INDETERMINATE and not f.warnings
+                       for f in self.findings)
+        return (not self.errors and not self.partial_coverage and readable
+                and not self.unread)
 
 
 def scan_organization(repos: Iterable[tuple[str, Path]], plan: QueryPlan, *,
@@ -262,14 +312,32 @@ def scan_organization(repos: Iterable[tuple[str, Path]], plan: QueryPlan, *,
             # exposures are fixtures but whose history was unreadable is still
             # INDETERMINATE, and carrying the original EXPOSED verdict here would
             # drop its repo-wide rotation items.
+            # An unparsed lockfile under tests/fixtures is committed data like any
+            # other: it must not cost the whole repository its verdict, or every
+            # tooling project that keeps such a fixture would be told its scan
+            # proves nothing.
+            unread = [t for t in graded.unread_trees
+                      if _is_installed_unread_tree(path, t)]
+            set_aside_unread = [t for t in graded.unread_trees if t not in unread]
             installed = replace(
-                graded, graded=kept,
+                graded, graded=kept, unread_trees=unread,
                 verdict=(Verdict.EXPOSED if kept
-                         # Only the walker's warnings mean the history was
-                         # unreadable; a thin CI record does not.
-                         else Verdict.INDETERMINATE if graded.warnings
+                         # Only the walker's own findings mean the history was not
+                         # read; a thin CI record does not.
+                         else Verdict.INDETERMINATE if graded.warnings or unread
                          else Verdict.CLEAN),
             )
+            for tree in unread:
+                line = f"{name}: {tree.reason}"
+                if line not in report.unread:
+                    report.unread.append(line)
+            for tree in set_aside_unread:
+                # Visible, but not part of the verdict — the same treatment a
+                # fixture exposure gets.
+                note = (f"{name}: {tree.reason} — set aside, nothing installs this "
+                        "tree")
+                if note not in report.notes:
+                    report.notes.append(note)
             # The report keeps the finding the decisions were made on, so its
             # verdict is the one `proves_absence` must answer to.
             report.findings.append(installed)
@@ -315,6 +383,10 @@ def render_report(report: OrgReport) -> str:
             )
             for fact in entry.evidence:
                 lines.append(f"                {fact}")
+    elif report.unread:
+        # Saying "no exposure found" alone would read as an all-clear for a
+        # repository whose dependencies were never legible.
+        lines.append("timeline: no exposure found in what could be read")
     else:
         lines.append("timeline: no exposure found in an installed tree")
     lines.append("")
@@ -345,7 +417,13 @@ def render_report(report: OrgReport) -> str:
     if report.errors:
         lines += ["", "could not scan (verdict is not complete)"]
         lines += [f"  {e}" for e in report.errors]
-    caveats = list(report.notes) + list(report.rotation_notes)
+    if report.unread:
+        lines += ["", "not judged (no lockfile this tool can read)"]
+        lines += [f"  {u}" for u in report.unread]
+    # The same reasons reach `rotation_notes` for a repo that also rotates; print
+    # each once, under the heading that explains it.
+    seen_above = set(report.unread)
+    caveats = [c for c in [*report.notes, *report.rotation_notes] if c not in seen_above]
     if caveats:
         lines += ["", "caveats"] + [f"  {c}" for c in caveats]
     if not report.proves_absence:
