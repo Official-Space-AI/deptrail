@@ -68,6 +68,15 @@ INSTALL_COMMANDS = ("npm ci", "npm i ", "npm install", "yarn install", "yarn --f
 RETENTION = timedelta(days=90)
 
 
+class ToolFailure(RuntimeError):
+    """A call this tool needed did not complete.
+
+    Its own type, because wrapping a ``CalledProcessError`` in a plain
+    ``RuntimeError`` loses the one fact a caller needs — that retrying may help —
+    and the report then files it as evidence that says nothing (E18).
+    """
+
+
 class Grade(str, Enum):
     CONFIRMED = "CONFIRMED"
     LIKELY = "LIKELY"
@@ -195,7 +204,15 @@ class GradedFinding:
         POSSIBLE counts: an unprovable install is not an absent one, and the
         cost of rotating one extra credential is smaller than the cost of
         leaving a live one in an attacker's hands.
+
+        An incomplete clone with nothing found is the exception, and it is not a
+        softening: no credential is pointed at, so none goes on a checklist, and the
+        exit code says "could not prove absence" on its own. Answering True here
+        would also make the caller fetch a repository's secret names — an
+        admin-scoped call — for a list it is then going to leave empty.
         """
+        if not self.graded and not self.warnings and self.incomplete:
+            return False
         return self.worst_grade in (Grade.CONFIRMED, Grade.LIKELY, Grade.POSSIBLE)
 
 
@@ -390,7 +407,7 @@ def runs_from_github(repo_slug: str, *, since: datetime | None = None,
             capture_output=True, text=True, check=True,
         ).stdout
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
-        raise RuntimeError(f"could not read CI runs for {repo_slug}: {e}") from e
+        raise ToolFailure(f"could not read CI runs for {repo_slug}: {e}") from e
     pages = json.loads(raw or "[]")
     runs = [run for page in pages for run in page.get("workflow_runs", [])]
     return parse_run_list(

@@ -211,6 +211,50 @@ class TestExitCodeContract:
         assert code == EXIT_TRANSIENT
         assert code not in (EXIT_ROTATE, EXIT_CLEAN)
 
+    def test_a_failed_tool_is_transient_on_the_repo_path_too(self, tmp_path, capsys,
+                                                             monkeypatch):
+        # The `--org` path raises before the scan, so it was already 4. The `--repo`
+        # path — the one action.yml itself runs — absorbed the failure into the report
+        # and left as 2, which the Action then passes off as a warning.
+        advisory = self._advisory(tmp_path)
+        monkeypatch.setenv("PATH", str(tmp_path / "empty"))  # no gh
+        code = main(["scan", "--ioc", str(advisory), "--format", "json",
+                     "--repo", str(tmp_path / "demo" / "web-frontend"),
+                     "--slug", "acme/web-frontend"])
+        payload = json.loads(capsys.readouterr().out)
+        assert code == EXIT_TRANSIENT
+        assert payload["could_not_run"], payload
+        assert payload["decision"]["scan_complete"] is False
+
+    def test_a_failed_call_is_transient_not_incomplete(self, tmp_path, capsys,
+                                                       monkeypatch):
+        # A `gh` that exists and fails is the other half of the contract: 2 says the
+        # history was looked at and cannot be cleared, 4 says the call did not happen.
+        advisory = self._advisory(tmp_path)
+        binhome = tmp_path / "failing"
+        binhome.mkdir()
+        (binhome / "gh").write_text("#!/bin/sh\necho 'gh: API rate limit' >&2\nexit 1\n")
+        (binhome / "gh").chmod(0o755)
+        real = __import__("os").environ["PATH"]
+        monkeypatch.setenv("PATH", f"{binhome}:{real}")
+        code = main(["scan", "--ioc", str(advisory), "--format", "json",
+                     "--repo", str(tmp_path / "demo" / "web-frontend"),
+                     "--slug", "acme/web-frontend"])
+        payload = json.loads(capsys.readouterr().out)
+        assert code == EXIT_TRANSIENT
+        assert any("CI runs unavailable" in t for t in payload["could_not_run"]), payload
+
+    def test_an_unwritable_workdir_is_transient_not_a_traceback(self, tmp_path, capsys):
+        # Letting an OSError escape means the interpreter exits 1, which this contract
+        # reads as "rotate these credentials".
+        advisory = self._advisory(tmp_path)
+        blocker = tmp_path / "not-a-dir"
+        blocker.write_text("i am a file")
+        code = main(["scan", "--ioc", str(advisory), "--org", "acme",
+                     "--workdir", str(blocker)])
+        assert code == EXIT_TRANSIENT
+        assert code != EXIT_ROTATE
+
     def test_write_failure_is_not_a_verdict(self, tmp_path, capsys):
         advisory = self._advisory(tmp_path)
         code = main(["scan", "--ioc", str(advisory), "--no-ci", "--format", "json",
@@ -305,9 +349,13 @@ class TestOrgCacheSafety:
         code = main(["scan", "--ioc", str(advisory), "--org", "acme", "--no-ci",
                      "--workdir", str(cache), "--limit", "2", "--format", "json"])
         payload = json.loads(capsys.readouterr().out)
-        assert code == EXIT_INCOMPLETE
+        assert code != EXIT_CLEAN
         assert payload["decision"]["scan_complete"] is False
+        # The truncation is the caller's to fix, so it stays an error rather than
+        # something to retry. (This fixture's cached clones also cannot be refreshed,
+        # which is what decides the exact non-zero code here.)
         assert any("hit the --limit" in e for e in payload["errors"])
+        assert not any("hit the --limit" in t for t in payload["could_not_run"])
 
     def test_cache_belonging_to_another_org_is_refused(self, tmp_path, capsys, monkeypatch):
         advisory = self._advisory(tmp_path)
@@ -331,8 +379,10 @@ class TestOrgCacheSafety:
         code = main(["scan", "--ioc", str(advisory), "--org", "acme", "--no-ci",
                      "--workdir", str(cache), "--format", "json"])
         payload = json.loads(capsys.readouterr().out)
-        assert code == EXIT_INCOMPLETE
-        assert any("fetch failed" in e for e in payload["errors"])
+        # A fetch that failed is the tooling not answering, not a history that says
+        # nothing: retrying may help, so it is 4 rather than 2.
+        assert code == EXIT_TRANSIENT
+        assert any("fetch failed" in t for t in payload["could_not_run"])
 
 
 class TestReportEncoding:

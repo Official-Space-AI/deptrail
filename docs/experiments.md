@@ -724,3 +724,77 @@ unreadable history should raise credentials — and two tests encoded it. Those 
 assert the same intent by the new mechanism: the repository is still not cleared, its
 worst grade is still `POSSIBLE`, and the reason is still named; what changed is that it
 no longer invents a credential list from an absence of evidence.
+
+## E18 — Reviewing a contract change, from two directions at once
+
+**Assumption**: E17's three separations were the whole of it, and the remaining work was
+wording.
+
+**Method**: the usual pair — a four-lens review with adversarial verification, and an
+independent second review — both aimed at a commit that deliberately *reversed* an
+earlier decision. 27 findings survived verification between them, and each one that made
+a claim about this repository was re-measured here before being acted on.
+
+**Result**: the reversal held. Everything around it needed work.
+
+*Neither review could defeat the reversal itself.* Asked for a concrete incident where
+refusing to name credentials for an unread view harms a responder, both came back with
+nothing better than the old behaviour's own failure — a list of every credential of every
+truncated repository, with no way to tell which mattered. That is the strongest evidence
+available that the change is right, and it is worth recording precisely because it was
+the thing most likely to be wrong.
+
+*A false clean neither review had been looking for.* A checkout built by `git init` +
+`git fetch origin <branch>` holds one branch and passes every completeness check: not
+shallow, no promisor, and — because `git remote add` writes the wildcard refspec whatever
+you fetch afterwards — not single-branch either. The malicious pin on an unfetched branch
+gives exit 0. It is not a regression; the same shape behaves identically two commits back.
+The obvious local signal, `refs/remotes/origin/HEAD`, turns out to be unusable: measured,
+`actions/checkout` with `fetch-depth: 0` fetches every head and still never sets it, so
+keying on it would deny an all-clear to the recommended CI configuration. Settling this
+needs the remote's ref list, which makes the walker touch the network for the first time —
+its own decision, tracked as #27 and documented in the README rather than half-done here.
+
+*The partial-clone rule was over-reporting, and the run itself proved it.* Refusing an
+all-clear for a `blob:none` clone asserted an unreadability the scan disproves: every
+snapshot the verdict rests on was read, and `_read_snapshot` records a warning for any
+that were not. So a partial clone is now an observation, the read failures are the
+evidence, and both directions are tested — a filtered clone that read everything clears,
+and one whose blob is genuinely absent does not.
+
+*Three exit codes were still wrong.* `EXIT_TRANSIENT` was unreachable on the `--repo`
+path — the one `action.yml` itself runs — because `scan_organization` absorbs a provider
+failure into the report, so an absent `gh` left as exit 2 and the Action turned that into
+a green check. Worse, `runs_from_github` wrapped `CalledProcessError` in a plain
+`RuntimeError`, which erased the one fact a caller needs; it now raises `ToolFailure`. And
+any `OSError` other than `FileNotFoundError` escaped `main()` as a traceback, so the
+interpreter exited 1 — which this contract reads as "rotate these credentials".
+
+*The CI assertion for exit 4 asserted 127.* `env PATH=<empty> deptrail …` looks up
+`deptrail` on the emptied PATH. The job was red, and because it aborted there, every
+assertion after it never ran. The partial-clone assertion beside it was circular in a
+different way: `file://` ignores `--filter` without `uploadpack.allowFilter`, so the clone
+under test had every blob while `remote.origin.promisor` was still set — the assertion
+proved only that git config can be read. Both replaced.
+
+*And the gate at the centre of E17 had no test at all.* Reverting
+`if finding.warnings and graded_needing:` to `if finding.warnings:` passed all 271 tests,
+because moving truncation out of `warnings` had quietly emptied the fixtures that used to
+cover it. Four tests now pin it in both directions, and every gate this round touched was
+mutation-checked.
+
+Smaller, all confirmed and fixed: the waiver note's dedup key omitted the suffix it
+appends, printing one accepted gap once per advisory package — hundreds of identical lines
+on a real advisory; `needs_rotation` was true for an incomplete-only finding, so the scan
+spent an admin-scoped `gh secret list` on a repository whose list it was about to leave
+empty, and reported the refusal as "could not scan"; the "no exposure found" sentence was
+unhedged for an incomplete view while its sibling unread case was hedged; JSON `caveats`
+repeated lines the dedicated keys already carried, so a JSON consumer counted every gap
+twice; under `fail-on: never` the strongest verdict produced no annotation at all while
+the milder one got a warning; and `cli.py`'s module docstring still published the
+superseded three-code contract.
+
+**Verification**: 281 tests. Every gate changed in E17 or here was mutation-checked by
+reverting its production line and confirming a test fails — including the two that
+initially did not, which is how the missing coverage was found. The exit-code matrix was
+re-measured end to end after every change.

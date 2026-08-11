@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from deptrail.grading import Grade, RunHistory, RunRecord
+from deptrail.history import Verdict
 from deptrail.ioc import parse_advisory
 from deptrail.org import render_report, scan_organization
 from deptrail.rotation import Scope, secrets_in_workflow
@@ -219,7 +220,7 @@ class TestOrgAggregation:
         assert not report.proves_absence
         assert any("partial coverage" in n for n in report.notes)
 
-    def test_unreadable_history_reaches_the_rotation_list(self, tmp_path, plan):
+    def test_unreadable_history_is_not_cleared_and_names_nothing(self, tmp_path, plan):
         origin = make_repo(tmp_path, "origin", [
             ("2025-11-25T10:00:00+00:00", "5.6.1"),
             ("2025-11-28T10:00:00+00:00", "5.6.2"),
@@ -396,6 +397,116 @@ class TestUnreadableTrees:
                                    secrets=secrets_provider)
         assert report.rotation_items, "the npm tree's exposure still rotates"
         assert report.unread and "mobile/yarn.lock" in report.unread[0]
+        assert not report.proves_absence
+
+
+class TestWideningNeedsSomethingToWiden:
+    """#20: a lost snapshot broadens the scope of what *was* found, and names nothing
+    when nothing was found. Reverting the gate to `if finding.warnings:` passed the
+    whole suite before these existed."""
+
+    def _unreadable(self, repo, path, date):
+        target = repo / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("{ not json")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", f"broken {path}", date=date)
+
+    def test_a_lost_snapshot_alone_names_no_credential(self, tmp_path, plan):
+        repo = tmp_path / "broken"
+        repo.mkdir()
+        git(repo, "init", "-q")
+        (repo / ".github/workflows").mkdir(parents=True)
+        (repo / ".github/workflows/ci.yml").write_text(CI_WORKFLOW)
+        self._unreadable(repo, "package-lock.json", "2025-11-25T10:00:00+00:00")
+        report = scan_organization([("broken", repo)], plan, runs=no_runs,
+                                   secrets=secrets_provider)
+        assert not report.proves_absence, "an unreadable lockfile is not an all-clear"
+        assert report.worst_grade is Grade.POSSIBLE
+        assert report.rotation_items == ()
+        assert report.rotation_required is False
+
+    def test_a_lost_snapshot_alone_names_nothing_even_unnamed(self, tmp_path, plan):
+        # Without a secrets provider the old gate produced an `unnamed` entry, which
+        # `rotation_required` counts — so exit 1 came back by another door.
+        repo = tmp_path / "broken2"
+        repo.mkdir()
+        git(repo, "init", "-q")
+        self._unreadable(repo, "package-lock.json", "2025-11-25T10:00:00+00:00")
+        report = scan_organization([("broken2", repo)], plan, runs=no_runs)
+        assert report.unnamed_rotations == ()
+        assert report.rotation_required is False
+        assert not report.proves_absence
+
+    def test_only_a_set_aside_exposure_plus_a_lost_snapshot_names_nothing(self, tmp_path,
+                                                                         plan):
+        # `kept` is empty because the exposure is a fixture, so there is still nothing
+        # to widen — the gate must look at what survived, not at what was found.
+        repo = tmp_path / "fixtures-only"
+        repo.mkdir()
+        git(repo, "init", "-q")
+        (repo / "tests/fixtures").mkdir(parents=True)
+        (repo / "tests/fixtures/package-lock.json").write_text(lock("5.6.1"))
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "fixture", date="2025-11-25T10:00:00+00:00")
+        self._unreadable(repo, "svc/package-lock.json", "2025-11-25T11:00:00+00:00")
+        report = scan_organization([("fixtures-only", repo)], plan, runs=no_runs,
+                                   secrets=secrets_provider)
+        assert report.set_aside, "the fixture finding stays visible"
+        assert report.rotation_items == ()
+        assert not report.proves_absence
+
+    def test_a_real_exposure_plus_a_lost_snapshot_still_widens(self, tmp_path, plan):
+        # The other direction, which E14 established and this must not undo.
+        repo = make_repo(tmp_path, "api", [("2025-11-25T10:00:00+00:00", "5.6.1")])
+        self._unreadable(repo, "svc/package-lock.json", "2025-11-25T11:00:00+00:00")
+        report = scan_organization([("api", repo)], plan,
+                                   runs=runs_with(exposing_commit(repo)),
+                                   secrets=secrets_provider)
+        secrets = {i.secret for i in report.rotation_items}
+        assert "AWS_KEY" in secrets, secrets
+
+
+class TestTheFindingAndTheReportMustAgree:
+    """Two places derive the same repository's verdict from the same data. When they
+    disagreed, only a separate check in `proves_absence` kept the exit code right, and
+    a consumer reading `OrgReport.findings` saw CLEAN for a clone that was truncated."""
+
+    def _shallow(self, tmp_path, plan):
+        origin = make_repo(tmp_path, "origin", [("2025-11-25T10:00:00+00:00", "5.6.0")])
+        shallow = tmp_path / "shallow"
+        subprocess.run(["git", "clone", "-q", "--depth", "1", f"file://{origin}",
+                        str(shallow)], check=True, capture_output=True)
+        return scan_organization([("shallow", shallow)], plan, runs=no_runs)
+
+    def test_the_kept_finding_carries_the_truncation(self, tmp_path, plan):
+        report = self._shallow(tmp_path, plan)
+        finding = report.findings[0]
+        assert finding.incomplete, "the reason must travel with the finding"
+        assert finding.verdict is Verdict.INDETERMINATE, (
+            "the finding the report keeps is the one proves_absence answers to"
+        )
+        assert not report.proves_absence
+
+    def test_an_incomplete_only_repo_is_not_asked_for_its_secret_names(self, tmp_path,
+                                                                      plan):
+        # Listing secrets needs an admin-scoped token. Asking for a repository whose
+        # rotation list is going to be empty spends that permission for nothing, and
+        # reports the refusal as "could not scan".
+        asked = []
+
+        def recording_secrets(path, name):
+            asked.append(name)
+            return ("AWS_KEY",)
+
+        origin = make_repo(tmp_path, "origin", [("2025-11-25T10:00:00+00:00", "5.6.0")])
+        shallow = tmp_path / "shallow"
+        subprocess.run(["git", "clone", "-q", "--depth", "1", f"file://{origin}",
+                        str(shallow)], check=True, capture_output=True)
+        report = scan_organization([("shallow", shallow)], plan, runs=no_runs,
+                                   secrets=recording_secrets)
+        assert asked == [], "nothing was found, so no credential list is being built"
+        assert report.rotation_items == ()
         assert not report.proves_absence
 
 

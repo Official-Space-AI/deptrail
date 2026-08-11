@@ -576,34 +576,65 @@ class TestPrecedenceAndDiagnostics:
         finding = scan_repo(repo, WINDOW)
         assert [t.path for t in finding.unread_trees] == ["yarn.lock"]
 
-    @pytest.mark.parametrize("key,value,expected", [
-        ("remote.origin.promisor", "true", "partial clone"),
-        ("remote.origin.fetch", "+refs/heads/main:refs/remotes/origin/main",
-         "single-branch clone"),
-    ])
-    def test_a_truncated_clone_is_named(self, tmp_path, key, value, expected):
-        # Both were silent before, and both produce a clean verdict from history the
-        # clone never had. Asserted on the config the real clone types set.
+    def test_a_single_branch_clone_cannot_be_cleared(self, tmp_path):
+        # A refspec with no wildcard fetched one branch, so a branch nobody fetched
+        # cannot testify. Asserted on the config a real `clone --single-branch` sets.
         from deptrail.history import incomplete_history
-        repo = self.fresh(tmp_path, f"truncated-{expected.split()[0]}")
+        repo = self.fresh(tmp_path, "single-branch")
         self.write(repo, "package-lock.json", lock_json("5.6.0"),
                    "2025-11-25T10:00:00+00:00")
-        assert incomplete_history(repo) == []
-        git(repo, "config", key, value)
-        reasons = incomplete_history(repo)
-        assert any(expected in r for r in reasons), reasons
+        assert incomplete_history(repo) == ([], [])
+        git(repo, "config", "remote.origin.fetch",
+            "+refs/heads/main:refs/remotes/origin/main")
+        reasons, notes = incomplete_history(repo)
+        assert any("single-branch clone" in r for r in reasons), reasons
         assert scan_repo(repo, WINDOW).verdict is Verdict.INDETERMINATE
+
+    def test_a_partial_clone_that_read_everything_is_still_cleared(self, tmp_path):
+        # It has every commit and its blobs arrive on demand. Refusing an all-clear
+        # here asserted an unreadability the run itself disproves — every snapshot the
+        # verdict rests on was read, and `warnings` is the record of any that were not.
+        from deptrail.history import incomplete_history
+        repo = self.fresh(tmp_path, "partial")
+        self.write(repo, "package-lock.json", lock_json("5.6.0"),
+                   "2025-11-25T10:00:00+00:00")
+        git(repo, "config", "remote.origin.promisor", "true")
+        git(repo, "config", "remote.origin.partialclonefilter", "blob:none")
+        reasons, notes = incomplete_history(repo)
+        assert reasons == []
+        assert any("partial clone" in n for n in notes), notes
+        finding = scan_repo(repo, WINDOW)
+        assert finding.verdict is Verdict.CLEAN
+        assert any("partial clone" in d for d in finding.diagnostics)
+
+    def test_a_partial_clone_whose_snapshots_cannot_be_read_is_not_cleared(self, tmp_path):
+        # The other half: when the blobs really are unavailable, the read failures are
+        # what stop the all-clear, and they are recorded per snapshot.
+        repo = self.fresh(tmp_path, "partial-broken")
+        self.write(repo, "package-lock.json", lock_json("5.6.0"),
+                   "2025-11-25T10:00:00+00:00")
+        blob = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD:package-lock.json"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        # Remove the blob the way a promisor clone leaves it: absent from the store.
+        loose = repo / ".git/objects" / blob[:2] / blob[2:]
+        if loose.exists():
+            loose.unlink()
+        finding = scan_repo(repo, WINDOW)
+        assert finding.verdict is Verdict.INDETERMINATE
+        assert any("unreadable" in w for w in finding.warnings), finding.warnings
 
     def test_a_full_clone_is_not_called_truncated(self, tmp_path):
         # The control: a wildcard refspec and no promisor must stay clean, or the
-        # check above would just be a way of never clearing anything.
+        # checks above would just be a way of never clearing anything.
         from deptrail.history import incomplete_history
         repo = self.fresh(tmp_path, "complete")
         self.write(repo, "package-lock.json", lock_json("5.6.0"),
                    "2025-11-25T10:00:00+00:00")
         git(repo, "config", "remote.origin.fetch",
             "+refs/heads/*:refs/remotes/origin/*")
-        assert incomplete_history(repo) == []
+        assert incomplete_history(repo) == ([], [])
         assert scan_repo(repo, WINDOW).verdict is Verdict.CLEAN
 
     def test_a_rewritten_date_is_a_diagnostic_and_not_lost_evidence(self, tmp_path):

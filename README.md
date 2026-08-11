@@ -125,10 +125,15 @@ read as a scan that found nothing.
   *which* lockfile governed *which* directory *when* needs npm's workspace rules and
   is tracked separately ([#22](https://github.com/Official-Space-AI/deptrail/issues/22)).
 - **An incomplete clone cannot be cleared.** Shallow (`actions/checkout` is depth-1 by
-  default), partial (`--filter=blob:none`) and single-branch clones are each detected,
-  named, and reported as exit `2`. Use a full clone with `fetch-depth: 0`, or accept the
-  gap deliberately with `--allow-incomplete-history` — which is off by default and still
-  prints the reason.
+  default) and single-branch clones are detected, named, and reported as exit `2`. Use a
+  full clone with `fetch-depth: 0`, or accept the gap deliberately with
+  `--allow-incomplete-history` — off by default, and it still prints the reason. A
+  partial clone (`--filter=blob:none`) is fine as long as its blobs can be fetched; any
+  snapshot that could not be read is listed instead.
+- **A one-branch `fetch` cannot be told from a full clone.** `git init` + `git fetch
+  origin <branch>` keeps a wildcard refspec, so a branch that was never fetched looks
+  like a branch that does not exist. Deciding this needs the remote's ref list
+  ([#27](https://github.com/Official-Space-AI/deptrail/issues/27)).
 - **A pull-request run installed a tree that is in no branch.** GitHub synthesises
   `refs/pull/N/merge` for `pull_request` events, and it is reachable from no ref in a
   normal clone, so what such a run installed is currently graded from the head commit

@@ -129,9 +129,9 @@ def render_html(report: OrgReport, advisory=None) -> str:
                 f"<td><ul>{facts}</ul></td></tr>"
             )
         out.append("</table>")
-    elif report.unread:
-        out.append("<p>No exposure found in what could be read — see "
-                   "<em>Not judged</em> below.</p>")
+    elif report.unread or report.incomplete:
+        out.append("<p>No exposure found in what could be read — see the sections "
+                   "below for what could not be.</p>")
     else:
         out.append("<p>No exposure found in a tree a workflow would install.</p>")
 
@@ -148,6 +148,13 @@ def render_html(report: OrgReport, advisory=None) -> str:
     if report.errors:
         out.append("<h2>Could not scan</h2><ul>")
         out += [f"<li>{escape(e)}</li>" for e in report.errors]
+        out.append("</ul>")
+
+    if report.transient:
+        out.append("<h2>Could not run</h2><p class='sub'>These failed for reasons that "
+                   "are not evidence — a missing tool, a failed call. Retrying may "
+                   "help.</p><ul>")
+        out += [f"<li>{escape(t)}</li>" for t in report.transient]
         out.append("</ul>")
 
     if report.incomplete:
