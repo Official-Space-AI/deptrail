@@ -498,15 +498,27 @@ reconstruction work walks the default branch and lists our lineage failure as a 
 to validity, mitigated by averaging over 33 000 projects — an escape hatch a
 per-repository verdict does not have.
 
-*But npm already answers it, from data we are holding.* An npm lockfile is
-self-describing: `packages[""].workspaces` records the declaration in force when it was
-written, and the `packages` keys enumerate the members actually resolved. npm ships
-`mapWorkspaces.virtual({lockfile})`, which derives the workspace map from the lockfile
-object alone with no filesystem access. That collapses the coupling that broke design
-#3 — the declaration drifting independently of the lockfile — into a single blob read,
-plus a free staleness check: compare the declaration in the lockfile against the
-`package.json` at the same commit and refuse to credit governance when they disagree.
-Recorded in #22.
+*npm's own algorithm is borrowable; its lockfile shortcut is not.* The survey's headline
+claim — that a lockfile is self-describing about its governance, so
+`mapWorkspaces.virtual({lockfile})` answers the question from one blob — was **refuted by
+the check attached to it**, and the refutation is the more useful result.
+`virtual` intersects the declaration and the member set *as of the lockfile's last
+write*; governance at a commit is a function of that commit's root `package.json`. When
+the two have drifted, a **narrowed** declaration leaves `virtual` still calling a
+directory a member that npm now treats as undeclared — the false-clean direction. It is
+also not a public API, and it returns an empty map with no error for lockfileVersion 1,
+so it cannot distinguish "no workspaces" from "cannot tell".
+
+What survives is worth more than what was claimed: the *authority* is the manifest at the
+commit (npm's own installer uses the filesystem `mapWorkspaces({cwd, pkg})`, and only
+`load-virtual` touches the virtual variant — to detect lockfile/manifest inconsistency,
+not to establish governance); the lockfile's recorded declaration is a **staleness
+detector**, which is what arborist's `flagsSuspect` uses it for; and the ordered-negation
+pattern semantics can be taken from npm through the documented entry point rather than
+rewritten. One production data point cuts the other way and is worth weighing: Dependabot
+does **not** walk to parent directories for npm lockfiles at all, so the largest
+deployment of this logic errs toward over-reporting rather than toward a false clean.
+Recorded in #22, including the correction.
 
 *The window we consume does not exist as data.* OSV and the GHSA malware records model
 malice as a bare version list. The left edge is derivable — the registry keeps
@@ -541,3 +553,22 @@ prior-art claims behind each change above were re-checked against primary source
 second reader, and the two angles that did not complete — how other systems model state
 over a DAG, and independent verification of the literature and incident claims — are
 named as open in #22 rather than treated as settled.
+
+### Status of the evidence in E15
+
+Two of five angles did not complete, and the independent checks landed unevenly. The
+record, so the reader can weight each claim:
+
+- **Checked and held**: Renovate's negation over-match (with the refinement that it fires
+  when the workspace root is the repository root), Dependabot's different mishandling of
+  the same negation, and Dependabot's npm lockfile lookup being same-directory only.
+- **Checked and refuted**: the lockfile-is-self-describing claim, corrected above.
+- **Checked by me directly**: git's path-log simplification hiding a merge-losing branch
+  (a test in this repository), and OSV-Scanner's documented exit codes.
+- **Not yet independently checked**: every claim from the literature and
+  incident-practice angles, including the ~26% no-lockfile base rate, the
+  `npm i --package-lock-only` hazard, the community detector's "safe" output, and the npm
+  cache index as a dated ledger. They are recorded in #22, #23 and #24 as the reasoning
+  behind those issues, not as settled fact, and the verification is in flight.
+- **Not surveyed at all**: how other systems model state over a git DAG at scale, which
+  is the angle that would most directly inform #22's second step.
