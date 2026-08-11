@@ -54,6 +54,13 @@ runs:
         GH_TOKEN: ${{ github.token }}
       run: |
         set -uo pipefail
+        # GitHub runs `shell: bash` as `bash -e -o pipefail`, and `set -uo pipefail`
+        # does not clear the inherited errexit. The scan's non-zero exit is this
+        # action's input, not a reason to abort, so errexit is turned off explicitly:
+        # without this the step died at the scan line and the whole `fail-on`
+        # contract below never ran — every outcome failed the job, including the
+        # ones documented not to. Every failure past this point is handled by hand.
+        set +e
         case "$FAIL_ON" in
           rotate|incomplete|never) ;;
           *) echo "::error::unknown fail-on value: $FAIL_ON"; exit 1 ;;

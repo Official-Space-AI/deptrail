@@ -128,8 +128,56 @@ jobs:
         uses: ./
         with:
           ioc: example-demo
+          report: deptrail-report.html
       - name: exit 2 is annotated, not passed over in silence
         run: |
           set -euo pipefail
           code="${{ steps.scan.outputs.exit-code }}"
           test "$code" = "2" || { echo "expected exit 2, got $code"; exit 1; }
+      - name: and the report the action was asked for exists
+        run: test -s deptrail-report.html
+  action-rotate:
+    # The other half of the contract: a scan that finds credentials must fail the job
+    # by default, and must not fail it under `fail-on: never`. Both were broken by the
+    # same inherited errexit, so both need a job.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Commit an exposure in a tree a workflow installs
+        run: |
+          set -euo pipefail
+          mkdir -p app
+          printf '%s' '{"name":"app","lockfileVersion":3,"packages":{"":{"dependencies":{"chalk":"^5.6.0"}},"node_modules/chalk":{"version":"5.6.1"}}}' \
+            > app/package-lock.json
+          git add app
+          GIT_AUTHOR_DATE="2025-11-25T10:00:00+00:00" \
+          GIT_COMMITTER_DATE="2025-11-25T10:00:00+00:00" \
+            git -c user.email=ci@test -c user.name=ci commit -qm "an exposed tree"
+      - id: permissive
+        uses: ./
+        continue-on-error: true
+        with:
+          ioc: example-demo
+          fail-on: never
+      - name: fail-on never reports without failing
+        run: |
+          set -euo pipefail
+          test "${{ steps.permissive.outcome }}" = "success" \
+            || { echo "fail-on: never must not fail the job"; exit 1; }
+          test "${{ steps.permissive.outputs.exit-code }}" = "1" \
+            || { echo "expected the scan to find credentials"; exit 1; }
+      - id: strict
+        uses: ./
+        continue-on-error: true
+        with:
+          ioc: example-demo
+      - name: the default fails the job when credentials must be rotated
+        run: |
+          set -euo pipefail
+          test "${{ steps.strict.outcome }}" = "failure" \
+            || { echo "the default fail-on must fail on exit 1"; exit 1; }
