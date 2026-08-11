@@ -220,8 +220,59 @@ def is_shallow(repo: Path) -> bool:
     return _git(repo, "rev-parse", "--is-shallow-repository").strip() == "true"
 
 
+def _config(repo: Path, key: str) -> str:
+    """One git config value, empty when unset. Never raises for a missing key."""
+    result = subprocess.run(
+        ["git", "-C", str(repo), "config", "--get-all", key],
+        capture_output=True, text=True,
+    )
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def incomplete_history(repo: Path) -> list[str]:
+    """Every way this clone is known to hold less than the repository does.
+
+    A shallow clone was already detected; two other truncations were not, and both
+    produce a clean verdict from a history that was never there (E16):
+
+    - a **partial clone** has the commits but not the blobs, so a snapshot read either
+      fetches from the promisor remote one object at a time or fails
+    - a **single-branch clone** has one ref, which makes "every ref testifies" false
+      while nothing in the report says so
+
+    Each is one config lookup, and each belongs in ``warnings`` so the repository
+    cannot be cleared on evidence it does not have.
+    """
+    reasons = []
+    if is_shallow(repo):
+        reasons.append(
+            "shallow clone: history is truncated, absence of exposure is not evidence"
+        )
+    if _config(repo, "remote.origin.promisor") == "true":
+        filtered = _config(repo, "remote.origin.partialclonefilter") or "unknown filter"
+        reasons.append(
+            f"partial clone ({filtered}): lockfile contents are not all present "
+            "locally, so what a snapshot pinned may not be readable"
+        )
+    fetch = _config(repo, "remote.origin.fetch")
+    if fetch and "*" not in fetch:
+        reasons.append(
+            f"single-branch clone ({fetch}): the other refs are absent, and exposure "
+            "on a branch nobody fetched is still exposure"
+        )
+    return reasons
+
+
 def _paths_with_basename(repo: Path, basenames: tuple[str, ...]) -> list[str]:
     """Every path where one of these files ever lived on any ref.
+
+    ``--diff-merges=first-parent`` is what makes a merge report its own change:
+    without it git prints nothing for merge commits, so a lockfile introduced *by* a
+    merge is never discovered at all — measured on a repository whose ``yarn.lock``
+    sits at HEAD and was reported clean (E16). ``--no-renames`` keeps rename
+    detection from collapsing "package-lock deleted, npm-shrinkwrap added" into one
+    record, which would hide a precedence handover, and keeps discovery working on a
+    partial clone where similarity detection would need absent blobs.
 
     ``-z`` output is unquoted and NUL-separated, so it is split on NUL and nothing
     else: rewriting newlines as separators turned ``line\\nbreak/package-lock.json``
@@ -229,7 +280,8 @@ def _paths_with_basename(repo: Path, basenames: tuple[str, ...]) -> list[str]:
     unwalkable (E14). The basename check rejects look-alikes such as
     ``sample-package-lock.json``, which the ``*name`` pathspec would match.
     """
-    out = _git(repo, "log", "--all", "--full-history", "--format=", "--name-only", "-z",
+    out = _git(repo, "log", "--all", "--full-history", "--diff-merges=first-parent",
+               "--no-renames", "--format=", "--name-only", "-z",
                "--", *(f"*{name}" for name in basenames))
     wanted = set(basenames)
     names = {token[1:] if token.startswith("\n") else token
@@ -255,11 +307,19 @@ def lockfile_paths(repo: Path) -> list[str]:
 
 
 def _exists_at(repo: Path, sha: str, path: str) -> bool:
-    """Whether ``path`` is present in one commit's tree. Reads no content."""
-    return subprocess.run(
-        ["git", "-C", str(repo), "cat-file", "-e", f"{sha}:{path}"],
-        capture_output=True,
-    ).returncode == 0
+    """Whether ``path`` is present in one commit's tree.
+
+    Asked of the tree rather than of the blob. ``cat-file -e <sha>:<path>`` needs the
+    blob itself, so on a partial clone it either triggers a per-object fetch from the
+    promisor remote or, with lazy fetching disabled, answers "missing" for a file that
+    is plainly in the tree. Trees are never filtered out by ``blob:none``, so
+    ``ls-tree`` answers from local data and cannot be wrong in that direction.
+    """
+    result = subprocess.run(
+        ["git", "-C", str(repo), "ls-tree", "-z", "--name-only", sha, "--", path],
+        capture_output=True, text=True,
+    )
+    return result.returncode == 0 and bool(result.stdout.strip("\0"))
 
 
 def _existed_during(repo: Path, path: str, query: WindowQuery,
@@ -336,7 +396,8 @@ def _log_commits(repo: Path, path: str, *, ref: str | None = None,
     charge without touching that file, so a log of the package-lock alone never
     sees the moment it started to matter (E14).
     """
-    args = ["log", "--topo-order", "--full-history", "--format=%H|%aI|%cI"]
+    args = ["log", "--topo-order", "--full-history", "--no-renames",
+            "--format=%H|%aI|%cI"]
     if all_refs:
         args.append("--all")
     if ref:
@@ -522,10 +583,7 @@ def scan_repo(repo: Path, query: WindowQuery) -> RepoFinding:
     finding = RepoFinding(repo=repo)
     warned: set[str] = set()
     try:
-        if is_shallow(repo):
-            finding.warnings.append(
-                "shallow clone: history is truncated, absence of exposure is not evidence"
-            )
+        finding.warnings.extend(incomplete_history(repo))
         paths, foreign = discovered_lockfiles(repo)
         refs = _refs(repo)
         children, parents = _commit_graph(repo) if paths or foreign else ({}, {})

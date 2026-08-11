@@ -549,6 +549,59 @@ class TestPrecedenceAndDiagnostics:
             "the branch's pin is reachable from the merge and CI built it"
         assert [e.version for e in finding.exposures] == ["5.6.1"]
 
+    def test_a_lockfile_introduced_by_a_merge_is_discovered(self, tmp_path):
+        """E16: git prints no file list for a merge commit unless asked, so a
+        lockfile the merge itself introduced was never discovered — this repository
+        has a yarn.lock at HEAD and was reported clean."""
+        repo = self.fresh(tmp_path, "evil-merge")
+        self.write(repo, "base.txt", "base", "2025-11-01T10:00:00+00:00")
+        default = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--abbrev-ref", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        git(repo, "checkout", "-q", "-b", "feature")
+        self.write(repo, "f.txt", "f", "2025-11-02T10:00:00+00:00")
+        git(repo, "checkout", "-q", default)
+        self.write(repo, "m.txt", "m", "2025-11-03T10:00:00+00:00")
+        git(repo, "merge", "-q", "--no-ff", "--no-commit", "feature")
+        (repo / "yarn.lock").write_text(YARN_LOCK)     # present in neither parent
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "merge, and add a lockfile",
+            date="2025-11-25T10:00:00+00:00")
+        assert lockfile_paths(repo) == []              # npm side unaffected
+        finding = scan_repo(repo, WINDOW)
+        assert [t.path for t in finding.unread_trees] == ["yarn.lock"]
+
+    @pytest.mark.parametrize("key,value,expected", [
+        ("remote.origin.promisor", "true", "partial clone"),
+        ("remote.origin.fetch", "+refs/heads/main:refs/remotes/origin/main",
+         "single-branch clone"),
+    ])
+    def test_a_truncated_clone_is_named(self, tmp_path, key, value, expected):
+        # Both were silent before, and both produce a clean verdict from history the
+        # clone never had. Asserted on the config the real clone types set.
+        from deptrail.history import incomplete_history
+        repo = self.fresh(tmp_path, f"truncated-{expected.split()[0]}")
+        self.write(repo, "package-lock.json", lock_json("5.6.0"),
+                   "2025-11-25T10:00:00+00:00")
+        assert incomplete_history(repo) == []
+        git(repo, "config", key, value)
+        reasons = incomplete_history(repo)
+        assert any(expected in r for r in reasons), reasons
+        assert scan_repo(repo, WINDOW).verdict is Verdict.INDETERMINATE
+
+    def test_a_full_clone_is_not_called_truncated(self, tmp_path):
+        # The control: a wildcard refspec and no promisor must stay clean, or the
+        # check above would just be a way of never clearing anything.
+        from deptrail.history import incomplete_history
+        repo = self.fresh(tmp_path, "complete")
+        self.write(repo, "package-lock.json", lock_json("5.6.0"),
+                   "2025-11-25T10:00:00+00:00")
+        git(repo, "config", "remote.origin.fetch",
+            "+refs/heads/*:refs/remotes/origin/*")
+        assert incomplete_history(repo) == []
+        assert scan_repo(repo, WINDOW).verdict is Verdict.CLEAN
+
     def test_a_rewritten_date_is_a_diagnostic_and_not_lost_evidence(self, tmp_path):
         # A rebase costs no evidence, so it must not widen anything. Treating it
         # as lost evidence put every credential of a rebased repo on the list.

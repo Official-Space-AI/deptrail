@@ -114,10 +114,15 @@ read as a scan that found nothing.
   ranges fresh at install time, so what it installed is unknown, but deciding
   *which* lockfile governed *which* directory *when* needs npm's workspace rules and
   is tracked separately ([#22](https://github.com/Official-Space-AI/deptrail/issues/22)).
-- **A shallow clone cannot be cleared.** `actions/checkout` is depth-1 by default,
-  and truncated history hides pins. Use `fetch-depth: 0`. Today a shallow clone
-  exits `1` where an unreadable tree exits `2`; reconciling those is
-  [#20](https://github.com/Official-Space-AI/deptrail/issues/20).
+- **An incomplete clone cannot be cleared.** Shallow (`actions/checkout` is depth-1 by
+  default), partial (`--filter=blob:none`) and single-branch clones are each detected and
+  named, and none of them can produce an all-clear. Use a full clone with
+  `fetch-depth: 0`. Today they exit `1` where an unreadable tree exits `2`; reconciling
+  those is [#20](https://github.com/Official-Space-AI/deptrail/issues/20).
+- **A pull-request run installed a tree that is in no branch.** GitHub synthesises
+  `refs/pull/N/merge` for `pull_request` events, and it is reachable from no ref in a
+  normal clone, so what such a run installed is currently graded from the head commit
+  instead ([#25](https://github.com/Official-Space-AI/deptrail/issues/25)).
 - **Submodules are not crossed.** `git log` does not descend into a gitlink, so a
   Node project inside a submodule is invisible
   ([#21](https://github.com/Official-Space-AI/deptrail/issues/21)).

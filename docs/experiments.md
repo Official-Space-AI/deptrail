@@ -572,3 +572,95 @@ record, so the reader can weight each claim:
   behind those issues, not as settled fact, and the verification is in flight.
 - **Not surveyed at all**: how other systems model state over a git DAG at scale, which
   is the angle that would most directly inform #22's second step.
+
+## E16 — Finishing the survey: what the last two angles and the critic found
+
+**Assumption**: E15 recorded the three angles that completed. The remaining two — how
+other systems model state over a git DAG, and independent verification of the literature
+and incident claims — would refine the design but not change what ships.
+
+**Method**: resumed the survey so the missing angle, the eight outstanding
+verifications, the synthesis and a completeness critic all ran. Every claim the synthesis
+made about *this* repository's code was then re-measured here before being acted on.
+
+**Result: two more false cleans in shipped code, and a design conclusion that closes the
+question of representation.**
+
+*A lockfile introduced by a merge was never discovered at all.* `git log --name-only`
+prints **nothing** for a merge commit unless `--diff-merges` is given, and it defaults to
+off. Built a repository whose `yarn.lock` is present at HEAD, added by the merge commit
+itself and in neither parent: discovery found zero paths and the scan returned exit 0.
+This is worse than E15's case, where the file at least no longer existed — here the
+unreadable lockfile is sitting in the current tree. `--diff-merges=first-parent` finds
+it. The same command also needed `--no-renames`, because rename detection collapses
+"`package-lock.json` deleted, `npm-shrinkwrap.json` added" into a single `R` record and
+hides a precedence handover. Measured loss on real repositories, from the survey: two
+paths on next.js, five on vscode, one of them a `yarn.lock` that would have forced
+INDETERMINATE.
+
+*Two kinds of truncated clone were silent.* Only shallow clones were detected. A
+**partial** clone (`remote.origin.promisor=true`, filter `blob:none`) has the commits but
+not the blobs; a **single-branch** clone has a refspec with no wildcard, which makes
+"every ref testifies" false while nothing said so. Both verified against clones of this
+repository, both now named in the report, and a full clone is still cleared — the control
+matters, because every check of this kind can be satisfied by never clearing anything.
+
+*Presence was being asked of the blob instead of the tree.* `cat-file -e <sha>:<path>`
+needs the blob, so on a partial clone it either fetches from the promisor remote one
+object at a time or answers "missing" for a file plainly in the tree. `ls-tree` answers
+from local data; trees are never filtered out by `blob:none`.
+
+*The representation question is settled, and not by preference.* Interval models
+presuppose a single line of time evolution; branched evolution is a separate indexing
+problem (Jiang, Salzberg, Lomet, Barrena, *The BT-tree: A Branched and Temporal Access
+Method*, VLDB 2000), and interval temporal logics are defined over linearly ordered
+domains, so "the interval during which F was present" is not well-formed over a DAG
+until a lineage is chosen. Design #3 failed for a reason identified 26 years ago. The
+established shape is per-commit state as the stored fact, with intervals **derived per
+lineage at report time** — which is what LGTM/Semmle and Software Heritage both do. The
+survey validated a fold, `state(C) = state(firstParent(C)) ⊕ delta(C vs first parent)`
+over `--topo-order --reverse --all --diff-merges=first-parent`, against `git ls-tree` on
+four real repositories: 2 336 sampled commits, 1 105 of them merges, zero mismatches,
+and 0.76 s for npm/cli through 24.3 s for vscode's 184 000 commits.
+
+*The workspace matcher can be ported rather than delegated, and now has an oracle.*
+Delegation does not survive: `mapWorkspaces.virtual` is the retracted shortcut, the
+documented `mapWorkspaces()` needs trees materialised to disk (~1.3 s per commit) plus a
+Node runtime, and `@npmcli/config`'s `loadLocalPrefix()` never reads a lockfile and walks
+past the checkout to the filesystem root. A 141-line stdlib-only Python port was written
+and differentially tested against npm 10.9.3's own `@npmcli/map-workspaces`: 1 234 cases
+across hand-written adversarial, random and path-derived suites, zero disagreements. The
+fuzzer earned its place by finding a semantics no angle had reported — **positive
+patterns skip dotfiles, negated ones do not**, because negations are handed to glob's
+`ignore` list, which is always parsed `dot: true`. Three different dot policies inside one
+function.
+
+*And the sub-problem is narrower than we thought.* On npm/cli's own history, "a manifest
+with no governing lockfile" fires roughly 366 times per commit, and every one is a test
+fixture nobody installs. The predicate has to be **installable *and* unlocked**, which
+means the existing `is_probably_installed` gate and the workflow-names-the-directory
+escape hatch are load-bearing rather than polish. That measurement is n=1 and on the
+least representative repository imaginable, so it is recorded as a reason to keep the
+gate, not as a rate.
+
+**Changes**: `--diff-merges=first-parent --no-renames` on discovery, `--no-renames` on
+path logs, presence via `ls-tree`, and partial/single-branch clone detection — each with a
+test that fails when the fix is removed, plus a full-clone control. #22 rewritten again
+around per-commit state and the ported matcher.
+
+**What the critic found that nobody looked at**, now recorded in the issues rather than
+lost: Turborepo's `crates/turborepo-lockfiles` implements exactly this primitive per
+ecosystem, with `Ok(None)` as a first-class "not governed" and a `global_change` guard for
+lockfile-format changes — the closest prior art in existence, and no angle opened it. For
+`pull_request` events, which were 62% of npm/cli's last hundred runs, the tree CI
+installed is a GitHub-synthesised `refs/pull/N/merge` commit that is reachable from **no
+branch** and absent from every clone, though it is fetchable on demand. The
+`actions/setup-node` cache key is `(ref, lockfile content hash, timestamp)` published by
+CI itself. And `overrides`/`resolutions`, pnpm `catalog:` ranges that live outside the
+member manifest, and private-registry mirrors that served the malicious tarball after
+npmjs.org removed it are all unmodelled.
+
+**Verification**: 269 tests. Each of the three fixes above was mutation-checked — the
+merge-discovery test and both truncation branches fail when their production line is
+disabled. Every scenario from the four earlier review rounds still returns the exit code
+it should, the demo still exits 1, and this repository still clears itself at exit 0.
