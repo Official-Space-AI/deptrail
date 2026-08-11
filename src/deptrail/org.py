@@ -22,11 +22,19 @@ human can overrule the classification; they simply do not produce rotation items
 """
 from __future__ import annotations
 
+import subprocess
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 
-from .grading import Grade, GradedExposure, GradedFinding, RunHistory, grade_finding
+from .grading import (
+    Grade,
+    GradedExposure,
+    GradedFinding,
+    RunHistory,
+    ToolFailure,
+    grade_finding,
+)
 from .history import (
     Exposure,
     GitError,
@@ -127,6 +135,19 @@ def _is_installed_unread_tree(repo: Path, tree: UnreadTree) -> bool:
     return _workflow_mentions_dir(repo, sha, _workflows_at(repo, sha), directory)
 
 
+# Failures that mean the tooling could not answer, as opposed to evidence that says
+# nothing. Retrying one of these may help; retrying a corrupt lockfile will not.
+TRANSIENT_FAILURES = (OSError, subprocess.CalledProcessError, ToolFailure, GitError)
+
+
+def _record_failure(report: "OrgReport", where: str, error: Exception) -> None:
+    """File a failure under the heading that tells a caller what to do about it."""
+    line = f"{where} ({type(error).__name__}: {error})"
+    target = (report.transient if isinstance(error, TRANSIENT_FAILURES)
+              else report.errors)
+    target.append(line)
+
+
 @dataclass(frozen=True)
 class TimelineEntry:
     """One exposure, placed in the organization-wide order of events."""
@@ -150,10 +171,18 @@ class OrgReport:
     timeline: list[TimelineEntry] = field(default_factory=list)
     rotations: list[RepoRotation] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    # Failures of the tooling rather than of the evidence: an absent `git`/`gh`, a
+    # failed API call, a clone that did not complete. Separate from ``errors``
+    # because only these are worth retrying, and because a caller that sees a
+    # verdict-shaped exit code would never learn the tool did not finish.
+    transient: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     # Trees nothing could be said about, as "repo: reason". Distinct from
     # ``errors``: the scan worked, there was simply no lockfile it could read.
     unread: list[str] = field(default_factory=list)
+    # Repositories whose clone held less than the repository does, as
+    # "repo: reason". A deeper clone is the remedy, so the report says which.
+    incomplete: list[str] = field(default_factory=list)
     repos_scanned: int = 0
     partial_coverage: bool = False
 
@@ -251,13 +280,13 @@ class OrgReport:
         # question open regardless of what the aggregate verdict became.
         readable = all(f.verdict is not Verdict.INDETERMINATE and not f.warnings
                        for f in self.findings)
-        return (not self.errors and not self.partial_coverage and readable
-                and not self.unread)
+        return (not self.errors and not self.transient and not self.partial_coverage
+                and readable and not self.unread and not self.incomplete)
 
 
 def scan_organization(repos: Iterable[tuple[str, Path]], plan: QueryPlan, *,
                       runs: RunsProvider, secrets: SecretsProvider | None = None,
-                      ) -> OrgReport:
+                      allow_incomplete: bool = False) -> OrgReport:
     """Judge every repository against every package the advisory names.
 
     ``repos`` are (name, local clone path) pairs; ``runs`` and ``secrets`` are
@@ -281,7 +310,7 @@ def scan_organization(repos: Iterable[tuple[str, Path]], plan: QueryPlan, *,
             try:
                 finding = scan_repo(path, query)
             except Exception as e:  # a failed repo must be visible, not silent
-                report.errors.append(f"{name} ({query.package}): {type(e).__name__}: {e}")
+                _record_failure(report, f"{name} ({query.package})", e)
                 continue
             if name not in run_cache:
                 try:
@@ -289,10 +318,9 @@ def scan_organization(repos: Iterable[tuple[str, Path]], plan: QueryPlan, *,
                 except Exception as e:
                     # Losing the CI evidence must not lose the exposures already
                     # read from git: without runs every exposure is POSSIBLE, which
-                    # is exactly what an unanswered question deserves.
-                    report.errors.append(
-                        f"{name}: CI runs unavailable ({type(e).__name__}: {e})"
-                    )
+                    # is exactly what an unanswered question deserves. It must also
+                    # not read as a verdict — a call that failed is a call to retry.
+                    _record_failure(report, f"{name}: CI runs unavailable", e)
                     run_cache[name] = RunHistory(source=f"unavailable for {name}")
             history = run_cache[name]
             graded = grade_finding(
@@ -316,6 +344,21 @@ def scan_organization(repos: Iterable[tuple[str, Path]], plan: QueryPlan, *,
             # other: it must not cost the whole repository its verdict, or every
             # tooling project that keeps such a fixture would be told its scan
             # proves nothing.
+            # An incomplete clone stops an all-clear unless the caller took
+            # responsibility for it, in which case it stays visible as a caveat.
+            if allow_incomplete and graded.incomplete:
+                for reason in graded.incomplete:
+                    # The guard has to test the line it appends: comparing the
+                    # unsuffixed text let one gap print once per advisory package,
+                    # which on a real advisory is hundreds of identical lines (E18).
+                    line = f"{name}: {reason} — accepted with --allow-incomplete-history"
+                    if line not in report.notes:
+                        report.notes.append(line)
+                graded = replace(graded, incomplete=[])
+            for reason in graded.incomplete:
+                line = f"{name}: {reason}"
+                if line not in report.incomplete:
+                    report.incomplete.append(line)
             unread = [t for t in graded.unread_trees
                       if _is_installed_unread_tree(path, t)]
             set_aside_unread = [t for t in graded.unread_trees if t not in unread]
@@ -324,7 +367,8 @@ def scan_organization(repos: Iterable[tuple[str, Path]], plan: QueryPlan, *,
                 verdict=(Verdict.EXPOSED if kept
                          # Only the walker's own findings mean the history was not
                          # read; a thin CI record does not.
-                         else Verdict.INDETERMINATE if graded.warnings or unread
+                         else Verdict.INDETERMINATE
+                         if graded.warnings or unread or graded.incomplete
                          else Verdict.CLEAN),
             )
             for tree in unread:
@@ -350,10 +394,8 @@ def scan_organization(repos: Iterable[tuple[str, Path]], plan: QueryPlan, *,
                         except Exception as e:
                             # One repo's secret listing failing must not lose the
                             # findings already collected for the rest.
-                            report.errors.append(
-                                f"{name}: secret names unavailable "
-                                f"({type(e).__name__}: {e})"
-                            )
+                            _record_failure(
+                                report, f"{name}: secret names unavailable", e)
                 report.rotations.append(
                     rotation_for_repo(path, name, installed, secret_cache[name])
                 )
@@ -383,9 +425,10 @@ def render_report(report: OrgReport) -> str:
             )
             for fact in entry.evidence:
                 lines.append(f"                {fact}")
-    elif report.unread:
+    elif report.unread or report.incomplete:
         # Saying "no exposure found" alone would read as an all-clear for a
-        # repository whose dependencies were never legible.
+        # repository whose dependencies were never legible, or whose clone held less
+        # than the repository does.
         lines.append("timeline: no exposure found in what could be read")
     else:
         lines.append("timeline: no exposure found in an installed tree")
@@ -417,12 +460,18 @@ def render_report(report: OrgReport) -> str:
     if report.errors:
         lines += ["", "could not scan (verdict is not complete)"]
         lines += [f"  {e}" for e in report.errors]
+    if report.transient:
+        lines += ["", "could not run (retrying may help)"]
+        lines += [f"  {t}" for t in report.transient]
+    if report.incomplete:
+        lines += ["", "incomplete view (a deeper clone would say more)"]
+        lines += [f"  {i}" for i in report.incomplete]
     if report.unread:
         lines += ["", "not judged (no lockfile this tool can read)"]
         lines += [f"  {u}" for u in report.unread]
     # The same reasons reach `rotation_notes` for a repo that also rotates; print
     # each once, under the heading that explains it.
-    seen_above = set(report.unread)
+    seen_above = set(report.unread) | set(report.incomplete)
     caveats = [c for c in [*report.notes, *report.rotation_notes] if c not in seen_above]
     if caveats:
         lines += ["", "caveats"] + [f"  {c}" for c in caveats]

@@ -71,13 +71,31 @@ jobs:
           expect 3 deptrail scan --ioc example-demo --org acme --repo .
 
           # A shallow clone must never read as clean: this is the guard that a
-          # default `actions/checkout` (depth 1) would otherwise trip silently.
+          # default `actions/checkout` (depth 1) would otherwise trip silently. It
+          # exits 2 — "looked and could not prove absence" — and not 1, because
+          # deepening a clone must never lower the reported risk.
           git clone --quiet --depth 1 "file://$PWD" "$RUNNER_TEMP/shallow"
-          expect 1 deptrail scan --ioc example-demo --repo "$RUNNER_TEMP/shallow" --no-ci
+          expect 2 deptrail scan --ioc example-demo --repo "$RUNNER_TEMP/shallow" --no-ci
           deptrail scan --ioc example-demo --repo "$RUNNER_TEMP/shallow" --no-ci \
             > shallow.txt || true
           grep -q "shallow clone" shallow.txt
           grep -q "cannot prove absence" shallow.txt
+          grep -q "rotate: nothing" shallow.txt
+          # The same clone with the gap accepted on purpose clears, and still says so.
+          expect 0 deptrail scan --ioc example-demo --repo "$RUNNER_TEMP/shallow" \
+            --no-ci --allow-incomplete-history
+          deptrail scan --ioc example-demo --repo "$RUNNER_TEMP/shallow" --no-ci \
+            --allow-incomplete-history > waived.txt || true
+          grep -q "allow-incomplete-history" waived.txt
+
+          # An environment that cannot answer is 4, not 1 and not 3: retrying may help.
+          # deptrail's own path is resolved first — stripping PATH before looking it up
+          # found no deptrail either, so this asserted 127 and killed every line after it.
+          bin="$(command -v deptrail)"
+          mkdir -p "$RUNNER_TEMP/nobin"
+          expect 4 env PATH="$RUNNER_TEMP/nobin" "$bin" scan --ioc example-demo --org acme
+          expect 4 env PATH="$RUNNER_TEMP/nobin" "$bin" scan --ioc example-demo \
+            --repo . --slug "$GITHUB_REPOSITORY"
 
           # A project this version cannot parse must exit 2 — "could not prove
           # absence" — rather than 0, and must not manufacture a rotation list.

@@ -194,6 +194,11 @@ class RepoFinding:
     # them as lost evidence put every credential of a rebased repository on the
     # rotation list (E14).
     diagnostics: list[str] = field(default_factory=list)
+    # Ways this *clone* holds less than the repository does: shallow, partial,
+    # single-branch. Kept apart from ``warnings`` because the remedy differs — a
+    # deeper clone fixes these and nothing fixes a corrupt lockfile — and because
+    # only these may be waived by ``--allow-incomplete-history``.
+    incomplete: list[str] = field(default_factory=list)
     lockfiles_seen: int = 0
     # Trees whose dependencies this tool cannot read at all: a lockfile in a
     # dialect it does not parse, or a Node project with no lockfile in history.
@@ -211,7 +216,7 @@ class RepoFinding:
         """CLEAN is only claimable when nothing was exposed AND nothing went unread."""
         if self.exposures:
             return Verdict.EXPOSED
-        if self.warnings or self.unread_trees:
+        if self.warnings or self.unread_trees or self.incomplete:
             return Verdict.INDETERMINATE
         return Verdict.CLEAN
 
@@ -229,38 +234,45 @@ def _config(repo: Path, key: str) -> str:
     return result.stdout.strip() if result.returncode == 0 else ""
 
 
-def incomplete_history(repo: Path) -> list[str]:
-    """Every way this clone is known to hold less than the repository does.
+def incomplete_history(repo: Path) -> tuple[list[str], list[str]]:
+    """How much less this clone holds than the repository does, and what that costs.
 
-    A shallow clone was already detected; two other truncations were not, and both
-    produce a clean verdict from a history that was never there (E16):
+    Returns (reasons that stop an all-clear, observations that only inform).
 
-    - a **partial clone** has the commits but not the blobs, so a snapshot read either
-      fetches from the promisor remote one object at a time or fails
-    - a **single-branch clone** has one ref, which makes "every ref testifies" false
-      while nothing in the report says so
+    A **shallow** clone is missing commits outright, and a **single-branch** clone
+    fetched one refspec, so a branch nobody fetched cannot testify. Neither can be
+    cleared.
 
-    Each is one config lookup, and each belongs in ``warnings`` so the repository
-    cannot be cleared on evidence it does not have.
+    A **partial** clone is different, and treating it as equivalent was
+    over-reporting: it has every commit, and its blobs arrive from the promisor
+    remote on demand. Whether that worked is not a prediction to make in advance —
+    ``_read_snapshot`` records a warning for every snapshot it could not read, so if
+    that list is empty the run *did* read every state its verdict depends on and the
+    repository is as fully judged as a full clone would be. So a partial clone is an
+    observation, and the read failures are the evidence (E18).
+
+    What this cannot see: a checkout built by ``git init`` plus ``git fetch origin
+    <branch>`` keeps the wildcard refspec, is not shallow and has no promisor, yet
+    holds one branch. Distinguishing it needs the remote's ref list — see issue #27.
     """
-    reasons = []
+    reasons, notes = [], []
     if is_shallow(repo):
         reasons.append(
             "shallow clone: history is truncated, absence of exposure is not evidence"
         )
-    if _config(repo, "remote.origin.promisor") == "true":
-        filtered = _config(repo, "remote.origin.partialclonefilter") or "unknown filter"
-        reasons.append(
-            f"partial clone ({filtered}): lockfile contents are not all present "
-            "locally, so what a snapshot pinned may not be readable"
-        )
     fetch = _config(repo, "remote.origin.fetch")
     if fetch and "*" not in fetch:
         reasons.append(
-            f"single-branch clone ({fetch}): the other refs are absent, and exposure "
-            "on a branch nobody fetched is still exposure"
+            f"single-branch clone ({fetch}): other refs, if the remote has any, were "
+            "not fetched, and exposure on a branch nobody fetched is still exposure"
         )
-    return reasons
+    if _config(repo, "remote.origin.promisor") == "true":
+        filtered = _config(repo, "remote.origin.partialclonefilter") or "unknown filter"
+        notes.append(
+            f"partial clone ({filtered}): lockfile contents were fetched on demand; "
+            "any that could not be read are listed as unreadable snapshots"
+        )
+    return reasons, notes
 
 
 def _paths_with_basename(repo: Path, basenames: tuple[str, ...]) -> list[str]:
@@ -583,7 +595,9 @@ def scan_repo(repo: Path, query: WindowQuery) -> RepoFinding:
     finding = RepoFinding(repo=repo)
     warned: set[str] = set()
     try:
-        finding.warnings.extend(incomplete_history(repo))
+        truncated, observed = incomplete_history(repo)
+        finding.incomplete.extend(truncated)
+        finding.diagnostics.extend(observed)
         paths, foreign = discovered_lockfiles(repo)
         refs = _refs(repo)
         children, parents = _commit_graph(repo) if paths or foreign else ({}, {})

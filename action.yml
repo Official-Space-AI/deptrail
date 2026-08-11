@@ -8,9 +8,10 @@ inputs:
     required: true
   fail-on:
     description: >-
-      When to fail the job: "rotate" (credentials to rotate, plus any bad input),
-      "incomplete" (also when the scan cannot prove absence), or "never" (report
-      only; bad input still fails, because a scan that never ran is not a pass).
+      When to fail the job: "rotate" (credentials to rotate, plus anything that
+      stopped the scan from running), "incomplete" (also when the scan looked and
+      could not prove absence), or "never" (report only; a scan that never ran still
+      fails, because a green check must not mean "we could not look").
     required: false
     default: rotate
   report:
@@ -23,8 +24,8 @@ outputs:
     # unless they are mapped here, so without this block a caller reading
     # `steps.<id>.outputs.exit-code` gets an empty string.
     description: >-
-      The scan's exit code: 0 nothing to do, 1 credentials to rotate, 2 the scan
-      could not prove absence, 3 malformed input.
+      The scan's exit code: 0 nothing to do, 1 credentials to rotate, 2 looked and
+      could not prove absence, 3 malformed request, 4 the tool could not run.
     value: ${{ steps.scan.outputs.exit-code }}
 runs:
   using: composite
@@ -87,11 +88,23 @@ runs:
           [ -s "$REPORT" ] || { echo "::error::report generation failed"; exit 1; }
         fi
 
-        # A scan that never ran (3) fails regardless of fail-on: a green check must
-        # never mean "we could not look".
+        # A scan that never ran fails regardless of fail-on: a green check must never
+        # mean "we could not look". 3 is a malformed request, 4 an environment that
+        # could not answer — different fixes, same refusal to pass.
         case "$code" in
-          3) echo "::error::deptrail could not run: see the log"; exit 1 ;;
-          1) [ "$FAIL_ON" = never ] && exit 0 || { echo "::error::credentials to rotate"; exit 1 ;} ;;
+          3) echo "::error::deptrail was asked for something it cannot do: see the log"
+             exit 1 ;;
+          4) echo "::error::deptrail could not run (a tool or call failed): see the log"
+             exit 1 ;;
+          # Annotated either way: under `never` the strongest verdict the tool can
+          # reach used to produce a check with no annotation at all, while the milder
+          # "could not prove absence" got one.
+          1) if [ "$FAIL_ON" = never ]; then
+               echo "::warning::deptrail found credentials to rotate: see the job summary"
+               exit 0
+             else
+               echo "::error::credentials to rotate"; exit 1
+             fi ;;
           # A scan that could not prove absence is only a failure when asked for,
           # but it is never silent: the annotation says so on the check itself,
           # because nobody opens the log of a green run.

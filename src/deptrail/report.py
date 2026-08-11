@@ -129,9 +129,9 @@ def render_html(report: OrgReport, advisory=None) -> str:
                 f"<td><ul>{facts}</ul></td></tr>"
             )
         out.append("</table>")
-    elif report.unread:
-        out.append("<p>No exposure found in what could be read — see "
-                   "<em>Not judged</em> below.</p>")
+    elif report.unread or report.incomplete:
+        out.append("<p>No exposure found in what could be read — see the sections "
+                   "below for what could not be.</p>")
     else:
         out.append("<p>No exposure found in a tree a workflow would install.</p>")
 
@@ -150,13 +150,27 @@ def render_html(report: OrgReport, advisory=None) -> str:
         out += [f"<li>{escape(e)}</li>" for e in report.errors]
         out.append("</ul>")
 
+    if report.transient:
+        out.append("<h2>Could not run</h2><p class='sub'>These failed for reasons that "
+                   "are not evidence — a missing tool, a failed call. Retrying may "
+                   "help.</p><ul>")
+        out += [f"<li>{escape(t)}</li>" for t in report.transient]
+        out.append("</ul>")
+
+    if report.incomplete:
+        out.append("<h2>Incomplete view</h2><p class='sub'>This clone holds less than "
+                   "the repository does, so absence could not be established. A deeper "
+                   "clone would say more.</p><ul>")
+        out += [f"<li>{escape(i)}</li>" for i in report.incomplete]
+        out.append("</ul>")
+
     if report.unread:
         out.append("<h2>Not judged</h2><p class='sub'>No lockfile this tool can read, "
                    "so these trees were neither cleared nor implicated.</p><ul>")
         out += [f"<li>{escape(u)}</li>" for u in report.unread]
         out.append("</ul>")
 
-    seen_above = set(report.unread)
+    seen_above = set(report.unread) | set(report.incomplete)
     caveats = [c for c in [*report.notes, *report.rotation_notes] if c not in seen_above]
     if caveats:
         out.append("<h2>Caveats</h2><ul>")

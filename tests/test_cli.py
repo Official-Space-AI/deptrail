@@ -11,7 +11,14 @@ from pathlib import Path
 
 import pytest
 
-from deptrail.cli import EXIT_BAD_INPUT, EXIT_CLEAN, EXIT_INCOMPLETE, EXIT_ROTATE, main
+from deptrail.cli import (
+    EXIT_BAD_INPUT,
+    EXIT_CLEAN,
+    EXIT_INCOMPLETE,
+    EXIT_ROTATE,
+    EXIT_TRANSIENT,
+    main,
+)
 from deptrail.demo import build
 
 
@@ -193,11 +200,59 @@ class TestExitCodeContract:
         assert code == EXIT_BAD_INPUT
         assert "not both" in capsys.readouterr().err
 
-    def test_missing_tool_is_bad_input_not_rotate(self, tmp_path, capsys, monkeypatch):
+    def test_missing_tool_is_transient_not_rotate_and_not_the_callers_fault(
+            self, tmp_path, capsys, monkeypatch):
+        # An absent git or gh is an environment that cannot answer. Exit 1 would read
+        # as "rotate these credentials", 3 would blame the arguments, and 2 would say
+        # the history was looked at.
         advisory = self._advisory(tmp_path)
         monkeypatch.setenv("PATH", str(tmp_path / "empty"))  # no gh, no git
         code = main(["scan", "--ioc", str(advisory), "--org", "acme"])
-        assert code in (EXIT_BAD_INPUT, EXIT_INCOMPLETE)
+        assert code == EXIT_TRANSIENT
+        assert code not in (EXIT_ROTATE, EXIT_CLEAN)
+
+    def test_a_failed_tool_is_transient_on_the_repo_path_too(self, tmp_path, capsys,
+                                                             monkeypatch):
+        # The `--org` path raises before the scan, so it was already 4. The `--repo`
+        # path — the one action.yml itself runs — absorbed the failure into the report
+        # and left as 2, which the Action then passes off as a warning.
+        advisory = self._advisory(tmp_path)
+        monkeypatch.setenv("PATH", str(tmp_path / "empty"))  # no gh
+        code = main(["scan", "--ioc", str(advisory), "--format", "json",
+                     "--repo", str(tmp_path / "demo" / "web-frontend"),
+                     "--slug", "acme/web-frontend"])
+        payload = json.loads(capsys.readouterr().out)
+        assert code == EXIT_TRANSIENT
+        assert payload["could_not_run"], payload
+        assert payload["decision"]["scan_complete"] is False
+
+    def test_a_failed_call_is_transient_not_incomplete(self, tmp_path, capsys,
+                                                       monkeypatch):
+        # A `gh` that exists and fails is the other half of the contract: 2 says the
+        # history was looked at and cannot be cleared, 4 says the call did not happen.
+        advisory = self._advisory(tmp_path)
+        binhome = tmp_path / "failing"
+        binhome.mkdir()
+        (binhome / "gh").write_text("#!/bin/sh\necho 'gh: API rate limit' >&2\nexit 1\n")
+        (binhome / "gh").chmod(0o755)
+        real = __import__("os").environ["PATH"]
+        monkeypatch.setenv("PATH", f"{binhome}:{real}")
+        code = main(["scan", "--ioc", str(advisory), "--format", "json",
+                     "--repo", str(tmp_path / "demo" / "web-frontend"),
+                     "--slug", "acme/web-frontend"])
+        payload = json.loads(capsys.readouterr().out)
+        assert code == EXIT_TRANSIENT
+        assert any("CI runs unavailable" in t for t in payload["could_not_run"]), payload
+
+    def test_an_unwritable_workdir_is_transient_not_a_traceback(self, tmp_path, capsys):
+        # Letting an OSError escape means the interpreter exits 1, which this contract
+        # reads as "rotate these credentials".
+        advisory = self._advisory(tmp_path)
+        blocker = tmp_path / "not-a-dir"
+        blocker.write_text("i am a file")
+        code = main(["scan", "--ioc", str(advisory), "--org", "acme",
+                     "--workdir", str(blocker)])
+        assert code == EXIT_TRANSIENT
         assert code != EXIT_ROTATE
 
     def test_write_failure_is_not_a_verdict(self, tmp_path, capsys):
@@ -294,9 +349,13 @@ class TestOrgCacheSafety:
         code = main(["scan", "--ioc", str(advisory), "--org", "acme", "--no-ci",
                      "--workdir", str(cache), "--limit", "2", "--format", "json"])
         payload = json.loads(capsys.readouterr().out)
-        assert code == EXIT_INCOMPLETE
+        assert code != EXIT_CLEAN
         assert payload["decision"]["scan_complete"] is False
+        # The truncation is the caller's to fix, so it stays an error rather than
+        # something to retry. (This fixture's cached clones also cannot be refreshed,
+        # which is what decides the exact non-zero code here.)
         assert any("hit the --limit" in e for e in payload["errors"])
+        assert not any("hit the --limit" in t for t in payload["could_not_run"])
 
     def test_cache_belonging_to_another_org_is_refused(self, tmp_path, capsys, monkeypatch):
         advisory = self._advisory(tmp_path)
@@ -320,8 +379,10 @@ class TestOrgCacheSafety:
         code = main(["scan", "--ioc", str(advisory), "--org", "acme", "--no-ci",
                      "--workdir", str(cache), "--format", "json"])
         payload = json.loads(capsys.readouterr().out)
-        assert code == EXIT_INCOMPLETE
-        assert any("fetch failed" in e for e in payload["errors"])
+        # A fetch that failed is the tooling not answering, not a history that says
+        # nothing: retrying may help, so it is 4 rather than 2.
+        assert code == EXIT_TRANSIENT
+        assert any("fetch failed" in t for t in payload["could_not_run"])
 
 
 class TestReportEncoding:
@@ -455,7 +516,43 @@ class TestShallowCheckout:
                        check=True, capture_output=True)
         code = main(["scan", "--ioc", str(advisory), "--repo", str(shallow), "--no-ci"])
         out = capsys.readouterr().out
-        # The same repository judged from full history exits 0 (see
-        # test_clean_repo_exits_zero); truncated, it cannot be cleared.
-        assert code == EXIT_ROTATE
+        # The same repository judged from full history exits 0; truncated, it cannot be
+        # cleared — and "could not prove absence" is what that is, not "rotate" (#20).
+        assert code == EXIT_INCOMPLETE
         assert "shallow clone" in out and "cannot prove absence" in out
+        assert "rotate: nothing" in out
+
+    def test_deepening_a_clone_never_lowers_the_reported_risk(self, tmp_path, capsys):
+        # The property this contract exists to remove: the truncated clone must not
+        # look more urgent than the complete one it came from.
+        from deptrail.demo import advisory_path
+        repos = dict(build(tmp_path / "demo"))
+        advisory = advisory_path(tmp_path / "demo")
+        shallow = tmp_path / "shallow"
+        subprocess.run(["git", "clone", "-q", "--depth", "1",
+                        f"file://{repos['web-frontend']}", str(shallow)],
+                       check=True, capture_output=True)
+        truncated = main(["scan", "--ioc", str(advisory), "--repo", str(shallow),
+                          "--no-ci"])
+        capsys.readouterr()
+        complete = main(["scan", "--ioc", str(advisory),
+                         "--repo", str(repos["web-frontend"]), "--no-ci"])
+        capsys.readouterr()
+        assert (complete, truncated) == (EXIT_CLEAN, EXIT_INCOMPLETE)
+
+    def test_an_incomplete_clone_can_be_accepted_on_purpose(self, tmp_path, capsys):
+        # Off by default, mirroring OSV-Scanner's --allow-no-lockfiles: the caller may
+        # take responsibility for the gap, and the report still names it.
+        from deptrail.demo import advisory_path
+        repos = dict(build(tmp_path / "demo"))
+        advisory = advisory_path(tmp_path / "demo")
+        shallow = tmp_path / "shallow"
+        subprocess.run(["git", "clone", "-q", "--depth", "1",
+                        f"file://{repos['web-frontend']}", str(shallow)],
+                       check=True, capture_output=True)
+        code = main(["scan", "--ioc", str(advisory), "--repo", str(shallow), "--no-ci",
+                     "--allow-incomplete-history"])
+        out = capsys.readouterr().out
+        assert code == EXIT_CLEAN
+        assert "shallow clone" in out, "the gap is accepted, not hidden"
+        assert "allow-incomplete-history" in out

@@ -62,8 +62,18 @@ workflow never reads, so it is not on the list. `web-frontend` never held the
 version while the registry served it, so it is absent from the report entirely.
 `mobile-app` is locked with Yarn, which this version cannot parse — so it is named
 as unread rather than cleared, and it raises no credentials, because nothing about
-it suggests one. Exit codes: `0` nothing to do, `1` credentials to rotate, `2` the
-scan could not prove absence, `3` malformed input.
+it suggests one.
+
+Exit codes split verdicts from non-verdicts, so a caller knows whether to act, to
+retry, or to fix something:
+
+| code | meaning | what to do |
+|---|---|---|
+| `0` | absence of exposure was established | nothing |
+| `1` | credentials to rotate | act on the list |
+| `2` | looked, and could not prove absence | deepen the clone, or investigate by hand |
+| `3` | the request was malformed | fix the arguments or the advisory |
+| `4` | the tool could not run | retry; a tool or an API call failed |
 
 ## Real use
 
@@ -115,10 +125,15 @@ read as a scan that found nothing.
   *which* lockfile governed *which* directory *when* needs npm's workspace rules and
   is tracked separately ([#22](https://github.com/Official-Space-AI/deptrail/issues/22)).
 - **An incomplete clone cannot be cleared.** Shallow (`actions/checkout` is depth-1 by
-  default), partial (`--filter=blob:none`) and single-branch clones are each detected and
-  named, and none of them can produce an all-clear. Use a full clone with
-  `fetch-depth: 0`. Today they exit `1` where an unreadable tree exits `2`; reconciling
-  those is [#20](https://github.com/Official-Space-AI/deptrail/issues/20).
+  default) and single-branch clones are detected, named, and reported as exit `2`. Use a
+  full clone with `fetch-depth: 0`, or accept the gap deliberately with
+  `--allow-incomplete-history` — off by default, and it still prints the reason. A
+  partial clone (`--filter=blob:none`) is fine as long as its blobs can be fetched; any
+  snapshot that could not be read is listed instead.
+- **A one-branch `fetch` cannot be told from a full clone.** `git init` + `git fetch
+  origin <branch>` keeps a wildcard refspec, so a branch that was never fetched looks
+  like a branch that does not exist. Deciding this needs the remote's ref list
+  ([#27](https://github.com/Official-Space-AI/deptrail/issues/27)).
 - **A pull-request run installed a tree that is in no branch.** GitHub synthesises
   `refs/pull/N/merge` for `pull_request` events, and it is reachable from no ref in a
   normal clone, so what such a run installed is currently graded from the head commit

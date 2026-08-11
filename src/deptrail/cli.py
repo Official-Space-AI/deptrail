@@ -12,10 +12,19 @@ Three entry points, in the order someone meets them:
   organization and judge them all.
 
 Exit codes are the contract, and a caller must never have to parse prose to learn
-what happened: ``0`` nothing to do and absence established, ``1`` credentials to
-rotate, ``2`` the scan could not prove absence (something failed, was truncated,
-or was unreadable), ``3`` bad input or a missing tool. Every path returns one of
-these — a traceback escaping as exit 1 would read as "rotate now".
+what happened. ``0`` and ``1`` are verdicts about evidence that was read; the rest
+say no verdict was reached, and they are kept apart because the next move differs:
+
+- ``0`` — absence of exposure was established
+- ``1`` — credentials to rotate
+- ``2`` — looked, and could not prove absence: a truncated clone, an unreadable
+  snapshot, a lockfile dialect this version cannot parse
+- ``3`` — the request was malformed: unknown feed, bad advisory, both targets
+- ``4`` — the tool could not run: an absent ``git``/``gh``, a failed call, a
+  directory it could not write. Retrying may help; for ``2`` it will not.
+
+Every path returns one of these — a traceback escaping as exit 1 would read as
+"rotate now".
 """
 from __future__ import annotations
 
@@ -32,10 +41,17 @@ from .ioc import Advisory, IocError, bundled_feeds, load_advisory
 from .org import OrgReport, render_report, scan_organization
 from .report import render_html
 
-EXIT_CLEAN = 0
-EXIT_ROTATE = 1
-EXIT_INCOMPLETE = 2
-EXIT_BAD_INPUT = 3
+# Codes 0 and 1 are verdicts about evidence that was read; everything above says
+# the tool did not reach a verdict. The split follows what shipped scanners do —
+# OSV-Scanner puts "no packages found" at 128, outside its result range entirely,
+# and reserves another range for failures that are nobody's fault but the tool's;
+# Snyk keeps "insufficient evidence" and "could not run" on separate codes. Folding
+# them together tells a caller to retry when retrying cannot help, or the reverse.
+EXIT_CLEAN = 0        # absence of exposure was established
+EXIT_ROTATE = 1       # credentials to rotate
+EXIT_INCOMPLETE = 2   # looked, and could not prove absence
+EXIT_BAD_INPUT = 3    # the request was malformed; fixing it is the caller's move
+EXIT_TRANSIENT = 4    # the tool could not run; retrying may help
 
 
 class Parser(argparse.ArgumentParser):
@@ -50,11 +66,16 @@ class Parser(argparse.ArgumentParser):
 def _exit_code(report: OrgReport) -> int:
     """One code per outcome, with no overlap.
 
-    Rotation wins over incompleteness: a responder who has credentials to rotate
-    must act, and the report states separately that the scan was incomplete.
+    Rotation wins over everything: a responder who has credentials to rotate must
+    act, and the report states separately what else went wrong. After that, a tool
+    that could not run outranks a history that could not be cleared — one is worth
+    retrying and the other is not, and folding them together let a failed API call
+    leave as exit 2, which the Action then passes off as a warning (#20).
     """
     if report.rotation_required:
         return EXIT_ROTATE
+    if report.transient:
+        return EXIT_TRANSIENT
     return EXIT_CLEAN if report.proves_absence else EXIT_INCOMPLETE
 
 
@@ -113,8 +134,14 @@ def _as_dict(report: OrgReport, advisory: Advisory | None) -> dict:
         ],
         "rotate_unnamed": list(report.unnamed_rotations),
         "errors": list(report.errors),
+        "could_not_run": list(report.transient),
+        "incomplete_view": list(report.incomplete),
         "not_judged": list(report.unread),
-        "caveats": list(report.notes) + list(report.rotation_notes),
+        # The dedicated keys above already carry these lines; repeating them here made
+        # a JSON consumer count every gap twice while the text and HTML reports showed
+        # it once.
+        "caveats": [c for c in [*report.notes, *report.rotation_notes]
+                    if c not in set(report.unread) | set(report.incomplete)],
     }
     if advisory is not None:
         payload["advisory"].update({
@@ -134,17 +161,21 @@ def _expected_remote(org: str, name: str) -> tuple[str, ...]:
 
 
 def _clone_org(org: str, workdir: Path, *, limit: int,
-               ) -> tuple[list[tuple[str, Path]], list[str]]:
+               ) -> tuple[list[tuple[str, Path]], list[str], list[str]]:
     """Clone or refresh every repository in an organization.
 
     Clones are full, never shallow: a truncated history cannot answer when a
     version was installed. Each repository is kept under its own organization
     directory and its remote is verified, so two organizations that share a
     repository name cannot be judged with each other's history. Anything that
-    fails becomes an error the report must carry — a repository nobody looked at
+    A truncated listing is an error the caller must fix; a clone or fetch that failed
+    is the tooling not answering, and is reported as such so the exit code says
+    "retry" rather than "we looked". Anything that
+    fails becomes something the report must carry — a repository nobody looked at
     may not read as clean.
     """
     errors: list[str] = []
+    transient: list[str] = []
     listing = subprocess.run(
         ["gh", "repo", "list", org, "--limit", str(limit), "--json", "name",
          "--jq", ".[].name"],
@@ -173,7 +204,7 @@ def _clone_org(org: str, workdir: Path, *, limit: int,
             fetch = subprocess.run(["git", "-C", str(dest), "fetch", "--prune", "--quiet"],
                                    capture_output=True, text=True)
             if fetch.returncode != 0:
-                errors.append(
+                transient.append(
                     f"{name}: fetch failed, the cached history may be stale "
                     f"({fetch.stderr.strip()[:120]})"
                 )
@@ -184,10 +215,10 @@ def _clone_org(org: str, workdir: Path, *, limit: int,
                  str(dest)], capture_output=True, text=True,
             )
             if clone.returncode != 0:
-                errors.append(f"{name}: clone failed ({clone.stderr.strip()[:120]})")
+                transient.append(f"{name}: clone failed ({clone.stderr.strip()[:120]})")
                 continue
         repos.append((name, dest))
-    return repos, errors
+    return repos, errors, transient
 
 
 def _github_runs(slug_of, window: tuple[datetime, datetime], *, annotate: bool):
@@ -251,13 +282,15 @@ def cmd_scan(args: argparse.Namespace) -> int:
         return EXIT_BAD_INPUT
 
     errors: list[str] = []
+    transient: list[str] = []
     if args.org:
-        repos, errors = _clone_org(args.org, Path(args.workdir), limit=args.limit)
+        repos, errors, transient = _clone_org(args.org, Path(args.workdir),
+                                              limit=args.limit)
         slug_of = lambda name: f"{args.org}/{name}"  # noqa: E731
     else:
         repos = [(Path(p).name, Path(p)) for p in args.repo]
         slug_of = (lambda name: args.slug) if args.slug else None
-    if not repos and not errors:
+    if not repos and not errors and not transient:
         print("nothing to scan: pass --org or one or more --repo paths", file=sys.stderr)
         return EXIT_BAD_INPUT
 
@@ -275,8 +308,10 @@ def cmd_scan(args: argparse.Namespace) -> int:
 
     # Even when every repository was skipped, the report must carry why: dropping
     # the errors here would turn "we could not look" into "there was nothing".
-    report = scan_organization(repos, advisory.plan(), runs=runs, secrets=secrets)
+    report = scan_organization(repos, advisory.plan(), runs=runs, secrets=secrets,
+                               allow_incomplete=args.allow_incomplete_history)
     report.errors[:0] = errors
+    report.transient[:0] = transient
     written = _emit(report, args, advisory)
     return written or _exit_code(report)
 
@@ -319,6 +354,11 @@ def build_parser() -> argparse.ArgumentParser:
                       help="where organization clones are kept")
     scan.add_argument("--limit", type=int, default=200,
                       help="maximum repositories to list from the organization")
+    scan.add_argument("--allow-incomplete-history", action="store_true",
+                      help="accept a shallow, partial or single-branch clone as "
+                           "grounds for an all-clear; off by default, because a "
+                           "clone that holds less than the repository cannot "
+                           "establish what the repository did")
     scan.add_argument("--no-ci", action="store_true",
                       help="skip CI and secret lookups (no token needed)")
     add_output(scan)
@@ -338,14 +378,23 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return args.func(args)
     except FileNotFoundError as e:
-        # A missing tool is bad input, not a verdict: exiting 1 here would read as
-        # "rotate these credentials".
+        # An absent `git` or `gh` is an environment that cannot answer, not a
+        # malformed request and not a verdict — exiting 1 here would read as
+        # "rotate these credentials", and 3 would blame the caller's arguments.
         print(f"a required tool is missing: {e}", file=sys.stderr)
-        return EXIT_BAD_INPUT
+        return EXIT_TRANSIENT
     except subprocess.CalledProcessError as e:
+        # Distinct from EXIT_INCOMPLETE: "the API call failed" is worth retrying and
+        # "this history genuinely holds no lockfile" is not.
         detail = (e.stderr or "").strip()[:300]
         print(f"a command failed: {' '.join(e.cmd)}\n{detail}", file=sys.stderr)
-        return EXIT_INCOMPLETE
+        return EXIT_TRANSIENT
+    except OSError as e:
+        # A read-only workdir, a --workdir that collides with a file, a full disk.
+        # Letting one escape means the interpreter exits 1, and this contract reads
+        # exit 1 as "rotate these credentials".
+        print(f"the tool could not run: {type(e).__name__}: {e}", file=sys.stderr)
+        return EXIT_TRANSIENT
 
 
 if __name__ == "__main__":  # pragma: no cover
