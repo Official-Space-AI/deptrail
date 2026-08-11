@@ -523,6 +523,32 @@ class TestPrecedenceAndDiagnostics:
             ["line\nbreak/package-lock.json"]
         assert finding.warnings == [], finding.warnings
 
+    def test_a_branch_that_lost_the_merge_conflict_still_testifies(self, tmp_path):
+        """E15: git's default history simplification follows one parent of a merge
+        that is TREESAME to it, so a branch whose malicious pin lost the conflict
+        vanished from the path log — and with the branch deleted after merging, the
+        repository reported exit 0 even though CI had built that commit."""
+        repo = self.fresh(tmp_path, "lost-merge")
+        self.write(repo, "package-lock.json", lock_json("5.6.0"),
+                   "2025-11-20T10:00:00+00:00")
+        default = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--abbrev-ref", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        git(repo, "checkout", "-q", "-b", "feature")
+        self.write(repo, "package-lock.json", lock_json("5.6.1"),
+                   "2025-11-25T10:00:00+00:00")
+        git(repo, "checkout", "-q", default)
+        self.write(repo, "package-lock.json", lock_json("5.6.2"),
+                   "2025-11-25T11:00:00+00:00")
+        git(repo, "merge", "--no-ff", "-X", "ours", "feature", "-m", "merge",
+            date="2025-11-25T12:00:00+00:00")
+        git(repo, "branch", "-q", "-D", "feature")   # as after a merged-PR cleanup
+        finding = scan_repo(repo, WINDOW)
+        assert finding.verdict is Verdict.EXPOSED, \
+            "the branch's pin is reachable from the merge and CI built it"
+        assert [e.version for e in finding.exposures] == ["5.6.1"]
+
     def test_a_rewritten_date_is_a_diagnostic_and_not_lost_evidence(self, tmp_path):
         # A rebase costs no evidence, so it must not widen anything. Treating it
         # as lost evidence put every credential of a rebased repo on the list.

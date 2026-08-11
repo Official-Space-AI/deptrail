@@ -457,3 +457,87 @@ instant, the shrinkwrap handover in both directions, the newline path, and the
 foreign-lockfile window in all three positions (before, during, after). Removing the
 coverage pass also removed its cost: the 200-package monorepo is back to 5.4 s
 against a 5.1 s baseline, from 12 s.
+
+## E15 — What does the prior art do about all this?
+
+**Assumption**: after three rounds of review on the same sub-problem, the model was
+being reinvented rather than borrowed. Someone must already have solved "which
+lockfile governed which tree, when".
+
+**Method**: a five-angle survey — production dependency tooling read as source, the
+package managers' own libraries, the research literature, published incident practice,
+and the general technique of modelling state over a git DAG — with each angle's
+load-bearing claims re-checked against primary sources by a second reader. Two angles
+were cut short by a session limit; the three that completed are the basis for what
+follows, and the gaps are named at the end.
+
+**Result, in the order it changes what we do.**
+
+*A false clean in code that was already merged.* Git's default history simplification
+follows only one parent of a merge that is TREESAME to it. So a branch that pinned the
+malicious version and then **lost the merge conflict** disappears from
+`git log <ref> -- package-lock.json` completely, and if the branch was deleted after
+merging there is no ref left to walk either. Built that repository: the malicious blob
+is reachable from the merge, a pull-request run would have installed it, and deptrail
+returned exit 0. `--full-history` shows the commit; the default does not. This is the
+E3 lesson — a merge hides the pin — in a form no amount of reasoning about intervals
+would have caught, because the commit was never in the input. Fixed, with a test that
+fails when the flag is removed. Cost on a 200-package monorepo: 5.4 s → 5.6 s.
+
+*Nobody has solved the coverage question, and the reason is structural.* Every
+production scanner analyses exactly one checkout, so it never asks "which lockfile
+governed D at commit C" — only "which lockfile is next to D right now". Renovate's
+association logic, the most mature in the field, returns *true for every path* as soon
+as the `workspaces` array contains one negated pattern, so an undeclared sibling
+inherits the root lockfile; Dependabot mishandles the same negation differently. Both
+err toward **over-crediting** governance, which is the false-clean direction. Porting
+either would have imported the bug we were trying to avoid. The literature avoids the
+case by construction: the first systematic study of lockfiles detects them in the root
+only and discards repositories with more than one, and the closest history-
+reconstruction work walks the default branch and lists our lineage failure as a threat
+to validity, mitigated by averaging over 33 000 projects — an escape hatch a
+per-repository verdict does not have.
+
+*But npm already answers it, from data we are holding.* An npm lockfile is
+self-describing: `packages[""].workspaces` records the declaration in force when it was
+written, and the `packages` keys enumerate the members actually resolved. npm ships
+`mapWorkspaces.virtual({lockfile})`, which derives the workspace map from the lockfile
+object alone with no filesystem access. That collapses the coupling that broke design
+#3 — the declaration drifting independently of the lockfile — into a single blob read,
+plus a free staleness check: compare the declaration in the lockfile against the
+`package.json` at the same commit and refuse to credit governance when they disagree.
+Recorded in #22.
+
+*The window we consume does not exist as data.* OSV and the GHSA malware records model
+malice as a bare version list. The left edge is derivable — the registry keeps
+`time[version]` after an unpublish — but **the right edge is recorded nowhere**, and it
+is not even one interval per incident: for a range-resolving install the window closes
+when the next satisfying good version is published, which differed from the unpublish
+time by five days in a real case. Our schema's closed per-advisory window is therefore
+wrong in shape. Filed as #23.
+
+*Practice is much coarser than this tool, and that cuts both ways.* CISA prescribes
+rotation unconditionally, in parallel with the dependency review rather than downstream
+of it, so precise scoping buys nothing at the level of the decision that costs money.
+What responders actually reconstruct is the (run, secret) join — "identified CI runs
+affected, identified secrets available to those runs" — which is exactly what our
+rotation list is, and is *not* a list of paths and intervals. Meanwhile the detector
+script that responders actually ran classifies the no-lockfile case as LOW risk and
+prints "Your current installation is safe" for it: the failure is a missing **tier**,
+not a missing algorithm, which is a strong argument that refusing to credit what we
+cannot read already beats what shipped, without #22 being finished.
+
+**Changes**: `--full-history` on every path log, with the regression test. #22 rewritten
+around npm's own resolver and a per-commit tree predicate. #23 opened for window
+semantics. #20 given the exit-code precedent from Snyk and OSV-Scanner, which both
+reserve a distinct code for "insufficient evidence" and refuse by default. #24 opened
+for the npm cache index as dated install evidence. Regenerating a lockfile at analysis
+time is now explicitly forbidden — the published move for a missing lockfile is
+`npm i --package-lock-only`, which resolves against *today's* registry and would
+manufacture a clean answer.
+
+**Verification**: the merge-loss repository is a test that fails without the flag. The
+prior-art claims behind each change above were re-checked against primary sources by a
+second reader, and the two angles that did not complete — how other systems model state
+over a DAG, and independent verification of the literature and incident claims — are
+named as open in #22 rather than treated as settled.

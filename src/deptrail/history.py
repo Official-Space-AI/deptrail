@@ -229,7 +229,7 @@ def _paths_with_basename(repo: Path, basenames: tuple[str, ...]) -> list[str]:
     unwalkable (E14). The basename check rejects look-alikes such as
     ``sample-package-lock.json``, which the ``*name`` pathspec would match.
     """
-    out = _git(repo, "log", "--all", "--format=", "--name-only", "-z",
+    out = _git(repo, "log", "--all", "--full-history", "--format=", "--name-only", "-z",
                "--", *(f"*{name}" for name in basenames))
     wanted = set(basenames)
     names = {token[1:] if token.startswith("\n") else token
@@ -324,12 +324,19 @@ def _log_commits(repo: Path, path: str, *, ref: str | None = None,
     Topological order (not date order) is what makes interval reasoning sound:
     a parent always precedes its descendants regardless of what the clocks said.
 
+    ``--full-history`` is not optional. Git's default history simplification follows
+    only one parent of a merge that is TREESAME to it, so a branch that pinned a
+    malicious version and lost the merge conflict disappears from the log entirely —
+    a repository whose CI built that branch reported exit 0 (E15). The flag costs
+    extra commits, every one of which is judged on its own snapshot, so a superset
+    can only improve the answer.
+
     ``also`` widens the log to commits that touched another path instead. It exists
     for precedence: removing a shrinkwrap puts the package-lock beside it back in
     charge without touching that file, so a log of the package-lock alone never
     sees the moment it started to matter (E14).
     """
-    args = ["log", "--topo-order", "--format=%H|%aI|%cI"]
+    args = ["log", "--topo-order", "--full-history", "--format=%H|%aI|%cI"]
     if all_refs:
         args.append("--all")
     if ref:
