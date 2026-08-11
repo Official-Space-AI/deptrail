@@ -77,8 +77,14 @@ runs:
         } >> "$GITHUB_STEP_SUMMARY"
 
         if [ -n "$REPORT" ]; then
+          # The verdict is already in $code. This run's exit status is that same
+          # verdict, not a statement about the file, so judging the report by it
+          # turned every finding into "report generation failed" — asking for a
+          # report and finding anything was a hard failure whatever fail-on said.
+          # The only question here is whether the file got written.
           deptrail scan --ioc "$IOC" --repo . --slug "$SLUG" --format html \
-            --output "$REPORT" || { echo "::error::report generation failed"; exit 1; }
+            --output "$REPORT"
+          [ -s "$REPORT" ] || { echo "::error::report generation failed"; exit 1; }
         fi
 
         # A scan that never ran (3) fails regardless of fail-on: a green check must
