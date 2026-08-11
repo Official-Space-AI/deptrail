@@ -86,7 +86,12 @@ jobs:
           printf '# yarn lockfile v1\n\n"chalk@^5.6.0":\n  version "5.6.1"\n' \
             > "$yarn/yarn.lock"
           git -C "$yarn" add -A
-          git -C "$yarn" -c user.email=ci@test -c user.name=ci commit -qm lock
+          # Dated inside the bundled advisory's window. A lockfile committed "now"
+          # did not exist while the version was installable, and the scanner is right
+          # to say nothing about it — which is what this assertion got wrong.
+          GIT_AUTHOR_DATE="2025-11-25T10:00:00+00:00" \
+          GIT_COMMITTER_DATE="2025-11-25T10:00:00+00:00" \
+            git -C "$yarn" -c user.email=ci@test -c user.name=ci commit -qm lock
           expect 2 deptrail scan --ioc example-demo --repo "$yarn" --no-ci
           deptrail scan --ioc example-demo --repo "$yarn" --no-ci > yarn.txt || true
           grep -q "not judged" yarn.txt
@@ -115,7 +120,10 @@ jobs:
           printf '{"name":"app","dependencies":{"chalk":"^5.6.0"}}\n' \
             > unreadable/package.json
           git add unreadable
-          git -c user.email=ci@test -c user.name=ci commit -qm "an unreadable tree"
+          # Inside the bundled advisory's window, for the same reason as above.
+          GIT_AUTHOR_DATE="2025-11-25T10:00:00+00:00" \
+          GIT_COMMITTER_DATE="2025-11-25T10:00:00+00:00" \
+            git -c user.email=ci@test -c user.name=ci commit -qm "an unreadable tree"
       - id: scan
         uses: ./
         with:
