@@ -105,12 +105,14 @@ def merge_caveats(caveats: Iterable[Caveat]) -> tuple[Caveat, ...]:
     """One caveat per distinct sentence, naming every subject that reached it.
 
     First-appearance order is kept for both sentences and subjects: a report that
-    reorders itself between runs cannot be diffed against the previous one.
+    reorders itself between runs cannot be diffed against the previous one. A dict
+    carries that order, so membership stays O(1) — scanning a growing list instead
+    made this quadratic in the number of subjects, which is the number of packages
+    the advisory names.
     """
-    merged: dict[str, list[str]] = {}
+    merged: dict[str, dict[str, None]] = {}
     for caveat in caveats:
-        subjects = merged.setdefault(caveat.text, [])
-        subjects.extend(s for s in caveat.subjects if s not in subjects)
+        merged.setdefault(caveat.text, {}).update(dict.fromkeys(caveat.subjects))
     return tuple(Caveat(text=text, subjects=tuple(subjects))
                  for text, subjects in merged.items())
 
@@ -140,7 +142,9 @@ class RotationItem:
     secret: str
     scope: Scope
     grade: Grade
-    causes: tuple[Caveat, ...] = ()
+    # No default: an item with no cause renders as a rotation line ending in a bare
+    # em dash, which is a credential on a checklist with the reason missing.
+    causes: tuple[Caveat, ...]
     run_ids: tuple[str, ...] = ()
 
     @property

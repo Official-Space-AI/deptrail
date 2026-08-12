@@ -102,6 +102,9 @@ package the advisory names, so a caveat about the repository was reached once pe
 package: three packages pinned in one lockfile printed the same paragraph three
 times, and the September 2025 Shai-Hulud advisory named roughly 180 packages.
 
+This section describes the rotation list and the caveats block. One producer is not
+converted yet and is named at the end.
+
 Deduplicating the rendered lines could not fix it, because the lines were not
 identical: each one carried its own version number, which is exactly the evidence a
 responder checking a machine by hand needs. So a caveat is stored as a sentence plus
@@ -109,10 +112,12 @@ the **subjects** it covers, and the varying part never enters the prose:
 
 ```
 rotate (1 repository to rotate broadly)
-  [could not be named] r2: pinned in package-lock.json, and no CI run was implicated — so
-                any install happened outside CI; ... and this repository's secret names
-                could not be listed, so rotate everything it can see (covers
-                chalk@5.6.1, debug@4.4.2, ansi-styles@6.2.2)
+  [could not be named] r2: pinned in package-lock.json, and no CI run was implicated — so any
+                install happened outside CI; Actions secrets are not automatically present on a
+                developer machine, but the same values often are, so investigate that machine's
+                credentials as well — and this repository's secret names could not be listed, so
+                rotate everything it can see (covers chalk@5.6.1, debug@4.4.2,
+                ansi-styles@6.2.2)
 ```
 
 Merging then compares sentences exactly instead of guessing at prose, and every
@@ -127,10 +132,23 @@ Two consequences worth knowing:
   repositories whose secret names could not be listed appear together, and the
   heading counts both. Printing the second only when the first was empty meant one
   repository naming a credential could hide another repository's repo-wide risk.
-- **Terminal lines are folded at 96 columns** with a hanging indent, never
-  truncated. Merging 180 subjects onto one line produced a 3.3 kB line, which is
-  unreadable for the same reason the repetition was. Words are never broken, so a
-  secret name or a `package@version` stays greppable.
+- **The rotation list and the caveats block fold at 96 columns** with a hanging
+  indent, never truncated. Merging 180 subjects onto one line produced a 3.3 kB
+  line, which is unreadable for the same reason the repetition was. (The timeline's
+  evidence lines are not folded and can still run past 96; they are one fact each,
+  and they did not change here.)
+
+  Two things the fold deliberately does *not* do. It never breaks a word, so a
+  secret name, a lockfile path or a `package@version` stays greppable in a saved
+  report — which means a single token longer than 96 columns will exceed it. And it
+  never folds the identity that opens a line (`grade`, repo, secret, scope, run ids):
+  a long repository and secret name together can push that one line past the width,
+  and it takes a line of its own rather than pushing the body over too.
+
+One caveat is not yet grouped this way and still prints once per package: the
+CI-retention note bakes a per-package timestamp into its prose, and the useful merged
+form is a single earliest instant rather than a list of them, which makes it a
+semantics change rather than a rendering one. See issue #33.
 
 ## What the report refuses to claim
 

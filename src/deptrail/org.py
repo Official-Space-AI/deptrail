@@ -447,31 +447,56 @@ def scan_organization(repos: Iterable[tuple[str, Path]], plan: QueryPlan, *,
 # every implicated version on one line, and on a 180-package advisory that line
 # measured 3.3 kB — unreadable for the same reason the repetition was.
 BODY_WIDTH = 96
+# Below this, a line holds a word or two and folding stops helping. A prefix that
+# leaves less than this gets its own line instead of pushing the body past the
+# width: an ordinary repository and secret name reached 149 columns that way.
+MIN_BODY = 32
 
 
 def _folded(prefix: str, body: str, indent: str) -> list[str]:
     """One report line, folded to a readable width under a hanging indent.
 
-    The prefix is passed as the first line's indent, so it is emitted verbatim — a
-    column of aligned grades stays aligned — and still counts against the width.
+    The prefix is emitted verbatim — a column of aligned grades stays aligned — and
+    counts against the width. When it is long enough to leave no useful room, it
+    takes a line of its own and the body follows at the indent, because an identity
+    is not foldable: a repository or secret name has to stay in one piece.
+
     Words are never broken, so a secret name, a flag or a ``package@version``
-    survives intact for whoever greps the output.
+    survives intact for whoever greps the output — which means a single token longer
+    than the width will exceed it, and that is the trade this makes deliberately.
     """
+    if len(prefix) + MIN_BODY > BODY_WIDTH:
+        folded = textwrap.wrap(body, width=BODY_WIDTH, initial_indent=indent,
+                              subsequent_indent=indent, break_long_words=False,
+                              break_on_hyphens=False)
+        return [prefix.rstrip(), *folded] if folded else _bare(prefix)
     return textwrap.wrap(body, width=BODY_WIDTH, initial_indent=prefix,
                          subsequent_indent=indent, break_long_words=False,
-                         break_on_hyphens=False) or [prefix.rstrip()]
+                         break_on_hyphens=False) or _bare(prefix)
 
 
-def _rotate_summary(report: OrgReport) -> str:
+def _bare(prefix: str) -> list[str]:
+    """The prefix alone, or no line at all when there is not even that.
+
+    A blank line here would land *inside* a section, and this project's own tooling
+    reads its terminal output as blank-line-delimited sections.
+    """
+    return [prefix.rstrip()] if prefix.strip() else []
+
+
+def _rotate_summary(items: tuple[RotationItem, ...], repos: tuple[str, ...]) -> str:
     """What the rotate heading claims, covering both halves of the list.
 
     A count of named credentials alone reads as the whole job when a second
     repository's secrets are at risk and unlistable, so the heading says both.
+
+    Takes the already-computed values rather than the report: ``rotation_items`` is
+    an incremental merge that is quadratic in the items, and re-deriving it here
+    made one render of a 180-package scan compute it three times.
     """
     parts = []
-    if report.rotation_items:
-        parts.append(f"{len(report.rotation_items)} credential(s)")
-    repos = report.unnamed_repos
+    if items:
+        parts.append(f"{len(items)} credential(s)")
     if repos:
         parts.append(f"{len(repos)} repositor{'y' if len(repos) == 1 else 'ies'} "
                      "to rotate broadly")
@@ -520,7 +545,7 @@ def render_report(report: OrgReport) -> str:
     items = report.rotation_items
     unnamed = report.unnamed_rotations
     if items or unnamed:
-        lines.append(f"rotate ({_rotate_summary(report)})")
+        lines.append(f"rotate ({_rotate_summary(items, report.unnamed_repos)})")
         for item in items:
             scope = "" if item.is_narrowed else f" [{item.scope.value}]"
             runs_cited = f" (run {', '.join(item.run_ids)})" if item.run_ids else ""
