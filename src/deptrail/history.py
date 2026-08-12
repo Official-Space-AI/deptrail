@@ -17,7 +17,7 @@ Judgment model (shaped by adversarial review — see PR #8):
   a repo that merges pull requests, the commit that pinned a version usually
   sits on a side line, and treating it as a momentary point once made a
   two-day exposure read as CLEAN (found by replaying real history, see
-  `docs/experiments.md`). An interval therefore ends at the first *descendant*
+  real history). An interval therefore ends at the first *descendant*
   commit whose snapshot no longer pins a named version — established with
   `merge-base --is-ancestor`, so incomparable branches widen an interval rather
   than truncating it.
@@ -29,13 +29,13 @@ Judgment model (shaped by adversarial review — see PR #8):
   are parsed. A tree locked with Yarn, pnpm, Bun or Deno is recorded in
   ``unread_trees`` and makes the repo INDETERMINATE —
   reporting CLEAN there would answer a question nobody could have looked at
-  (found by replaying such repositories, see ``docs/experiments.md`` E12).
+  (found by replaying such repositories).
   Unlike a warning, it does not raise a grade: nothing suggests exposure either,
   so the honest outcome is "not judged".
 - **A foreign lockfile counts during the window and only then.** Its existence
   interval is read from git even though its contents cannot be parsed, so a
   project that moved off Yarn years before the incident is not denied an
-  all-clear forever (E13). Whether a ``package.json`` that *no* lockfile governed
+  all-clear forever. Whether a ``package.json`` that *no* lockfile governed
   is likewise unread is a harder question than it looks — see issue #22.
 - **Only the lockfile npm would have read testifies.** When a directory holds
   both ``npm-shrinkwrap.json`` and ``package-lock.json``, npm ignores the latter,
@@ -192,7 +192,7 @@ class RepoFinding:
     # Observations about the history that cost no evidence — a rewritten date, a
     # commit older than its parent. They are printed, and that is all: treating
     # them as lost evidence put every credential of a rebased repository on the
-    # rotation list (E14).
+    # rotation list.
     diagnostics: list[str] = field(default_factory=list)
     # Ways this *clone* holds less than the repository does: shallow, partial,
     # single-branch. Kept apart from ``warnings`` because the remedy differs — a
@@ -249,7 +249,7 @@ def incomplete_history(repo: Path) -> tuple[list[str], list[str]]:
     ``_read_snapshot`` records a warning for every snapshot it could not read, so if
     that list is empty the run *did* read every state its verdict depends on and the
     repository is as fully judged as a full clone would be. So a partial clone is an
-    observation, and the read failures are the evidence (E18).
+    observation, and the read failures are the evidence.
 
     What this cannot see: a checkout built by ``git init`` plus ``git fetch origin
     <branch>`` keeps the wildcard refspec, is not shallow and has no promisor, yet
@@ -281,7 +281,7 @@ def _paths_with_basename(repo: Path, basenames: tuple[str, ...]) -> list[str]:
     ``--diff-merges=first-parent`` is what makes a merge report its own change:
     without it git prints nothing for merge commits, so a lockfile introduced *by* a
     merge is never discovered at all — measured on a repository whose ``yarn.lock``
-    sits at HEAD and was reported clean (E16). ``--no-renames`` keeps rename
+    sits at HEAD and was reported clean. ``--no-renames`` keeps rename
     detection from collapsing "package-lock deleted, npm-shrinkwrap added" into one
     record, which would hide a precedence handover, and keeps discovery working on a
     partial clone where similarity detection would need absent blobs.
@@ -289,7 +289,7 @@ def _paths_with_basename(repo: Path, basenames: tuple[str, ...]) -> list[str]:
     ``-z`` output is unquoted and NUL-separated, so it is split on NUL and nothing
     else: rewriting newlines as separators turned ``line\\nbreak/package-lock.json``
     into a file called ``break/package-lock.json``, which was then reported as
-    unwalkable (E14). The basename check rejects look-alikes such as
+    unwalkable. The basename check rejects look-alikes such as
     ``sample-package-lock.json``, which the ``*name`` pathspec would match.
     """
     out = _git(repo, "log", "--all", "--full-history", "--diff-merges=first-parent",
@@ -399,14 +399,14 @@ def _log_commits(repo: Path, path: str, *, ref: str | None = None,
     ``--full-history`` is not optional. Git's default history simplification follows
     only one parent of a merge that is TREESAME to it, so a branch that pinned a
     malicious version and lost the merge conflict disappears from the log entirely —
-    a repository whose CI built that branch reported exit 0 (E15). The flag costs
+    a repository whose CI built that branch reported exit 0. The flag costs
     extra commits, every one of which is judged on its own snapshot, so a superset
     can only improve the answer.
 
     ``also`` widens the log to commits that touched another path instead. It exists
     for precedence: removing a shrinkwrap puts the package-lock beside it back in
     charge without touching that file, so a log of the package-lock alone never
-    sees the moment it started to matter (E14).
+    sees the moment it started to matter.
     """
     args = ["log", "--topo-order", "--full-history", "--no-renames",
             "--format=%H|%aI|%cI"]
@@ -548,7 +548,7 @@ def _scan_ref_chain(repo: Path, path: str, ref: str, chain: list[Commit],
             if shadowed(successor.sha):
                 # npm stopped reading this file here, so the pin stopped mattering
                 # here. Without this the interval stayed open and the report said
-                # "still pinned" about a lockfile nothing installs (E14).
+                # "still pinned" about a lockfile nothing installs.
                 until = successor.late
                 break
             later = snapshot(successor)
@@ -603,7 +603,7 @@ def scan_repo(repo: Path, query: WindowQuery) -> RepoFinding:
         children, parents = _commit_graph(repo) if paths or foreign else ({}, {})
         # A foreign lockfile only says something about the window if it was there
         # during it: holding one committed years earlier against a project denied
-        # an all-clear forever (E13).
+        # an all-clear forever.
         present: dict[tuple[str, str], bool] = {}
         live_foreign = {
             path: witness for path in foreign
