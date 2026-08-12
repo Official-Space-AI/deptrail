@@ -29,6 +29,7 @@ Every path returns one of these — a traceback escaping as exit 1 would read as
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import subprocess
 import sys
@@ -86,6 +87,19 @@ def _exit_code(report: OrgReport) -> int:
     return EXIT_CLEAN if report.proves_absence else EXIT_INCOMPLETE
 
 
+# Errors that say the path itself cannot work. Retrying will not help, so they are the
+# caller's to fix; everything else (a full disk, a read-only mount, an I/O fault) is the
+# environment and belongs on the retryable code.
+_PATH_IS_WRONG = frozenset({
+    errno.ENOENT, errno.EISDIR, errno.ENOTDIR, errno.ENAMETOOLONG, errno.EEXIST,
+})
+
+
+def _write_failure(target: str, error: OSError) -> int:
+    print(f"could not write {target}: {error}", file=sys.stderr)
+    return EXIT_BAD_INPUT if error.errno in _PATH_IS_WRONG else EXIT_TRANSIENT
+
+
 def _emit(report: OrgReport, args: argparse.Namespace, advisory: Advisory | None) -> int:
     """Write the report where it was asked for. A write failure is not a verdict."""
     if args.format == "json":
@@ -100,8 +114,7 @@ def _emit(report: OrgReport, args: argparse.Namespace, advisory: Advisory | None
     try:
         Path(args.output).write_text(text + "\n", encoding="utf-8")
     except OSError as e:
-        print(f"could not write {args.output}: {e}", file=sys.stderr)
-        return EXIT_BAD_INPUT
+        return _write_failure(args.output, e)
     print(f"wrote {args.output}", file=sys.stderr)
     return EXIT_CLEAN
 
@@ -325,7 +338,10 @@ def cmd_scan(args: argparse.Namespace) -> int:
     return written or _exit_code(report)
 
 
-FORMAT_DOCS = "docs/ioc-format.md"
+# An installed wheel carries `src/deptrail` and the bundled feeds, not `docs/`, so a
+# repo-relative path is a dead end for exactly the people who need it.
+FORMAT_DOCS = ("https://github.com/Official-Space-AI/deptrail/blob/main/"
+               "docs/ioc-format.md")
 
 
 def cmd_advisory_init(args: argparse.Namespace) -> int:
@@ -338,13 +354,13 @@ def cmd_advisory_init(args: argparse.Namespace) -> int:
     text = advisory_template(
         package=args.package, versions=tuple(args.version or ()),
         start=args.start, end=args.end, source=args.source,
+        identifier=args.id, name=args.name,
     )
     if args.output:
         try:
             Path(args.output).write_text(text, encoding="utf-8")
         except OSError as e:
-            print(f"could not write {args.output}: {e}", file=sys.stderr)
-            return EXIT_TRANSIENT
+            return _write_failure(args.output, e)
         print(f"wrote {args.output}", file=sys.stderr)
     else:
         print(text, end="")
@@ -416,6 +432,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     init = advisory_subs.add_parser(
         "init", help="write an advisory to fill in, or a complete one from flags")
+    init.add_argument("--id", help="the advisory's own identifier, e.g. GHSA-xxxx or "
+                                   "MAL-0000-1234. Never derived from the package: "
+                                   "there has been more than one chalk incident")
+    init.add_argument("--name", help="one line a responder will recognise months later")
     init.add_argument("--package", help="the compromised package name")
     init.add_argument("--version", action="append",
                       help="an exact malicious version; repeat for several")

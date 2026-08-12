@@ -564,7 +564,9 @@ class TestAdvisoryAuthoring:
 
     def test_a_fully_specified_init_is_valid_immediately(self, tmp_path, capsys):
         target = tmp_path / "incident.json"
-        code = main(["advisory", "init", "--package", "chalk", "--version", "5.6.1",
+        code = main(["advisory", "init", "--id", "GHSA-test-0001",
+                     "--name", "chalk compromised",
+                     "--package", "chalk", "--version", "5.6.1",
                      "--start", "2025-11-24T00:00:00+00:00",
                      "--end", "2025-11-26T23:59:59+00:00",
                      "--source", "https://example.test/advisory",
@@ -596,7 +598,9 @@ class TestAdvisoryAuthoring:
 
     def test_init_without_a_source_refuses_to_look_complete(self, tmp_path, capsys):
         # Provenance is not optional: a verdict is only as good as its advisory.
-        code = main(["advisory", "init", "--package", "chalk", "--version", "5.6.1",
+        code = main(["advisory", "init", "--id", "GHSA-test-0001",
+                     "--name", "chalk compromised",
+                     "--package", "chalk", "--version", "5.6.1",
                      "--start", "2025-11-24T00:00:00+00:00",
                      "--end", "2025-11-26T23:59:59+00:00"])
         out, err = capsys.readouterr()
@@ -620,7 +624,8 @@ class TestAdvisoryAuthoring:
 
     def test_validate_says_a_partial_feed_cannot_prove_absence(self, tmp_path, capsys):
         target = tmp_path / "partial.json"
-        main(["advisory", "init", "--package", "chalk", "--version", "5.6.1",
+        main(["advisory", "init", "--id", "GHSA-test-0002", "--name", "partial feed",
+              "--package", "chalk", "--version", "5.6.1",
               "--start", "2025-11-24T00:00:00+00:00",
               "--end", "2025-11-26T23:59:59+00:00",
               "--source", "https://example.test/a", "--output", str(target)])
@@ -638,3 +643,89 @@ class TestAdvisoryAuthoring:
 
     def test_bare_advisory_prints_help_rather_than_a_traceback(self, capsys):
         assert main(["advisory"]) == EXIT_BAD_INPUT
+
+    def test_a_placeholder_identity_is_not_an_identity(self, tmp_path, capsys):
+        # Everything real except id and name: this validated and printed
+        # "REPLACE-ME — REPLACE-ME" at exit 0, so the loader now knows the marker.
+        main(["advisory", "init"])
+        skeleton = json.loads(capsys.readouterr().out)
+        skeleton["packages"][0].update(
+            {"name": "chalk", "versions": ["5.6.1"],
+             "sources": ["https://example.test/a"]})
+        skeleton["sources"] = ["https://example.test/a"]
+        skeleton["window"] = {"start": "2025-11-24T00:00:00+00:00",
+                             "end": "2025-11-26T23:59:59+00:00"}
+        half = tmp_path / "half.json"
+        half.write_text(json.dumps(skeleton))
+        assert main(["advisory", "validate", str(half)]) == EXIT_BAD_INPUT
+        assert "REPLACE-ME" in capsys.readouterr().err
+
+    def test_the_identity_is_never_derived_from_the_package(self, capsys):
+        # There has been more than one chalk incident. Two of them must not be indexable
+        # as the same advisory, because the report keys its verdict on this field.
+        main(["advisory", "init", "--package", "chalk", "--version", "5.6.1"])
+        first = json.loads(capsys.readouterr().out)
+        main(["advisory", "init", "--package", "chalk", "--version", "5.6.3"])
+        second = json.loads(capsys.readouterr().out)
+        assert "REPLACE-ME" in first["id"], "an identity must be supplied, not invented"
+        assert first["id"] == second["id"], "both are unfilled, and both say so"
+        main(["advisory", "init", "--id", "GHSA-a", "--package", "chalk"])
+        a = json.loads(capsys.readouterr().out)
+        main(["advisory", "init", "--id", "GHSA-b", "--package", "chalk"])
+        b = json.loads(capsys.readouterr().out)
+        assert (a["id"], b["id"]) == ("GHSA-a", "GHSA-b")
+
+    def test_every_version_given_is_kept(self, capsys):
+        main(["advisory", "init", "--package", "chalk",
+              "--version", "5.6.1", "--version", "5.6.2", "--version", "5.6.3"])
+        written = json.loads(capsys.readouterr().out)
+        assert written["packages"][0]["versions"] == ["5.6.1", "5.6.2", "5.6.3"]
+
+    @pytest.mark.parametrize("path,expected", [
+        ("nope/deep/a.json", EXIT_BAD_INPUT),   # the parent does not exist
+        (".", EXIT_BAD_INPUT),                  # the target is a directory
+    ])
+    def test_a_path_that_cannot_work_is_the_callers_to_fix(self, tmp_path, path, expected):
+        # Retrying cannot make either of these succeed, so they are not the retryable
+        # code. That distinction is the whole point of having both (#20).
+        target = tmp_path / path if path != "." else tmp_path
+        assert main(["advisory", "init", "--output", str(target)]) == expected
+
+    def test_the_docs_pointer_is_reachable_from_an_installed_copy(self, tmp_path, capsys):
+        # An installed wheel has no `docs/` directory, so a repo-relative path is a dead
+        # end for exactly the people who need it.
+        from deptrail.cli import FORMAT_DOCS
+        assert FORMAT_DOCS.startswith("https://")
+        broken = tmp_path / "bad.json"
+        broken.write_text("{}")
+        main(["advisory", "validate", str(broken)])
+        assert FORMAT_DOCS in capsys.readouterr().err
+
+    def test_a_partial_advisory_from_init_really_cannot_prove_absence(self, tmp_path,
+                                                                     capsys):
+        # The generated default is `coverage: partial`, and this asserts what that costs
+        # a real scan rather than trusting the field to mean something.
+        advisory = tmp_path / "partial.json"
+        main(["advisory", "init", "--id", "GHSA-p", "--name", "partial",
+              "--package", "chalk", "--version", "5.6.1",
+              "--start", "2025-11-24T00:00:00+00:00",
+              "--end", "2025-11-26T23:59:59+00:00",
+              "--source", "https://example.test/a", "--output", str(advisory)])
+        capsys.readouterr()
+        repo = tmp_path / "clean"
+        repo.mkdir()
+        subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True,
+                       capture_output=True)
+        (repo / "README.md").write_text("nothing to see")
+        subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t",
+                        "-c", "user.name=t", "add", "-A"], check=True,
+                       capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t",
+                        "-c", "user.name=t", "commit", "-qm", "init"], check=True,
+                       capture_output=True)
+        code = main(["scan", "--ioc", str(advisory), "--repo", str(repo), "--no-ci",
+                     "--format", "json"])
+        payload = json.loads(capsys.readouterr().out)
+        assert code == EXIT_INCOMPLETE
+        assert payload["decision"]["scan_complete"] is False
+        assert any("partial coverage" in c for c in payload["caveats"]), payload

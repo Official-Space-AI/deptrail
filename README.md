@@ -80,7 +80,10 @@ retry, or to fix something:
 On incident day, start from the advisory — it is the only thing you have to write:
 
 ```bash
-deptrail advisory init --package chalk --version 5.6.1 \
+deptrail advisory init \
+  --id GHSA-....                            # the advisory's own id, never guessed \
+  --name "chalk compromised" \
+  --package chalk --version 5.6.1 \
   --start 2025-11-24T00:00:00+00:00 \
   --end   2025-11-26T23:59:59+00:00 \
   --source https://github.com/advisories/GHSA-... \
@@ -89,11 +92,15 @@ deptrail advisory init --package chalk --version 5.6.1 \
 deptrail advisory validate incident.json    # before a verdict depends on it
 ```
 
-`init` leaves anything you did not supply as `REPLACE-ME` and tells you so, because an
-advisory with blanks must not validate — a half-filled one would produce a confident
-`CLEAN`. The template carries the definition of the window in the file itself, since
-that is the field most easily transcribed wrong and getting it backwards makes every
-scan report clean. Full format in [`docs/ioc-format.md`](docs/ioc-format.md).
+`init` fills exactly what you give it and leaves the rest as `REPLACE-ME`, which the
+loader rejects by name — an advisory with blanks must not validate, because a half-filled
+one would produce a confident `CLEAN`. Nothing is derived: the identifier in particular is
+asked for rather than invented, since there has been more than one `chalk` incident and
+the report keys its verdict on that field.
+
+The template carries the definition of the window in the file itself, because that is the
+field most easily transcribed wrong and getting it backwards makes every scan report
+clean. Full format in [`docs/ioc-format.md`](docs/ioc-format.md).
 
 Then judge:
 
