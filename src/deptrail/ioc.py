@@ -68,6 +68,13 @@ _PACKAGE_KEYS = {"name", "versions", "window", "sources", "notes"}
 _WINDOW_KEYS = {"start", "end"}
 
 
+# The marker ``advisory init`` writes into every field it was not given. The *loader*
+# knows it, not just the generator: a blank left anywhere must fail, and checking only the
+# fields that happen to have a format (a window, a URL) let an advisory validate with no
+# identity at all — it printed "REPLACE-ME — REPLACE-ME" and exited 0.
+PLACEHOLDER = "REPLACE-ME"
+
+
 class IocError(ValueError):
     """The advisory input is malformed. Never raised for merely surprising data."""
 
@@ -75,6 +82,15 @@ class IocError(ValueError):
 def _require(condition: bool, message: str) -> None:
     if not condition:
         raise IocError(message)
+
+
+def _reject_placeholder(value: object, where: str) -> None:
+    """Refuse a field still holding the template's marker."""
+    if isinstance(value, str) and PLACEHOLDER in value:
+        raise IocError(
+            f"{where}: still holds {PLACEHOLDER} — fill it in. An advisory with blanks "
+            "must not validate, because a verdict would then rest on a field nobody set"
+        )
 
 
 def _reject_unknown(obj: dict, allowed: set[str], where: str) -> None:
@@ -262,8 +278,7 @@ def parse_advisory(text: str) -> Advisory:
     for key in ("id", "name", "ecosystem", "coverage", "packages", "sources", "window"):
         _require(key in data, f"advisory: missing required field {key!r}")
     for key in ("id", "name", "ecosystem"):
-        _require(isinstance(data[key], str) and data[key].strip(),
-                 f"advisory.{key}: must be a non-empty string")
+        _required_str(data[key], f"advisory.{key}")
     _require(data["ecosystem"] == "npm",
              f"advisory.ecosystem: only 'npm' is supported, got {data['ecosystem']!r}")
     _require(data["coverage"] in COVERAGE_VALUES,
@@ -384,6 +399,14 @@ def _string_list(raw: object, where: str, *, required: bool) -> tuple[str, ...]:
     return tuple(str(i).strip() for i in items)
 
 
+def _required_str(raw: object, where: str) -> str:
+    """A non-empty string that is not the template's marker."""
+    _require(isinstance(raw, str) and str(raw).strip() != "",
+             f"{where}: must be a non-empty string")
+    _reject_placeholder(raw, where)
+    return str(raw).strip()
+
+
 def _optional_str(raw: object, where: str) -> str | None:
     if raw is None:
         return None
@@ -437,12 +460,10 @@ TEMPLATE_HINTS = {
 }
 
 
-PLACEHOLDER = "REPLACE-ME"
-
-
 def advisory_template(*, package: str | None = None, versions: tuple[str, ...] = (),
                       start: str | None = None, end: str | None = None,
-                      source: str | None = None) -> str:
+                      source: str | None = None, identifier: str | None = None,
+                      name: str | None = None) -> str:
     """An advisory to edit, or a complete one when every fact is already known.
 
     A fully-specified call produces a file that validates. Anything left out is written
@@ -453,9 +474,11 @@ def advisory_template(*, package: str | None = None, versions: tuple[str, ...] =
     """
     body = {
         "schema_version": SCHEMA_VERSION,
-        "id": f"LOCAL-{package.upper()}-0001" if package else PLACEHOLDER,
-        "name": f"{package} compromised" if package
-                else f"{PLACEHOLDER}: {TEMPLATE_HINTS['name']}",
+        # Never derived from the package. There have been several chalk incidents, and
+        # naming them all LOCAL-CHALK-0001 would make two different events indexable as
+        # one — the report keys its whole verdict on this field.
+        "id": identifier or f"{PLACEHOLDER}: {TEMPLATE_HINTS['id']}",
+        "name": name or f"{PLACEHOLDER}: {TEMPLATE_HINTS['name']}",
         "ecosystem": "npm",
         "coverage": "partial",
         "window": {
