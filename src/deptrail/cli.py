@@ -37,7 +37,14 @@ from pathlib import Path
 
 from .demo import advisory_path, build, runs_provider, secrets_provider
 from .grading import RunHistory, annotate_installs, runs_from_github
-from .ioc import Advisory, IocError, bundled_feeds, load_advisory
+from .ioc import (
+    Advisory,
+    IocError,
+    advisory_template,
+    bundled_feeds,
+    load_advisory,
+    parse_advisory,
+)
 from .org import OrgReport, render_report, scan_organization
 from .report import render_html
 
@@ -279,6 +286,8 @@ def cmd_scan(args: argparse.Namespace) -> int:
         advisory = load_advisory(args.ioc)
     except IocError as e:
         print(f"advisory rejected: {e}", file=sys.stderr)
+        print(f"check it with `deptrail advisory validate {args.ioc}`; the format is "
+              f"documented in {FORMAT_DOCS}", file=sys.stderr)
         return EXIT_BAD_INPUT
 
     errors: list[str] = []
@@ -316,6 +325,64 @@ def cmd_scan(args: argparse.Namespace) -> int:
     return written or _exit_code(report)
 
 
+FORMAT_DOCS = "docs/ioc-format.md"
+
+
+def cmd_advisory_init(args: argparse.Namespace) -> int:
+    """Write an advisory to edit. Anything not supplied is left as REPLACE-ME.
+
+    A template that validated while still full of placeholders would be worse than no
+    template: the whole point of the strict loader is that a half-filled advisory fails
+    before it can produce a confident CLEAN.
+    """
+    text = advisory_template(
+        package=args.package, versions=tuple(args.version or ()),
+        start=args.start, end=args.end, source=args.source,
+    )
+    if args.output:
+        try:
+            Path(args.output).write_text(text, encoding="utf-8")
+        except OSError as e:
+            print(f"could not write {args.output}: {e}", file=sys.stderr)
+            return EXIT_TRANSIENT
+        print(f"wrote {args.output}", file=sys.stderr)
+    else:
+        print(text, end="")
+
+    try:
+        parse_advisory(text)
+    except IocError as e:
+        print(f"\nstill to fill in: {e}\n"
+              f"then check it with: deptrail advisory validate {args.output or '<file>'}\n"
+              f"the window is the field that decides everything — {FORMAT_DOCS}",
+              file=sys.stderr)
+        return EXIT_CLEAN  # a template with blanks is the expected output, not a failure
+    print("this advisory is complete and valid", file=sys.stderr)
+    return EXIT_CLEAN
+
+
+def cmd_advisory_validate(args: argparse.Namespace) -> int:
+    """Say whether an advisory is usable, before a scan depends on it."""
+    try:
+        advisory = load_advisory(args.ioc)
+    except IocError as e:
+        print(f"not usable: {e}", file=sys.stderr)
+        print(f"the format is documented in {FORMAT_DOCS}", file=sys.stderr)
+        return EXIT_BAD_INPUT
+    start, end = advisory.window
+    print(f"{advisory.id} — {advisory.name}")
+    print(f"  window     {start.isoformat()} → {end.isoformat()}"
+          f"  ({(end - start).days}d {((end - start).seconds // 3600)}h, inclusive)")
+    print(f"  coverage   {advisory.coverage}"
+          + ("" if advisory.coverage == "complete"
+             else " — absence of exposure will not be provable"))
+    for package in advisory.packages:
+        window = "" if package.window is None else "  (own window)"
+        print(f"  package    {package.name} {', '.join(package.versions)}{window}")
+    print(f"  sources    {', '.join(advisory.sources)}")
+    return EXIT_CLEAN
+
+
 def cmd_feeds(args: argparse.Namespace) -> int:
     for name in bundled_feeds():
         advisory = load_advisory(name)
@@ -341,6 +408,29 @@ def build_parser() -> argparse.ArgumentParser:
                       help="where to build the demo repositories")
     add_output(demo)
     demo.set_defaults(func=cmd_demo)
+
+    advisory = subs.add_parser(
+        "advisory", help="write and check the advisory a scan reads")
+    advisory_subs = advisory.add_subparsers(dest="advisory_command")
+    advisory.set_defaults(func=lambda a: (advisory.print_help(), EXIT_BAD_INPUT)[1])
+
+    init = advisory_subs.add_parser(
+        "init", help="write an advisory to fill in, or a complete one from flags")
+    init.add_argument("--package", help="the compromised package name")
+    init.add_argument("--version", action="append",
+                      help="an exact malicious version; repeat for several")
+    init.add_argument("--start", help="first instant the malicious artifact was "
+                                      "installable, e.g. 2025-11-24T00:00:00+00:00")
+    init.add_argument("--end", help="last instant it was still installable — the "
+                                    "registry's removal, not the advisory's publication")
+    init.add_argument("--source", help="URL the claim comes from")
+    init.add_argument("--output", help="write here instead of stdout")
+    init.set_defaults(func=cmd_advisory_init)
+
+    check = advisory_subs.add_parser(
+        "validate", help="check an advisory before a scan depends on it")
+    check.add_argument("ioc", help="advisory file path, or a bundled feed name")
+    check.set_defaults(func=cmd_advisory_validate)
 
     scan = subs.add_parser("scan", help="judge real repositories against an advisory")
     scan.add_argument("--ioc", required=True,

@@ -416,3 +416,58 @@ def load_advisory(path: str | Path) -> Advisory:
 
 def bundled_feeds() -> list[str]:
     return sorted(p.stem for p in FEEDS_DIR.glob("*.json"))
+
+
+# What the window means, said in the file itself. JSON has no comments, and this is the
+# field that decides every verdict: vendors headline the interval the *attacker* was
+# active, which is not the interval the malicious artifact was *installable*. Enter the
+# first and every scan returns CLEAN — the failure this tool exists to prevent.
+WINDOW_NOTE = (
+    "window is the interval the malicious artifact was INSTALLABLE — first malicious "
+    "publish to registry removal — not the interval the attacker was active. The two "
+    "differ, and using the second makes every scan report CLEAN. See docs/ioc-format.md."
+)
+
+TEMPLATE_HINTS = {
+    "id": "the advisory's own identifier, e.g. GHSA-xxxx-xxxx-xxxx or MAL-0000-1234",
+    "name": "one line a responder will recognise months later",
+    "coverage": "'complete' if this file lists every affected package of the incident, "
+                "'partial' if not — a partial feed can never prove absence",
+    "sources": "where each claim came from; a verdict is only as good as its advisory",
+}
+
+
+PLACEHOLDER = "REPLACE-ME"
+
+
+def advisory_template(*, package: str | None = None, versions: tuple[str, ...] = (),
+                      start: str | None = None, end: str | None = None,
+                      source: str | None = None) -> str:
+    """An advisory to edit, or a complete one when every fact is already known.
+
+    A fully-specified call produces a file that validates. Anything left out is written
+    as ``REPLACE-ME``, which fails validation on purpose: an advisory with no source has
+    no provenance, and a verdict is only ever as good as the advisory behind it. That is
+    why ``coverage`` defaults to ``partial`` too — claiming a feed lists every affected
+    package of an incident is a claim, and the default should not make it silently.
+    """
+    body = {
+        "schema_version": SCHEMA_VERSION,
+        "id": f"LOCAL-{package.upper()}-0001" if package else PLACEHOLDER,
+        "name": f"{package} compromised" if package
+                else f"{PLACEHOLDER}: {TEMPLATE_HINTS['name']}",
+        "ecosystem": "npm",
+        "coverage": "partial",
+        "window": {
+            "start": start or f"{PLACEHOLDER}: 2025-11-24T00:00:00+00:00",
+            "end": end or f"{PLACEHOLDER}: 2025-11-26T23:59:59+00:00",
+        },
+        "packages": [{
+            "name": package or PLACEHOLDER,
+            "versions": list(versions) or [PLACEHOLDER],
+            "sources": [source or f"{PLACEHOLDER}: https://..."],
+        }],
+        "sources": [source or f"{PLACEHOLDER}: https://..."],
+        "notes": WINDOW_NOTE,
+    }
+    return json.dumps(body, indent=2, ensure_ascii=False) + "\n"

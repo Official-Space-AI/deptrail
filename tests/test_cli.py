@@ -556,3 +556,85 @@ class TestShallowCheckout:
         assert code == EXIT_CLEAN
         assert "shallow clone" in out, "the gap is accepted, not hidden"
         assert "allow-incomplete-history" in out
+
+
+class TestAdvisoryAuthoring:
+    """#29: hand-authoring the advisory was the first thing that stopped a new user, and
+    it stopped them before the tool had done anything at all."""
+
+    def test_a_fully_specified_init_is_valid_immediately(self, tmp_path, capsys):
+        target = tmp_path / "incident.json"
+        code = main(["advisory", "init", "--package", "chalk", "--version", "5.6.1",
+                     "--start", "2025-11-24T00:00:00+00:00",
+                     "--end", "2025-11-26T23:59:59+00:00",
+                     "--source", "https://example.test/advisory",
+                     "--output", str(target)])
+        assert code == EXIT_CLEAN
+        assert "complete and valid" in capsys.readouterr().err
+        assert main(["advisory", "validate", str(target)]) == EXIT_CLEAN
+
+    def test_a_blank_template_does_not_validate(self, tmp_path, capsys):
+        # A template that passed while still full of placeholders would be worse than no
+        # template: the strict loader exists so a half-filled advisory cannot produce a
+        # confident CLEAN.
+        code = main(["advisory", "init"])
+        out, err = capsys.readouterr()
+        assert code == EXIT_CLEAN, "emitting a template is not a failure"
+        assert "REPLACE-ME" in out
+        assert "still to fill in" in err
+        template = tmp_path / "blank.json"
+        template.write_text(out)
+        assert main(["advisory", "validate", str(template)]) == EXIT_BAD_INPUT
+
+    def test_the_template_says_what_the_window_means(self, capsys):
+        # Getting this backwards makes every scan return CLEAN, so it is written into the
+        # file rather than left in the documentation.
+        main(["advisory", "init"])
+        out = capsys.readouterr().out
+        assert "INSTALLABLE" in out
+        assert "not the interval the attacker was active" in out
+
+    def test_init_without_a_source_refuses_to_look_complete(self, tmp_path, capsys):
+        # Provenance is not optional: a verdict is only as good as its advisory.
+        code = main(["advisory", "init", "--package", "chalk", "--version", "5.6.1",
+                     "--start", "2025-11-24T00:00:00+00:00",
+                     "--end", "2025-11-26T23:59:59+00:00"])
+        out, err = capsys.readouterr()
+        assert code == EXIT_CLEAN
+        assert "still to fill in" in err
+        assert "sources" in err
+
+    def test_validate_explains_a_broken_advisory_and_names_the_docs(self, tmp_path, capsys):
+        broken = tmp_path / "bad.json"
+        broken.write_text('{"schema_version": 1, "id": "X", "summary": "oops"}')
+        code = main(["advisory", "validate", str(broken)])
+        err = capsys.readouterr().err
+        assert code == EXIT_BAD_INPUT
+        assert "unknown field(s) ['summary']" in err
+        assert "docs/ioc-format.md" in err
+
+    def test_validate_accepts_a_bundled_feed_by_name(self, capsys):
+        assert main(["advisory", "validate", "example-demo"]) == EXIT_CLEAN
+        out = capsys.readouterr().out
+        assert "window" in out and "coverage" in out
+
+    def test_validate_says_a_partial_feed_cannot_prove_absence(self, tmp_path, capsys):
+        target = tmp_path / "partial.json"
+        main(["advisory", "init", "--package", "chalk", "--version", "5.6.1",
+              "--start", "2025-11-24T00:00:00+00:00",
+              "--end", "2025-11-26T23:59:59+00:00",
+              "--source", "https://example.test/a", "--output", str(target)])
+        capsys.readouterr()
+        main(["advisory", "validate", str(target)])
+        assert "absence of exposure will not be provable" in capsys.readouterr().out
+
+    def test_a_rejected_advisory_tells_a_scan_user_where_to_look(self, tmp_path, capsys):
+        broken = tmp_path / "bad.json"
+        broken.write_text('{"nope": true}')
+        code = main(["scan", "--ioc", str(broken), "--repo", ".", "--no-ci"])
+        err = capsys.readouterr().err
+        assert code == EXIT_BAD_INPUT
+        assert "advisory validate" in err and "docs/ioc-format.md" in err
+
+    def test_bare_advisory_prints_help_rather_than_a_traceback(self, capsys):
+        assert main(["advisory"]) == EXIT_BAD_INPUT
