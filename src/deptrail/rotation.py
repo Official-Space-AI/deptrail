@@ -26,12 +26,13 @@ API by design, and this tool never asks for them.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
 from .grading import Grade, GradedExposure, GradedFinding
-from .history import GitError, Verdict, _git as _git_text
+from .history import Exposure, GitError, Verdict, _git as _git_text
 
 # Only ``${{ ... }}`` expressions can read the secrets context, so references are
 # looked for inside those blocks: a commented-out secret or the literal string
@@ -68,19 +69,88 @@ class Scope(str, Enum):
 
 
 @dataclass(frozen=True)
+class Caveat:
+    """One sentence about a repository, kept apart from what varies between exposures.
+
+    An advisory names many packages and each one is scanned separately, so the same
+    sentence is reached once per package — three packages pinned in one lockfile with
+    no implicated run produce the same paragraph three times. With the version baked
+    into the prose there is nothing downstream can group on but the prose itself,
+    and the report printed the paragraph once per package; the September 2025
+    Shai-Hulud advisory named roughly 180 (#30).
+
+    So the part that varies lives in ``subjects`` and the sentence is stored without
+    it. Grouping then compares sentences exactly rather than guessing at prose, and
+    the merged line still names every version — which is the evidence a responder
+    checking a machine by hand actually needs.
+    """
+
+    text: str
+    subjects: tuple[str, ...] = ()
+
+    @property
+    def rendered(self) -> str:
+        """The line a reader sees: what is true, then which exposures it covers.
+
+        The sentence comes first because it is the part a responder acts on. Naming
+        the subjects first reads better for two versions and buries the sentence at
+        eighty, and eighty is the realistic case.
+        """
+        if not self.subjects:
+            return self.text
+        return f"{self.text} (covers {', '.join(self.subjects)})"
+
+
+def merge_caveats(caveats: Iterable[Caveat]) -> tuple[Caveat, ...]:
+    """One caveat per distinct sentence, naming every subject that reached it.
+
+    First-appearance order is kept for both sentences and subjects: a report that
+    reorders itself between runs cannot be diffed against the previous one.
+    """
+    merged: dict[str, list[str]] = {}
+    for caveat in caveats:
+        subjects = merged.setdefault(caveat.text, [])
+        subjects.extend(s for s in caveat.subjects if s not in subjects)
+    return tuple(Caveat(text=text, subjects=tuple(subjects))
+                 for text, subjects in merged.items())
+
+
+def subject_of(package: str | None, exposure: Exposure) -> str:
+    """How one exposure is named where several of them share a sentence.
+
+    The package name is part of it: a bare ``5.6.1`` is ambiguous the moment an
+    advisory names more than one package, and on a real incident it names hundreds.
+    """
+    return f"{package}@{exposure.version}" if package else exposure.version
+
+
+@dataclass(frozen=True)
 class RotationItem:
-    """One credential to rotate, with the evidence that put it on the list."""
+    """One credential to rotate, with the evidence that put it on the list.
+
+    ``causes`` is a list because one credential is commonly implicated by several
+    of an advisory's packages, and merging them is what keeps the count at the top
+    of the report honest. It is a list of ``Caveat`` and not of strings so that
+    merging can tell "the same sentence about another version" from "a different
+    sentence"; joining prose and deduplicating the clauses afterwards used to drop
+    the tail of every sentence after the first.
+    """
 
     repo: str
     secret: str
     scope: Scope
     grade: Grade
-    reason: str
+    causes: tuple[Caveat, ...] = ()
     run_ids: tuple[str, ...] = ()
 
     @property
     def is_narrowed(self) -> bool:
         return self.scope is Scope.WORKFLOW
+
+    @property
+    def reason(self) -> str:
+        """Every cause, rendered as one cell of a report."""
+        return "; ".join(c.rendered for c in self.causes)
 
 
 @dataclass
@@ -95,8 +165,8 @@ class RepoRotation:
 
     repo: str
     items: list[RotationItem] = field(default_factory=list)
-    notes: list[str] = field(default_factory=list)
-    unnamed: list[str] = field(default_factory=list)
+    notes: list[Caveat] = field(default_factory=list)
+    unnamed: list[Caveat] = field(default_factory=list)
 
 
 def _expressions(body: str) -> str:
@@ -192,10 +262,12 @@ def rotation_for_repo(repo_path: Path, repo_name: str, finding: GradedFinding,
     """Build one repository's rotation list from its graded exposures."""
     rotation = RepoRotation(repo=repo_name)
     if finding.coverage_warning:
-        rotation.notes.append(finding.coverage_warning)
+        rotation.notes.append(Caveat(finding.coverage_warning))
     for note in (*finding.warnings, *finding.incomplete, *finding.diagnostics,
                  *finding.ci_notes, *(t.reason for t in finding.unread_trees)):
-        rotation.notes.append(note)
+        # These name no version, so they carry no subject: they are already the
+        # same sentence for every package of the advisory and merge on their text.
+        rotation.notes.append(Caveat(note))
 
     graded_needing = [g for g in finding.graded
                       if g.grade in (Grade.CONFIRMED, Grade.LIKELY, Grade.POSSIBLE)]
@@ -214,19 +286,20 @@ def rotation_for_repo(repo_path: Path, repo_name: str, finding: GradedFinding,
         # are excluded for the same reason.
         rotation.items.extend(_repo_wide_items(
             repo_name, repo_secrets, Grade.POSSIBLE, rotation,
-            "this repository's history could not be read, so exposure was "
-            "neither shown nor ruled out",
+            Caveat("this repository's history could not be read, so exposure was "
+                   "neither shown nor ruled out"),
         ))
 
     for item in graded_needing:
         rotation.items.extend(
-            _items_for_exposure(repo_path, repo_name, item, repo_secrets, rotation)
+            _items_for_exposure(repo_path, repo_name, item, repo_secrets, rotation,
+                                finding.package)
         )
     return rotation
 
 
 def _repo_wide_items(repo_name: str, repo_secrets: tuple[str, ...] | None, grade: Grade,
-                     rotation: RepoRotation, reason: str,
+                     rotation: RepoRotation, cause: Caveat,
                      run_ids: tuple[str, ...] = ()) -> list[RotationItem]:
     """Items covering every secret the repo can see, or a note if we cannot list them.
 
@@ -235,45 +308,58 @@ def _repo_wide_items(repo_name: str, repo_secrets: tuple[str, ...] | None, grade
     alternative. ``None`` means the listing failed, ``()`` means it returned empty.
     """
     if repo_secrets is None:
-        rotation.unnamed.append(
-            f"{reason} — and this repository's secret names could not be listed, "
-            "so rotate everything it can see"
-        )
+        rotation.unnamed.append(_extend(
+            cause, "— and this repository's secret names could not be listed, "
+            "so rotate everything it can see"))
         return []
     if not repo_secrets:
-        rotation.notes.append(f"{reason} — this repository holds no secrets")
+        rotation.notes.append(_extend(cause, "— this repository holds no secrets"))
         return []
     return [
         RotationItem(repo=repo_name, secret=secret, scope=Scope.REPO_WIDE,
-                     grade=grade, reason=reason, run_ids=run_ids)
+                     grade=grade, causes=(cause,), run_ids=run_ids)
         for secret in repo_secrets if secret not in EPHEMERAL_SECRETS
     ]
 
 
+def _extend(cause: Caveat, tail: str) -> Caveat:
+    """The same subjects, with one more clause on the sentence.
+
+    Kept as a function so the suffix lands on the text and not between the subjects
+    and it: two packages reaching the same dead end must still merge afterwards.
+    """
+    return Caveat(text=f"{cause.text} {tail}", subjects=cause.subjects)
+
+
 def _items_for_exposure(repo_path: Path, repo_name: str, graded: GradedExposure,
                         repo_secrets: tuple[str, ...] | None,
-                        rotation: RepoRotation) -> list[RotationItem]:
+                        rotation: RepoRotation,
+                        package: str | None = None) -> list[RotationItem]:
     exposure = graded.exposure
+    subject = (subject_of(package, exposure),)
     if not graded.run_ids or not graded.implicates_install:
         why_local = ("no CI run was implicated" if not graded.run_ids else
                      "no implicated run could have installed it")
-        reason = (f"{exposure.version} was pinned in {exposure.lockfile_path} and "
-                  f"{why_local}, so if it was installed at all it was outside CI; "
-                  "Actions secrets are not automatically present on a developer "
-                  "machine, but the same values often are — investigate that "
-                  "machine's credentials as well")
+        # Phrased without a grammatical number, because one merged line covers one
+        # version or eighty of them and neither reading may be wrong.
+        cause = Caveat(
+            text=(f"pinned in {exposure.lockfile_path}, and {why_local} — so any "
+                  "install happened outside CI; Actions secrets are not automatically "
+                  "present on a developer machine, but the same values often are, so "
+                  "investigate that machine's credentials as well"),
+            subjects=subject,
+        )
         if repo_secrets is None:
-            rotation.unnamed.append(
-                f"{reason} — and this repository's secret names could not be listed, "
-                "so rotate everything it can see"
-            )
+            rotation.unnamed.append(_extend(
+                cause, "— and this repository's secret names could not be listed, "
+                "so rotate everything it can see"))
             return []
         if not repo_secrets:
-            rotation.notes.append(f"{reason} — this repository holds no secrets")
+            rotation.notes.append(_extend(cause, "— this repository holds no secrets"))
             return []
         return [
             RotationItem(repo=repo_name, secret=secret, scope=Scope.DEVELOPER,
-                         grade=graded.grade, reason=reason)
+                         grade=graded.grade, causes=(cause,))
             for secret in repo_secrets if secret not in EPHEMERAL_SECRETS
         ]
 
@@ -281,11 +367,11 @@ def _items_for_exposure(repo_path: Path, repo_name: str, graded: GradedExposure,
         repo_path, exposure.commit, graded.workflow_paths
     )
     if environments:
-        rotation.notes.append(
+        rotation.notes.append(Caveat(
             f"the implicated run(s) entered environment(s) "
             f"{', '.join(environments)}; secrets defined on an environment are not "
             "in a repository secret listing, so check them separately"
-        )
+        ))
     names, scope, why = secrets_across_workflows(
         repo_path, exposure.commit, graded.workflow_paths
     )
@@ -293,20 +379,23 @@ def _items_for_exposure(repo_path: Path, repo_name: str, graded: GradedExposure,
         actionable = [n for n in names if n not in EPHEMERAL_SECRETS]
         skipped = sorted(set(names) - set(actionable))
         if skipped:
-            rotation.notes.append(
+            rotation.notes.append(Caveat(
                 f"{', '.join(skipped)} was in scope but expires with its run, so it "
                 "is not on the rotation list"
-            )
+            ))
         return [
             RotationItem(repo=repo_name, secret=secret, scope=scope,
-                         grade=graded.grade, reason=why, run_ids=graded.run_ids)
+                         grade=graded.grade,
+                         causes=(Caveat(text=why, subjects=subject),),
+                         run_ids=graded.run_ids)
             for secret in actionable
         ]
     if scope is Scope.WORKFLOW:
-        rotation.notes.append(
-            f"{exposure.version} ran in {repo_name} but {why}, so no credential "
-            "from this exposure needs rotating"
-        )
+        rotation.notes.append(Caveat(
+            text=f"ran in {repo_name} but {why}, so no credential from this exposure "
+                 "needs rotating",
+            subjects=subject,
+        ))
         return []
-    return _repo_wide_items(repo_name, repo_secrets, graded.grade, rotation, why,
-                            graded.run_ids)
+    return _repo_wide_items(repo_name, repo_secrets, graded.grade, rotation,
+                            Caveat(text=why, subjects=subject), graded.run_ids)

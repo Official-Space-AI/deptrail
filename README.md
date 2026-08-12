@@ -47,9 +47,13 @@ timeline
                 the workflows at that commit install dependencies, so 5.6.1 executed
 
 rotate (3 credential(s))
-  [CONFIRMED  ] api-server: DEPLOY_KEY (run 4412) — named in .github/workflows/ci.yml at c6cd5f96
+  [CONFIRMED  ] api-server: DEPLOY_KEY (run 4412) — named in .github/workflows/ci.yml at
+                c6cd5f96 (covers chalk@5.6.1)
   [CONFIRMED  ] api-server: NPM_TOKEN (run 4412) — named in .github/workflows/ci.yml at c6cd5f96
-  [LIKELY     ] docs-site: ALGOLIA_KEY [DEVELOPER] — no implicated run could have installed it ...
+                (covers chalk@5.6.1)
+  [LIKELY     ] docs-site: ALGOLIA_KEY [DEVELOPER] — pinned in package-lock.json, and no
+                implicated run could have installed it — so any install happened outside CI;
+                Actions secrets are not automatically present on a developer machine, but ...
 
 not judged (no lockfile this tool can read)
   mobile-app: yarn.lock: Yarn lockfiles are not parsed yet, so the versions this tree installed were not judged
@@ -63,6 +67,10 @@ version while the registry served it, so it is absent from the report entirely.
 `mobile-app` is locked with Yarn, which this version cannot parse — so it is named
 as unread rather than cleared, and it raises no credentials, because nothing about
 it suggests one.
+
+Each line ends with the versions it `covers`, and that is how one repository stays
+one line: an advisory naming 180 packages — the September 2025 Shai-Hulud wave named
+roughly that many — would otherwise print the same paragraph 180 times.
 
 Exit codes split verdicts from non-verdicts, so a caller knows whether to act, to
 retry, or to fix something:

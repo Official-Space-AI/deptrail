@@ -23,6 +23,7 @@ human can overrule the classification; they simply do not produce rotation items
 from __future__ import annotations
 
 import subprocess
+import textwrap
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
@@ -44,7 +45,14 @@ from .history import (
     scan_repo,
 )
 from .ioc import QueryPlan
-from .rotation import RepoRotation, RotationItem, Scope, rotation_for_repo
+from .rotation import (
+    Caveat,
+    RepoRotation,
+    RotationItem,
+    Scope,
+    merge_caveats,
+    rotation_for_repo,
+)
 
 RunsProvider = Callable[[Path, str], RunHistory]
 SecretsProvider = Callable[[Path, str], tuple[str, ...]]  # returns names; raise if unavailable
@@ -217,16 +225,27 @@ class OrgReport:
                 stronger = min(existing, item, key=lambda i: order.get(i.grade, 3))
                 # Widest scope wins regardless of the order the items arrived in.
                 widest = max((existing.scope, item.scope), key=SCOPE_WIDTH.get)
-                seen_reasons = dict.fromkeys(
-                    [*existing.reason.split("; "), *item.reason.split("; ")]
-                )
-                reasons = "; ".join(seen_reasons)
+                # Merged on the sentence, not on prose split at "; ": the same
+                # sentence about another version collapses and keeps both versions,
+                # while clause-level deduplication used to eat the tail of every
+                # sentence after the first — the second package's reason ended at
+                # "outside CI" with its advice removed (#30).
                 merged[key] = replace(
-                    stronger, scope=widest, reason=reasons,
+                    stronger, scope=widest,
+                    causes=merge_caveats([*existing.causes, *item.causes]),
                     run_ids=tuple(sorted(set(existing.run_ids) | set(item.run_ids))),
                 )
         return tuple(sorted(merged.values(),
                             key=lambda i: (order.get(i.grade, 3), i.repo, i.secret)))
+
+    @property
+    def unnamed_repos(self) -> tuple[str, ...]:
+        """Repositories at risk whose secret names could not be listed.
+
+        Counted separately from the items, because they are the part of the rotation
+        list no headline number can cover.
+        """
+        return tuple(sorted({r.repo for r in self.rotations if r.unnamed}))
 
     @property
     def rotation_required(self) -> bool:
@@ -237,22 +256,42 @@ class OrgReport:
         """
         return bool(self.rotation_items) or any(r.unnamed for r in self.rotations)
 
+    def _grouped(self, pick: Callable[[RepoRotation], Iterable[Caveat]],
+                 ) -> tuple[str, ...]:
+        """Caveats gathered per repository and merged, one line each.
+
+        Gathered across ``rotations`` and not within one, because a repository has
+        one entry there per advisory *package*: merging inside each entry would
+        leave the copies untouched, which is how the same paragraph came to be
+        printed once per package.
+        """
+        per_repo: dict[str, list[Caveat]] = {}
+        for rotation in self.rotations:
+            per_repo.setdefault(rotation.repo, []).extend(pick(rotation))
+        return tuple(f"{repo}: {caveat.rendered}"
+                     for repo, caveats in per_repo.items()
+                     for caveat in merge_caveats(caveats))
+
     @property
     def unnamed_rotations(self) -> tuple[str, ...]:
         """Repositories whose credentials must be rotated but could not be named."""
-        return tuple(f"{r.repo}: {note}" for r in self.rotations for note in r.unnamed)
+        return self._grouped(lambda r: r.unnamed)
 
     @property
     def rotation_notes(self) -> tuple[str, ...]:
-        """Per-repository caveats, deduplicated, prefixed with the repo they came from."""
-        seen, notes = set(), []
-        for rotation in self.rotations:
-            for note in (*rotation.unnamed, *rotation.notes):
-                line = f"{rotation.repo}: {note}"
-                if line not in seen:
-                    seen.add(line)
-                    notes.append(line)
-        return tuple(notes)
+        """Per-repository caveats, merged, prefixed with the repo they came from."""
+        return self._grouped(lambda r: (*r.unnamed, *r.notes))
+
+    @property
+    def caveats(self) -> tuple[str, ...]:
+        """Every caveat once, minus the lines a dedicated section already carries.
+
+        One property for all three renderers. They each built this list themselves
+        and drifted: the JSON output counted every gap twice for a while, because
+        its ``caveats`` key repeated what ``not_judged`` already held.
+        """
+        shown = {*self.unread, *self.incomplete, *self.unnamed_rotations}
+        return tuple(c for c in (*self.notes, *self.rotation_notes) if c not in shown)
 
     @property
     def worst_grade(self) -> Grade:
@@ -404,6 +443,41 @@ def scan_organization(repos: Iterable[tuple[str, Path]], plan: QueryPlan, *,
     return report
 
 
+# A terminal report is read in a terminal. Merging the duplicate paragraphs put
+# every implicated version on one line, and on a 180-package advisory that line
+# measured 3.3 kB — unreadable for the same reason the repetition was.
+BODY_WIDTH = 96
+
+
+def _folded(prefix: str, body: str, indent: str) -> list[str]:
+    """One report line, folded to a readable width under a hanging indent.
+
+    The prefix is passed as the first line's indent, so it is emitted verbatim — a
+    column of aligned grades stays aligned — and still counts against the width.
+    Words are never broken, so a secret name, a flag or a ``package@version``
+    survives intact for whoever greps the output.
+    """
+    return textwrap.wrap(body, width=BODY_WIDTH, initial_indent=prefix,
+                         subsequent_indent=indent, break_long_words=False,
+                         break_on_hyphens=False) or [prefix.rstrip()]
+
+
+def _rotate_summary(report: OrgReport) -> str:
+    """What the rotate heading claims, covering both halves of the list.
+
+    A count of named credentials alone reads as the whole job when a second
+    repository's secrets are at risk and unlistable, so the heading says both.
+    """
+    parts = []
+    if report.rotation_items:
+        parts.append(f"{len(report.rotation_items)} credential(s)")
+    repos = report.unnamed_repos
+    if repos:
+        parts.append(f"{len(repos)} repositor{'y' if len(repos) == 1 else 'ies'} "
+                     "to rotate broadly")
+    return ", ".join(parts)
+
+
 def render_report(report: OrgReport) -> str:
     """A terminal report: the timeline, then the rotation list, then the caveats."""
     lines = [
@@ -444,16 +518,21 @@ def render_report(report: OrgReport) -> str:
         lines.append("")
 
     items = report.rotation_items
-    if items:
-        lines.append(f"rotate ({len(items)} credential(s))")
+    unnamed = report.unnamed_rotations
+    if items or unnamed:
+        lines.append(f"rotate ({_rotate_summary(report)})")
         for item in items:
             scope = "" if item.is_narrowed else f" [{item.scope.value}]"
             runs_cited = f" (run {', '.join(item.run_ids)})" if item.run_ids else ""
-            lines.append(f"  [{item.grade.value:11s}] {item.repo}: {item.secret}"
-                         f"{scope}{runs_cited} — {item.reason}")
-    elif report.unnamed_rotations:
-        lines.append("rotate: credentials are at risk but could not be named")
-        lines += [f"  {note}" for note in report.unnamed_rotations]
+            lines += _folded(f"  [{item.grade.value:11s}] {item.repo}: {item.secret}"
+                             f"{scope}{runs_cited} — ", item.reason, " " * 16)
+        # Printed alongside the named items rather than instead of them. The `elif`
+        # that used to stand here dropped this block the moment any *other*
+        # repository named a credential, so a repository whose secret listing failed
+        # was left out of the rotation section entirely while the headline counted
+        # only the credentials that could be named.
+        for note in unnamed:
+            lines += _folded("  [could not be named] ", note, " " * 16)
     else:
         lines.append("rotate: nothing")
 
@@ -471,10 +550,11 @@ def render_report(report: OrgReport) -> str:
         lines += [f"  {u}" for u in report.unread]
     # The same reasons reach `rotation_notes` for a repo that also rotates; print
     # each once, under the heading that explains it.
-    seen_above = set(report.unread) | set(report.incomplete)
-    caveats = [c for c in [*report.notes, *report.rotation_notes] if c not in seen_above]
-    if caveats:
-        lines += ["", "caveats"] + [f"  {c}" for c in caveats]
+    if report.caveats:
+        lines.append("")
+        lines.append("caveats")
+        for caveat in report.caveats:
+            lines += _folded("  ", caveat, " " * 4)
     if not report.proves_absence:
         lines += ["", "this scan cannot prove absence of exposure"]
     return "\n".join(lines)

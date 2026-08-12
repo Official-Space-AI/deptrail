@@ -94,6 +94,44 @@ A lockfile of either kind under `tests/fixtures`, `examples` and the like is
 committed data: it is named in the caveats and does not cost the repository its
 verdict, the same treatment a fixture exposure gets.
 
+## One sentence per repository, not one per package
+
+A list long enough to be unactionable is a failure, not thoroughness — and the
+report used to break that rule on its own output. A repository is scanned once per
+package the advisory names, so a caveat about the repository was reached once per
+package: three packages pinned in one lockfile printed the same paragraph three
+times, and the September 2025 Shai-Hulud advisory named roughly 180 packages.
+
+Deduplicating the rendered lines could not fix it, because the lines were not
+identical: each one carried its own version number, which is exactly the evidence a
+responder checking a machine by hand needs. So a caveat is stored as a sentence plus
+the **subjects** it covers, and the varying part never enters the prose:
+
+```
+rotate (1 repository to rotate broadly)
+  [could not be named] r2: pinned in package-lock.json, and no CI run was implicated — so
+                any install happened outside CI; ... and this repository's secret names
+                could not be listed, so rotate everything it can see (covers
+                chalk@5.6.1, debug@4.4.2, ansi-styles@6.2.2)
+```
+
+Merging then compares sentences exactly instead of guessing at prose, and every
+version survives. The same grouping merges the reasons behind one credential
+implicated by several packages: joining the prose and deduplicating its clauses used
+to drop the tail of every sentence after the first, so the second package's reason
+ended mid-thought.
+
+Two consequences worth knowing:
+
+- **The rotate section prints both halves of the list.** Named credentials and
+  repositories whose secret names could not be listed appear together, and the
+  heading counts both. Printing the second only when the first was empty meant one
+  repository naming a credential could hide another repository's repo-wide risk.
+- **Terminal lines are folded at 96 columns** with a hanging indent, never
+  truncated. Merging 180 subjects onto one line produced a 3.3 kB line, which is
+  unreadable for the same reason the repetition was. Words are never broken, so a
+  secret name or a `package@version` stays greppable.
+
 ## What the report refuses to claim
 
 A report says it **cannot prove absence** whenever a repository failed to scan, a
