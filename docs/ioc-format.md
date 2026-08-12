@@ -1,5 +1,10 @@
 # Advisory (IOC) format
 
+> **Start here:** `deptrail advisory init` writes a file to fill in and
+> `deptrail advisory validate <file>` checks it before a verdict depends on it. Anything
+> left blank fails validation on purpose — an advisory with holes must not be able to
+> produce a confident `CLEAN`.
+
 An advisory is the question DepTrail answers: *which package versions were malicious, and during what window?* On incident day it is transcribed from a vendor blog post or GHSA entry — the format is deliberately small enough to write by hand in minutes.
 
 ```json

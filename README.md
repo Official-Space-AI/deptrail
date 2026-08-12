@@ -77,17 +77,32 @@ retry, or to fix something:
 
 ## Real use
 
+On incident day, start from the advisory — it is the only thing you have to write:
+
 ```bash
-deptrail scan --ioc advisory.json --org my-org          # clone and judge an org
-deptrail scan --ioc advisory.json --repo . --no-ci      # one local clone, no token
-deptrail scan --ioc advisory.json --org my-org --format html --output report.html
-deptrail feeds                                          # bundled advisories
+deptrail advisory init --package chalk --version 5.6.1 \
+  --start 2025-11-24T00:00:00+00:00 \
+  --end   2025-11-26T23:59:59+00:00 \
+  --source https://github.com/advisories/GHSA-... \
+  --output incident.json
+
+deptrail advisory validate incident.json    # before a verdict depends on it
 ```
 
-Writing the advisory on incident day takes minutes — see
-[`docs/ioc-format.md`](docs/ioc-format.md), and read
-[the window section](docs/ioc-format.md) first: the field most easily transcribed
-wrong is the one that decides everything.
+`init` leaves anything you did not supply as `REPLACE-ME` and tells you so, because an
+advisory with blanks must not validate — a half-filled one would produce a confident
+`CLEAN`. The template carries the definition of the window in the file itself, since
+that is the field most easily transcribed wrong and getting it backwards makes every
+scan report clean. Full format in [`docs/ioc-format.md`](docs/ioc-format.md).
+
+Then judge:
+
+```bash
+deptrail scan --ioc incident.json --org my-org          # clone and judge an org
+deptrail scan --ioc incident.json --repo . --no-ci      # one local clone, no token
+deptrail scan --ioc incident.json --org my-org --format html --output report.html
+deptrail feeds                                          # bundled advisories
+```
 
 As a GitHub Action:
 
