@@ -798,3 +798,80 @@ superseded three-code contract.
 reverting its production line and confirming a test fails — including the two that
 initially did not, which is how the missing coverage was found. The exit-code matrix was
 re-measured end to end after every change.
+
+## E19 — Is deduplication the same problem as grouping?
+
+**Assumption**: the report already deduplicated its caveats — `rotation_notes` skipped a
+line it had emitted before — so the duplicate paragraphs left in the output were a matter
+of finding the remaining unguarded path and adding the same check there.
+
+**Method**: built a three-package advisory against a repository pinning all three, both
+with the secret listing available and with it failing, and counted repeated lines. Then
+re-ran the same measurement at 180 packages, the scale of the September 2025 Shai-Hulud
+advisory.
+
+**Result**: the deduplication was working and was the wrong tool. A repository is scanned
+once per package, so every caveat is reached once per package — and the lines were not
+identical, because each carried its own version:
+
+```
+rotate: credentials are at risk but could not be named
+  r2: 5.6.1 was pinned in package-lock.json and no CI run was implicated, so if it ...
+  r2: 4.4.2 was pinned in package-lock.json and no CI run was implicated, so if it ...
+  r2: 6.2.2 was pinned in package-lock.json and no CI run was implicated, so if it ...
+
+caveats
+  (the same three lines again)
+```
+
+Six of twenty-one output lines were the same sentence, and a `set()` could not have
+removed them without also removing the version numbers — which are the evidence a
+responder checking a machine by hand needs. **Deduplication compares whole strings;
+this needed grouping by what the strings have in common.**
+
+The measurement also contradicted the issue's own analysis. It recorded the
+named-credential path as "fine, because it merges reasons by `(repo, secret)`" — and it
+does merge them, by splitting both reasons at `"; "` and dropping clauses already seen.
+With three packages the surviving cell was:
+
+```
+5.6.1 was pinned ... outside CI; Actions secrets are not automatically present on a
+developer machine ... as well; 4.4.2 was pinned ... outside CI; 6.2.2 was pinned ...
+outside CI
+```
+
+The same sentence three times, and the second and third copies **truncated** — their
+advice clause had already been seen, so it was removed and the sentence ended
+mid-thought. Merging prose had been quietly corrupting it.
+
+**Changes.** The part that varies stopped being prose. A caveat is now a sentence plus
+the `subjects` it covers (`Caveat(text, subjects)`), the version never enters the text,
+and one `merge_caveats` groups by sentence and unions the subjects — used both for the
+per-repository caveats and for one credential's several causes. Sentences were rephrased
+without grammatical number, because one merged line covers one version or eighty.
+
+Two further defects came out of the same reading, both confirmed by measurement:
+
+*The unnamed block was `elif`-ed away.* All three renderers printed "credentials are at
+risk but could not be named" only when no credential **anywhere** could be named. With
+two repositories — one listing its secrets, one whose listing returned 403 — the second
+repository's repo-wide risk vanished from the rotation section entirely, while the
+heading counted `2 credential(s)` as though that were the whole job. The two halves are
+now printed together and the heading names both.
+
+*The 3.3 kB line.* Merging 180 subjects onto one line is unreadable for the same reason
+180 lines were, and this project's own rule is that an unactionable list is a failure.
+Terminal output is now folded at 96 columns with a hanging indent — never truncated, and
+never breaking a word, so a secret name or a `package@version` stays greppable.
+
+The "already shown above" subtraction that all three renderers each computed differently
+(and which the JSON output once got wrong, counting every gap twice) moved onto the
+report as one `OrgReport.caveats`.
+
+**Verification**: 306 tests. Measured before and after at both scales — 6 of 21 repeated
+lines and a 3,313-character line became 0 and 138 (the longest remaining line is an
+unfolded timeline entry). Eight mutations were applied one at a time — removing each
+`merge_caveats` call, restoring the `elif`, dropping the subjects from the rendered line,
+moving the sentence extension outside the text, removing the package name from a subject,
+and removing the folding — and all eight were caught by a failing test. Every assertion
+in the demo workflow was replayed locally, including the two greps that read caveat text.

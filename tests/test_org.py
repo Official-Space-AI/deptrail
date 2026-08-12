@@ -855,12 +855,12 @@ class TestCodexRegressions:
     def test_merged_scope_is_order_invariant(self, tmp_path):
         from deptrail.grading import Grade as G
         from deptrail.org import OrgReport
-        from deptrail.rotation import RepoRotation, RotationItem
+        from deptrail.rotation import Caveat, RepoRotation, RotationItem
 
         dev = RotationItem(repo="api", secret="K", scope=Scope.DEVELOPER, grade=G.POSSIBLE,
-                           reason="local")
+                           causes=(Caveat("local"),))
         wide = RotationItem(repo="api", secret="K", scope=Scope.REPO_WIDE, grade=G.POSSIBLE,
-                            reason="unreadable", run_ids=("9",))
+                            causes=(Caveat("unreadable"),), run_ids=("9",))
         first = OrgReport(advisory_id="x", advisory_name="x",
                           rotations=[RepoRotation(repo="api", items=[dev, wide])])
         second = OrgReport(advisory_id="x", advisory_name="x",
@@ -892,3 +892,161 @@ class TestEnvironmentSecrets:
                                   secrets=lambda p, n: ("REPO_ONLY",))
         assert {i.secret for i in report.rotation_items} == {"PROD_TOKEN"}
         assert any("environment(s) production" in n for n in report.rotation_notes)
+
+
+THREE = dict(ADVISORY, packages=[
+    {"name": "chalk", "versions": ["5.6.1"], "sources": ["https://a.test"]},
+    {"name": "debug", "versions": ["4.4.2"], "sources": ["https://a.test"]},
+    {"name": "ansi-styles", "versions": ["6.2.2"], "sources": ["https://a.test"]},
+])
+PINNED = {"chalk": "5.6.1", "debug": "4.4.2", "ansi-styles": "6.2.2"}
+
+
+def multi_lock(versions: dict[str, str]) -> str:
+    packages = {"": {"dependencies": {n: f"^{v}" for n, v in versions.items()}}}
+    for name, version in versions.items():
+        packages[f"node_modules/{name}"] = {"version": version}
+    return json.dumps({"name": "app", "lockfileVersion": 3, "packages": packages})
+
+
+def make_multi_repo(tmp_path: Path, name: str) -> Path:
+    """A repo that pins every package a three-package advisory names."""
+    repo = tmp_path / name
+    repo.mkdir()
+    git(repo, "init", "-q")
+    (repo / ".github/workflows").mkdir(parents=True)
+    (repo / ".github/workflows/ci.yml").write_text(CI_WORKFLOW)
+    (repo / "package-lock.json").write_text(multi_lock({n: "0.0.1" for n in PINNED}))
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "deps", date="2025-11-20T10:00:00+00:00")
+    (repo / "package-lock.json").write_text(multi_lock(PINNED))
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "bad", date="2025-11-25T10:00:00+00:00")
+    return repo
+
+
+@pytest.fixture
+def three():
+    return parse_advisory(json.dumps(THREE)).plan()
+
+
+class TestOneSentencePerRepoNotPerPackage:
+    """#30: the same paragraph was printed once per package the advisory named.
+
+    A repository is scanned once per package, so every sentence that mentions no
+    package at all was reached N times, and every sentence that mentioned a version
+    differed only in that version — which no string comparison could collapse. The
+    fix keeps the varying part as data; these tests hold it there.
+    """
+
+    def test_unnamed_rotation_is_one_line_naming_every_version(self, tmp_path, three):
+        repo = make_multi_repo(tmp_path, "r2")
+        report = scan_organization([("r2", repo)], three, runs=no_runs)
+        assert len(report.unnamed_rotations) == 1, report.unnamed_rotations
+        line = report.unnamed_rotations[0]
+        # Collapsing must not cost the evidence: a responder checking a machine by
+        # hand needs to know which versions were pinned.
+        for package, version in PINNED.items():
+            assert f"{package}@{version}" in line
+
+    def test_report_has_no_repeated_line(self, tmp_path, three):
+        repo = make_multi_repo(tmp_path, "r2")
+        text = render_report(scan_organization([("r2", repo)], three, runs=no_runs))
+        body = [line for line in text.splitlines() if line.strip()]
+        assert len(body) == len(set(body)), "\n".join(body)
+
+    def test_caveats_do_not_repeat_the_rotate_section(self, tmp_path, three):
+        repo = make_multi_repo(tmp_path, "r2")
+        report = scan_organization([("r2", repo)], three, runs=no_runs)
+        assert report.unnamed_rotations, "the case under test needs an unnamed rotation"
+        # The rotate section prints these; a dedicated section and the caveats block
+        # both carrying them made a reader count the same gap twice.
+        for line in report.unnamed_rotations:
+            assert line not in report.caveats
+
+    def test_merged_reason_keeps_every_version_and_the_whole_sentence(self, tmp_path,
+                                                                     three):
+        repo = make_multi_repo(tmp_path, "r2")
+        report = scan_organization([("r2", repo)], three, runs=no_runs,
+                                   secrets=lambda p, n: ("AWS_KEY",))
+        items = report.rotation_items
+        assert len(items) == 1
+        reason = items[0].reason
+        for package, version in PINNED.items():
+            assert f"{package}@{version}" in reason
+        # Deduplicating the clauses of joined prose used to drop the tail of every
+        # sentence after the first, so the advice appeared once and the second and
+        # third packages' reasons ended mid-thought at "outside CI".
+        assert reason.count("investigate that machine") == 1
+        assert reason.count("pinned in package-lock.json") == 1
+
+    def test_a_repo_that_could_not_be_listed_is_shown_beside_named_credentials(
+            self, tmp_path, three):
+        named = make_multi_repo(tmp_path, "r2")
+        unlistable = make_multi_repo(tmp_path, "web")
+
+        def mixed(path: Path, name: str) -> tuple[str, ...]:
+            if name == "web":
+                raise RuntimeError("403: admin scope required")
+            return ("AWS_KEY",)
+
+        report = scan_organization([("r2", named), ("web", unlistable)], three,
+                                   runs=no_runs, secrets=mixed)
+        text = render_report(report)
+        assert report.unnamed_repos == ("web",)
+        rotate = text.split("rotate (")[1].split("\n\n")[0]
+        # `elif` used to hide this block whenever another repository named a
+        # credential, leaving a repo-wide risk out of the rotation section while the
+        # heading counted only what could be named.
+        assert "web" in rotate
+        assert "1 repository to rotate broadly" in text
+        assert "1 credential(s)" in text
+
+    def test_long_line_is_folded_and_loses_no_version(self):
+        from deptrail.org import BODY_WIDTH, OrgReport
+        from deptrail.rotation import Caveat, RepoRotation
+
+        subjects = tuple(f"pkg-{i:03d}@{i}.0.1" for i in range(180))
+        report = OrgReport(advisory_id="x", advisory_name="x", rotations=[
+            RepoRotation(repo="api", unnamed=[
+                Caveat(text="pinned in package-lock.json, and no CI run was implicated "
+                            "— so any install happened outside CI",
+                       subjects=subjects)])])
+        text = render_report(report)
+        assert max(len(line) for line in text.splitlines()) <= BODY_WIDTH
+        for subject in subjects:
+            assert subject in text, subject
+
+
+class TestCaveatMerging:
+    def test_first_appearance_order_is_kept(self):
+        from deptrail.rotation import Caveat, merge_caveats
+
+        merged = merge_caveats([
+            Caveat("second sentence", ("b@2",)),
+            Caveat("first sentence", ("a@1",)),
+            Caveat("second sentence", ("c@3",)),
+            Caveat("first sentence", ("a@1",)),
+        ])
+        # A report that reorders itself between runs cannot be diffed against the
+        # previous one, and a duplicate subject must not be listed twice.
+        assert [c.text for c in merged] == ["second sentence", "first sentence"]
+        assert merged[0].subjects == ("b@2", "c@3")
+        assert merged[1].subjects == ("a@1",)
+
+    def test_a_sentence_without_subjects_renders_unchanged(self):
+        from deptrail.rotation import Caveat
+
+        assert Caveat("nothing varies here").rendered == "nothing varies here"
+
+    def test_extending_a_sentence_keeps_it_mergeable(self):
+        from deptrail.rotation import Caveat, _extend, merge_caveats
+
+        base = Caveat("history could not be read", ("a@1",))
+        extended = [_extend(base, "— and secrets could not be listed"),
+                    _extend(Caveat("history could not be read", ("b@2",)),
+                            "— and secrets could not be listed")]
+        # The suffix has to land on the text, not between the subjects and it, or two
+        # packages reaching the same dead end would no longer merge.
+        assert len(merge_caveats(extended)) == 1
+        assert merge_caveats(extended)[0].subjects == ("a@1", "b@2")

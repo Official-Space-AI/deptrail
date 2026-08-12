@@ -159,9 +159,9 @@ def _as_dict(report: OrgReport, advisory: Advisory | None) -> dict:
         "not_judged": list(report.unread),
         # The dedicated keys above already carry these lines; repeating them here made
         # a JSON consumer count every gap twice while the text and HTML reports showed
-        # it once.
-        "caveats": [c for c in [*report.notes, *report.rotation_notes]
-                    if c not in set(report.unread) | set(report.incomplete)],
+        # it once. The subtraction lives on the report so all three renderers do it
+        # the same way.
+        "caveats": list(report.caveats),
     }
     if advisory is not None:
         payload["advisory"].update({
