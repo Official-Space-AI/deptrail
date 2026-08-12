@@ -868,10 +868,122 @@ The "already shown above" subtraction that all three renderers each computed dif
 (and which the JSON output once got wrong, counting every gap twice) moved onto the
 report as one `OrgReport.caveats`.
 
-**Verification**: 306 tests. Measured before and after at both scales — 6 of 21 repeated
-lines and a 3,313-character line became 0 and 138 (the longest remaining line is an
-unfolded timeline entry). Eight mutations were applied one at a time — removing each
-`merge_caveats` call, restoring the `elif`, dropping the subjects from the rendered line,
-moving the sentence extension outside the text, removing the package name from a subject,
-and removing the folding — and all eight were caught by a failing test. Every assertion
-in the demo workflow was replayed locally, including the two greps that read caveat text.
+**Verification**: measured before and after at both scales — 6 of 21 repeated lines and a
+3,313-character line became 0 and 138 (the longest remaining line is an unfolded timeline
+entry). Eight mutations were applied one at a time — removing each `merge_caveats` call,
+restoring the `elif`, dropping the subjects from the rendered line, moving the sentence
+extension outside the text, removing the package name from a subject, and removing the
+folding — and all eight were caught by a failing test. Every assertion in the demo
+workflow was replayed locally, including the two greps that read caveat text.
+
+Those eight were the mutations *I* thought to try, and E20 is what happened when the
+reviews tried thirty-nine.
+
+## E20 — Is "every gate mutation-checked" a claim or a measurement?
+
+**Assumption**: E19's fix was verified. Eight mutations had been applied to the lines the
+fix rested on and all eight failed a test, so the guards were in place.
+
+**Method**: three reviews ran against the same commit with different lenses — correctness,
+robustness at the edges, and test quality plus consumer contract. The third was asked to
+establish by mutation whether the new tests guard what they claim, and to look for
+pre-existing tests that now pass by accident because the sentences were reworded. It
+applied thirty-nine.
+
+**Result**: **ten survived.** The eight I chose were the eight I already believed were
+guarded — the set was shaped by my own model of the change, which is exactly the model a
+mutation test is supposed to check from outside.
+
+Two of the survivors made E19's own headline claims vacuous:
+
+*The entire HTML half of the fix was unguarded.* Reverting `report.py` to
+`if unnamed and not items:` left all 306 tests green while a repository whose secret
+listing was refused vanished from the HTML rotation section and the banner claimed
+`1 credential(s) to rotate`. E19 said "restoring the `elif`" was among the eight caught —
+true of the terminal renderer, and the HTML file is the artifact the composite action
+forwards.
+
+*The folding test could not fail.* It imported `BODY_WIDTH` from the module under test and
+asserted against it, so widening the constant to 100000 kept the test green with the 3.3 kB
+line restored. It is now pinned to a literal 96, with the duplication marked deliberate.
+
+And its fixture could not have caught the real case anyway: it built its report from an
+`unnamed` caveat, whose prefix is a fixed 24 characters. The correctness review measured
+what a real one does — a repository name and a secret name, neither adversarial:
+
+```
+  [CONFIRMED  ] platform-payments-service: AWS_SECRET_ACCESS_KEY_PRODUCTION [REPO_WIDE] (run …) — .github/workflows/deploy.yml
+                passes `secrets: inherit` (covers chalk@5.6.1, debug@4.4.2)
+```
+
+149 columns against a documented 96. A prefix that leaves less than 32 columns now takes a
+line of its own. The identity line can still exceed the width, and that is a real trade
+rather than an oversight: you cannot promise 96 columns *and* promise never to split a
+repository or secret name, and a responder greps the second one.
+
+The remaining survivors, all now pinned: `reason` keeping only the first cause (E19's
+fixture merges to exactly *one* cause holding three subjects, so it could not see the
+truncation it was written to prevent); JSON `caveats` as a superset **and** as a subset of
+the truth, in both directions, because the fixture compared two empty lists;
+`break_long_words=False` (an 89-character monorepo lockfile path is split mid-token without
+it, breaking the "greppable" promise the docs make); first-appearance subject order (the
+fixture was already in sorted order, so `sorted()` was a no-op); and subject-before-sentence
+layout, which the README states as fact.
+
+**A 6.7× slowdown, introduced by the fix.** The robustness review timed the shape E19 calls
+realistic and found `render_report` had gone from 6.6 s to 44.5 s at 180 packages × 50
+lockfiles. Two causes, both in the change: `_rotate_summary(report)` re-derived
+`rotation_items` — an incremental merge quadratic in the items — twice more than necessary,
+taking one render from computing it once to three times; and `merge_caveats` tested
+membership against a growing list where the code it replaced used `dict.fromkeys`. Counting
+the recomputations is the crisp check:
+
+```
+eabedd4 : one render_report() recomputes {'rotation_items': 1}
+E19     : one render_report() recomputes {'rotation_items': 3}
+E20     : one render_report() recomputes {'rotation_items': 1}
+```
+
+Normally performance is a follow-up issue here, not a merge blocker. This one was not,
+because the change's whole purpose is the report a responder reads during an incident, and
+44 seconds to produce it undoes the point. End to end, 180 packages × 50 lockfiles × 8
+secrets:
+
+| shape | `eabedd4` | after E20 |
+|---|---|---|
+| distinct per-package reasons (the common case) | 54.4 s, 6.1 MB | 9.4 s, 1.5 MB |
+| one shared repo-wide reason (main's best case) | 0.18 s, 925 B | 0.38 s, 29.8 KB |
+
+The second row is the honest half: on the shape that favours the old code it is twice as
+slow, spending 0.2 s to name the 180 packages that implicated each credential — which
+`eabedd4` discarded.
+
+**Changes.** Ten mutations pinned by new tests; the long-prefix guard; `merge_caveats`
+membership through a dict; `_rotate_summary` taking the values instead of the report; and
+two API hazards closed that no scan can reach but a caller can — `RotationItem.causes` lost
+its default, because an item with no cause renders as a credential on a checklist with the
+reason missing, and an empty body now produces no line rather than a blank one *inside* a
+section.
+
+Two things the reviews found that were **not** regressions and are recorded rather than
+fixed: the CI-retention caveat still bakes a per-package timestamp into its prose and so
+still prints once per package (issue #33 — the useful merged form is a single earliest
+instant, which makes it a semantics change), and a lockfile path containing U+202E survives
+unescaped in the HTML report exactly as it did before this change.
+
+**Verification**: 317 tests. Twenty mutations re-run in a throwaway copy of the tree, **all
+twenty caught** — including the two that survived the first re-run, whose tests turned out
+to be passing for the wrong reason a second time. The demo workflow's eight greps and nine
+exit-code expectations were replayed after each round, plus a check that no rendered section
+contains a stray blank line.
+
+**What this changes about the process.** Two rules earned by measurement, not by argument:
+
+- **A mutation set I write is a test of my own model, not of the code.** Every one of the
+  ten survivors was in a place I had not thought to doubt. Mutation testing has to be
+  handed to something that did not write the fix.
+- **Run mutations in a copy.** These ran against the working tree, and the robustness
+  review — reading the same files at the same time — saw `reason` briefly return
+  `causes[0]` and had to re-measure everything against a clean clone. It correctly reported
+  that as someone else's in-flight state rather than as a defect, but the contamination was
+  avoidable.

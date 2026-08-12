@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 from datetime import datetime, timezone
+from html import escape
 from pathlib import Path
 
 import pytest
@@ -1050,3 +1051,194 @@ class TestCaveatMerging:
         # packages reaching the same dead end would no longer merge.
         assert len(merge_caveats(extended)) == 1
         assert merge_caveats(extended)[0].subjects == ("a@1", "b@2")
+
+
+class TestEveryRendererAgrees:
+    """The text report, the HTML file and the JSON payload must say the same thing.
+
+    Each of them used to compute "what is already shown above" itself, and each drifted:
+    the JSON counted every gap twice, and the HTML kept the `elif` that hides a
+    repository's repo-wide risk. The HTML file is the artifact the composite action
+    forwards, so a gap there is the one a reader is most likely to meet.
+    """
+
+    @pytest.fixture
+    def mixed(self, tmp_path, three):
+        """All three secret outcomes at once, which is what separates the keys.
+
+        One repo lists its secrets, one's listing is refused, and one holds none. The
+        third is what makes `caveats` non-empty from a *rotation* note rather than an
+        org-level one — without it, asserting equality against `report.caveats` was
+        comparing two empty lists and could not see a renderer that drops the
+        rotation-derived half.
+        """
+        named = make_multi_repo(tmp_path, "r2")
+        unlistable = make_multi_repo(tmp_path, "web")
+        empty = make_multi_repo(tmp_path, "docs")
+
+        def secrets(path: Path, name: str) -> tuple[str, ...]:
+            if name == "web":
+                raise RuntimeError("403: admin scope required")
+            return () if name == "docs" else ("AWS_KEY",)
+
+        return scan_organization([("r2", named), ("web", unlistable), ("docs", empty)],
+                                 three, runs=no_runs, secrets=secrets)
+
+    def test_html_shows_the_unlistable_repo_beside_the_named_credential(self, mixed):
+        from deptrail.report import render_html
+
+        html = render_html(mixed)
+        rotate = html.split("<h2>Rotate</h2>")[1].split("<h2>")[0]
+        assert "could not be named" in rotate
+        assert "web" in rotate
+        # The banner is the first thing a reader sees, so it must not present the
+        # credentials that could be named as the whole job.
+        banner = html.split("class='banner'")[1].split("</p>")[0]
+        assert "1 credential(s) to rotate" in banner
+        assert "1 repository to rotate broadly" in banner
+
+    def test_html_caveats_do_not_repeat_the_rotate_section(self, mixed):
+        from deptrail.report import render_html
+
+        html = render_html(mixed)
+        for line in mixed.unnamed_rotations:
+            assert html.count(escape(line)) == 1, line
+
+    def test_json_caveats_are_exactly_the_reports_caveats(self, mixed):
+        from deptrail.cli import _as_dict
+
+        payload = _as_dict(mixed, None)
+        # Equality in both directions: a superset double-counts every gap, a subset
+        # silently drops the caveats that came from the rotation scan.
+        assert payload["caveats"] == list(mixed.caveats)
+        assert set(payload["caveats"]).isdisjoint(payload["rotate_unnamed"])
+        assert set(payload["caveats"]).isdisjoint(payload["not_judged"])
+        assert set(payload["caveats"]).isdisjoint(payload["incomplete_view"])
+        assert payload["rotate_unnamed"], "the fixture must have an unnamed rotation"
+        # Non-vacuous in the other direction too: at least one caveat must come from
+        # the rotation scan, or the equality above holds for two empty lists.
+        assert any("holds no secrets" in c for c in payload["caveats"]), payload["caveats"]
+
+    def test_a_credential_keeps_every_distinct_reason_it_was_implicated_by(self):
+        from deptrail.grading import Grade as G
+        from deptrail.org import OrgReport
+        from deptrail.rotation import Caveat, RepoRotation, RotationItem
+
+        # Two *different* sentences about one secret. The three-package fixture merges
+        # to a single cause holding three subjects, so it cannot see a renderer that
+        # keeps only the first cause — and dropping the rest is the truncation this
+        # change exists to remove.
+        from_ci = RotationItem(repo="api", secret="K", scope=Scope.WORKFLOW, grade=G.CONFIRMED,
+                               causes=(Caveat("named in ci.yml at deadbeef", ("chalk@5.6.1",)),),
+                               run_ids=("1",))
+        from_local = RotationItem(repo="api", secret="K", scope=Scope.DEVELOPER, grade=G.POSSIBLE,
+                                  causes=(Caveat("pinned with no implicated run — "
+                                                 "investigate that machine", ("debug@4.4.2",)),))
+        report = OrgReport(advisory_id="x", advisory_name="x",
+                           rotations=[RepoRotation(repo="api", items=[from_ci, from_local])])
+        merged, = report.rotation_items
+        assert len(merged.causes) == 2
+        assert "named in ci.yml" in merged.reason
+        assert "investigate that machine" in merged.reason
+        assert "chalk@5.6.1" in merged.reason and "debug@4.4.2" in merged.reason
+        # And both reach the report. Compared word by word, because the renderer folds
+        # the cell across lines and the raw string is not a substring of the output.
+        rendered = " ".join(render_report(report).split())
+        assert " ".join(merged.reason.split()) in rendered
+
+
+class TestFoldingHoldsItsPromise:
+    """Folding is a promise about the output's width and about what survives in it.
+
+    Both halves need pinning to a literal. The width assertion used to import
+    `BODY_WIDTH` from the module it was testing, so widening the constant to 100000
+    left the test green with the 3.3 kB line restored.
+    """
+
+    WIDTH = 96  # deliberately duplicated: a test that reads the constant tests nothing
+
+    def _report(self, repo: str, secret: str, text: str, subjects: tuple[str, ...]):
+        from deptrail.grading import Grade as G
+        from deptrail.org import OrgReport
+        from deptrail.rotation import Caveat, RepoRotation, RotationItem
+
+        item = RotationItem(repo=repo, secret=secret, scope=Scope.REPO_WIDE, grade=G.CONFIRMED,
+                            causes=(Caveat(text, subjects),), run_ids=("18234567890",))
+        return OrgReport(advisory_id="x", advisory_name="x",
+                         rotations=[RepoRotation(repo=repo, items=[item])])
+
+    def test_the_constant_matches_the_documented_width(self):
+        from deptrail.org import BODY_WIDTH
+
+        assert BODY_WIDTH == self.WIDTH, "docs/rotation.md states 96 columns"
+
+    def test_body_text_is_folded_even_under_a_long_identity(self):
+        report = self._report(
+            "platform-payments-service", "AWS_SECRET_ACCESS_KEY_PRODUCTION",
+            "deploy.yml passes `secrets: inherit`", ("chalk@5.6.1", "debug@4.4.2"))
+        lines = render_report(report).splitlines()
+        # The identity line may be as long as the names in it; every line carrying
+        # folded body text must hold the width. Ordinary repo and secret names used
+        # to push the first line to 149 columns.
+        body = [line for line in lines if line.startswith(" " * 16)]
+        assert body, "the reason must have been folded onto a continuation line"
+        assert max(len(line) for line in body) <= self.WIDTH
+        assert "AWS_SECRET_ACCESS_KEY_PRODUCTION" in render_report(report)
+        # And the identity keeps the line to itself. Asserting only on the folded
+        # continuation lines could not see the body's first word riding along on an
+        # over-long first line, which is what textwrap does with a full indent.
+        identity, = [line for line in lines if "AWS_SECRET_ACCESS_KEY_PRODUCTION" in line]
+        assert identity.rstrip().endswith("—"), identity
+        assert "deploy.yml" not in identity
+
+    def test_a_long_token_is_never_split(self):
+        path = "services/frontend/packages/design-system/components/vendor/package-lock.json"
+        report = self._report("api", "K", f"pinned in {path}, and no CI run was implicated",
+                              ("chalk@5.6.1",))
+        text = render_report(report)
+        # The doc promises a responder can grep the saved output. Breaking a long
+        # word would fold the width down at the cost of the thing being looked for.
+        assert path in text
+        assert "package-lock.json" in text
+
+    def test_nothing_to_say_produces_no_line_at_all(self):
+        from deptrail.org import _folded
+
+        # Not reachable from a scan today — every caveat is repo-prefixed, so its body
+        # is never empty. Guarded anyway because the failure is silent in a specific
+        # way: a blank line lands *inside* a section, and this project reads its own
+        # terminal output as blank-line-delimited sections.
+        assert _folded("  ", "", " " * 4) == []
+        assert _folded("  api: ", "", " " * 4) == ["  api:"]
+
+    def test_every_subject_survives_at_advisory_scale(self):
+        subjects = tuple(f"pkg-{i:03d}@{i}.0.1" for i in range(180))
+        report = self._report("api", "K", "pinned in package-lock.json, and no CI run "
+                              "was implicated", subjects)
+        text = render_report(report)
+        body = [line for line in text.splitlines() if line.startswith(" " * 16)]
+        assert max(len(line) for line in body) <= self.WIDTH
+        for subject in subjects:
+            assert subject in text, subject
+
+
+class TestRenderedShapeIsPinned:
+    def test_subjects_are_listed_in_first_appearance_order(self):
+        from deptrail.rotation import Caveat, merge_caveats
+
+        # Ordered so that sorting would change it: a fixture already in sorted order
+        # cannot tell first-appearance from `sorted()`.
+        merged, = merge_caveats([Caveat("one sentence", ("zeta@9.0.0",)),
+                                 Caveat("one sentence", ("alpha@1.0.0",)),
+                                 Caveat("one sentence", ("mu@5.0.0",))])
+        assert merged.subjects == ("zeta@9.0.0", "alpha@1.0.0", "mu@5.0.0")
+        assert merged.rendered.endswith("(covers zeta@9.0.0, alpha@1.0.0, mu@5.0.0)")
+
+    def test_the_sentence_comes_before_the_subjects(self):
+        from deptrail.rotation import Caveat
+
+        rendered = Caveat("what is true", ("a@1", "b@2")).rendered
+        # README states each line ends with the versions it covers, and the ordering
+        # is the whole reason the sentence is not buried at 180 subjects.
+        assert rendered.startswith("what is true")
+        assert rendered == "what is true (covers a@1, b@2)"
