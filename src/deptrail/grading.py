@@ -60,7 +60,7 @@ from .history import (
 # Commands that unambiguously install this ecosystem's dependencies. Only these
 # can raise a grade to CONFIRMED: a step merely named "Install" may be
 # installing anything, and guessing would assert an execution that never
-# happened (measured against real workflows — see docs/experiments.md).
+# happened (measured against real workflows).
 INSTALL_COMMANDS = ("npm ci", "npm i ", "npm install", "yarn install", "yarn --frozen",
                     "pnpm install", "pnpm i ", "npm-run-all install")
 # GitHub's default run retention; used only to say "the records for that window
@@ -73,7 +73,7 @@ class ToolFailure(RuntimeError):
 
     Its own type, because wrapping a ``CalledProcessError`` in a plain
     ``RuntimeError`` loses the one fact a caller needs — that retrying may help —
-    and the report then files it as evidence that says nothing (E18).
+    and the report then files it as evidence that says nothing.
     """
 
 

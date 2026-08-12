@@ -16,7 +16,7 @@ repository failed, and the report says which.
 **Fixture lockfiles are set aside, never dropped.** A lockfile under
 ``tests/fixtures`` or ``examples`` is committed data, not a dependency any CI
 installs, and letting it raise credentials for rotation would bury the real items
-(measured on this project's own repository — see ``docs/experiments.md``, E7).
+(measured on this project's own repository).
 Such exposures stay in the report under their own heading with the reason, so a
 human can overrule the classification; they simply do not produce rotation items.
 """
@@ -116,7 +116,7 @@ def _workflows_at(repo: Path, sha: str) -> tuple[str, ...]:
 
     Read at the commit and not at HEAD: a workflow that installed a directory
     during the window and was deleted afterwards is exactly the evidence that
-    matters, and looking at today's tree loses it (E14).
+    matters, and looking at today's tree loses it.
     """
     try:
         out = _git_text(repo, "ls-tree", "-r", "--name-only", sha,
@@ -132,7 +132,7 @@ def _is_installed_unread_tree(repo: Path, tree: UnreadTree) -> bool:
     The directory heuristic must lose to evidence here for the same reason it does
     for exposures: an application that really lives under ``examples/`` would
     otherwise be filed away as sample data, and the repository would be cleared on
-    the strength of a directory name (found by review — see E13).
+    the strength of a directory name (found by review).
     """
     if is_probably_installed(tree.path):
         return True
@@ -389,7 +389,7 @@ def scan_organization(repos: Iterable[tuple[str, Path]], plan: QueryPlan, *,
                 for reason in graded.incomplete:
                     # The guard has to test the line it appends: comparing the
                     # unsuffixed text let one gap print once per advisory package,
-                    # which on a real advisory is hundreds of identical lines (E18).
+                    # which on a real advisory is hundreds of identical lines.
                     line = f"{name}: {reason} — accepted with --allow-incomplete-history"
                     if line not in report.notes:
                         report.notes.append(line)

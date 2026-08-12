@@ -138,8 +138,8 @@ the scan could not run at all — a green check must never mean "we could not lo
 - [`docs/grading.md`](docs/grading.md) — what each grade requires, and why
   `POSSIBLE` still means rotate
 - [`docs/rotation.md`](docs/rotation.md) — how the credential list is scoped
-- [`docs/experiments.md`](docs/experiments.md) — every assumption replayed against
-  real repositories, and the bugs that replay found
+- [`docs/ioc-format.md`](docs/ioc-format.md) — how to write an advisory feed, and
+  what a window means
 
 ## Limitations
 

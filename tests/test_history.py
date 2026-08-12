@@ -397,7 +397,7 @@ class TestUnreadableTrees:
 class TestForeignLockfilesOverTime:
     """A lockfile this version cannot parse counts while the window was open,
     and only then: holding one committed years earlier against a project denied
-    it an all-clear forever (E13)."""
+    it an all-clear forever."""
 
     def write(self, repo, path, body, date):
         target = repo / path
@@ -464,7 +464,7 @@ class TestForeignLockfilesOverTime:
         assert [e.version for e in finding.exposures] == ["5.6.1"]
 
 class TestPrecedenceAndDiagnostics:
-    """Third review round (E14): precedence was read off the wrong event stream,
+    """Precedence was read off the wrong event stream,
     and a harmless observation was being treated as lost evidence."""
 
     def write(self, repo, path, body, date):

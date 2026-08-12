@@ -257,7 +257,7 @@ class TestRunHistoryHorizon:
 
 
 class TestInstallDetection:
-    """Workflow-based install detection, shaped by E4 (see docs/experiments.md)."""
+    """Workflow-based install detection, shaped by replaying real workflows."""
 
     def _repo(self, tmp_path, files: dict[str, str]):
         repo = tmp_path / "wf"
