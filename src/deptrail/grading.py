@@ -439,7 +439,9 @@ def _coverage_doubt(pages: list, runs: list, announced: object,
     # so a range whose upper bound is already past cannot gain one, and a deletion lowers
     # the count and is caught above. A single page cannot be shifted at all. Anything else
     # — several pages reaching up to today — is the case that cannot be certified.
-    if len(pages) > 1 and not (until and until.date() < datetime.now(timezone.utc).date()):
+    stable = until and until.astimezone(timezone.utc).date() < datetime.now(
+        timezone.utc).date()
+    if len(pages) > 1 and not stable:
         return (f"{len(pages)} pages were read over a range that reaches the present, and "
                 "offset pagination gives no snapshot — a run created between two requests "
                 "shifts the rest and can hide one without changing any count")
@@ -457,8 +459,12 @@ def runs_from_github(repo_slug: str, *, since: datetime | None = None,
     """
     query = "per_page=100"
     if since or until:
-        lo = since.date().isoformat() if since else "*"
-        hi = until.date().isoformat() if until else "*"
+        # Normalised to UTC before the date is taken. `created=` filters by date, and a
+        # bound written in another offset lands on a different day: a window opening at
+        # 2025-11-25T01:00+09:00 is 2025-11-24 in UTC, and asking from the 25th skipped the
+        # first hours of the window it was meant to cover.
+        lo = since.astimezone(timezone.utc).date().isoformat() if since else "*"
+        hi = until.astimezone(timezone.utc).date().isoformat() if until else "*"
         query += f"&created={lo}..{hi}"
     try:
         raw = subprocess.run(

@@ -85,45 +85,24 @@ def is_probably_installed(lockfile_path: str) -> bool:
     return not any(part.lower() in NON_DEPLOYED_DIRS for part in directories)
 
 
-# Comments are stripped before anything is matched: a commented-out install is not an
-# install, and `# - run: npm ci --prefix examples/app` read as one.
-COMMENT = re.compile(r"(?m)(?<!\$)#.*$")
-# Keys that scope a step to a directory. Presence is not enough on its own — the step has
-# to install something too — but it is what makes the directory the step's subject.
-SCOPES_TO_DIR = re.compile(
-    r"working-directory\s*:|cache-dependency-path\s*:|--prefix|(?:^|\s)-C\s"
-    r"|(?:^|;|&)\s*cd\s")
-# A package manager is being invoked. Paired with an install verb as a separate token this
-# covers the forms `INSTALL_COMMANDS` misses because the flags come first —
-# `npm --workspace examples/app install`, `pnpm -F examples/app install`.
-PACKAGE_MANAGER = re.compile(r"(?:^|[\s;&|])(?:npm|yarn|pnpm|bun)(?:$|[\s;&|])")
-INSTALL_VERB = re.compile(r"(?:^|\s)(?:install|ci|add)(?:$|\s)")
-# The workflow hands the work to something this tool does not read: a local composite
-# action, a script in the repository, or a build tool. None of these can be resolved here,
-# so none of them may be read as "this tree is not installed" — and that is a property of
-# the whole file, not of the step the directory happens to appear in, because the thing
-# they delegate to can install anything anywhere.
-DELEGATES = re.compile(
-    r"uses:\s*[\"']?\./"
-    r"|(?:^|[\s;&|])(?:bash|sh|make|just|task)\s"
-    r"|(?:^|[\s;&|])\./[\w./-]+")
-# A scoping key whose value is an expression: the directory it names is decided at run
-# time, so no reading of this file can rule the tree out. `${{ }}` on its own is not this
-# — nearly every workflow interpolates a secret — so only the keys that select a directory
-# count.
-SCOPE_IS_DYNAMIC = re.compile(
-    r"(?:working-directory\s*:|cache-dependency-path\s*:|--prefix|(?:^|;|&)\s*cd\s)"
-    r"[^\n]*\$\{\{")
-
-
 class Installed(str, Enum):
     """Whether a workflow installs a tree — and the third answer, which is not "no".
 
-    A directory name in a workflow answers neither question on its own. Forced into a
-    boolean this was wrong in both directions at once: `"test"` inside `ubuntu-latest`
-    made a fixture look installed, while a real `npm ci` reached through a composite
-    action or a matrix variable made an installed tree look like test data. The first
-    over-reports, which costs a responder time. The second is a false clean.
+    Forced into a boolean this was wrong four times, in both directions. A bare substring
+    made `"test"` match `ubuntu-latest` and a fixture look installed; requiring an install
+    command on the same line made a real ``npm ci --prefix examples/app`` reached through a
+    composite action look like test data. Every attempt to decide *whether a workflow
+    installs a directory* by pattern-matching YAML was wrong somewhere, in both directions
+    at once by the fourth try — an install can arrive through a composite action, a wrapper
+    script, a matrix variable, `npm i`, a bare `yarn`, or a reusable workflow in another
+    repository, and a directory name can appear in a step title, a runner label or an
+    echoed string.
+
+    So that question is not asked here. What is asked is narrower and answerable: does a
+    workflow at that commit **name** this directory as a path? If it does and a run is
+    implicated, the tree is installed. If it does and no run is implicated, the answer is
+    ``UNKNOWN`` — which is the case that used to be silently "no", and that silence is
+    what deleted a finding when CI evidence weakened.
     """
 
     YES = "YES"
@@ -132,112 +111,31 @@ class Installed(str, Enum):
 
 
 def _mentions(text: str, directory: str) -> bool:
-    """Whether ``directory`` appears as a path, not as the start of a longer word.
+    """Whether the text names this directory as a path, rather than inside another word.
 
-    `examples/app` must not match `examples/application`, and `test` must not match
-    `ubuntu-latest` — the boundary is what makes it a path rather than a substring.
+    Compared as path segments, not by substring or by a boundary regex. Both of those were
+    wrong on real input: `"test"` matched `ubuntu-latest`, and a regex boundary still
+    matched `vendor/examples/app` and `examples/app.bak` when the tree was `examples/app`.
     """
-    return re.search(rf"(?<![\w.-]){re.escape(directory)}(?![\w-])", text) is not None
-
-
-def _blocks(body: str) -> list[str]:
-    """The workflow cut so a directory and a command have to share one step.
-
-    Without this, `working-directory: examples/app` in one step and `npm ci` in another
-    read as an install of that directory. There is no YAML parser here — this project
-    ships no runtime dependencies — so blocks are cut at the `- ` list markers, which is
-    where a step begins, and a multi-line `run: |` body stays inside its own step.
-    """
-    blocks, current = [], []
-    for line in body.splitlines():
-        if re.match(r"\s*-\s", line) and current:
-            blocks.append("\n".join(current))
-            current = []
-        current.append(line)
-    if current:
-        blocks.append("\n".join(current))
-    return blocks
-
-
-def _job_scope_lines(body: str) -> list[str]:
-    """Lines that scope a job rather than a step: a `defaults:` block and cache keys.
-
-    Taken as lines rather than blocks because `cache-dependency-path` sits inside a `with:`
-    on the step that sets Node up, while the install it feeds is a later step.
-    """
-    return [line for line in body.splitlines()
-            if re.search(r"defaults\s*:|working-directory\s*:|cache-dependency-path\s*:",
-                         line)]
-
-
-def _installs_here(block: str, directory: str) -> Installed:
-    """What one step says about installing in ``directory``."""
-    if not _mentions(block, directory):
-        return Installed.NO
-    if any(command in block for command in INSTALL_COMMANDS):
-        return Installed.YES
-    if PACKAGE_MANAGER.search(block):
-        # `npm --workspace <dir> install` puts the flags before the verb, so the literal
-        # command list misses it. An invocation with no install verb at all — `npm test`,
-        # `npm run build` — is a step that needs the tree installed but does not install
-        # it, and says nothing here.
-        return Installed.YES if INSTALL_VERB.search(block) else Installed.NO
-    return Installed.NO
-
-
-def _workflow_installs_dir(repo: Path, sha: str, paths: tuple[str, ...],
-                           directory: str) -> Installed:
-    """Whether any workflow at ``sha`` installs dependencies in ``directory``.
-
-    ``UNKNOWN`` where a workflow could install it through something unreadable. That
-    answer is not "no": treating it as one is how a real `npm ci --prefix examples/app`
-    reached through a composite action ended up filed away as test data.
-    """
-    if not directory or directory == ".":
-        return Installed.NO
-    verdict = Installed.NO
-    for path in paths:
-        raw = _text_at(repo, sha, path)
-        if raw is None:
-            # A workflow we cannot read cannot clear the tree either.
-            verdict = Installed.UNKNOWN
+    wanted = PurePosixPath(directory)
+    for token in re.findall(r"[\w./-]+", text):
+        candidate = token.strip("'\"").lstrip("./")
+        if not candidate:
             continue
-        body = COMMENT.sub("", raw)
-        # Two keys scope a whole job rather than one step, so the install that honours them
-        # is a different step by construction: `defaults.run.working-directory`, and
-        # `cache-dependency-path`, which names the lockfile an install will use.
-        file_scoped = any(
-            _mentions(line, directory)
-            and ("defaults" in line or "cache-dependency-path" in line
-                 or "working-directory" in line)
-            for line in _job_scope_lines(body))
-        if file_scoped and any(c in body for c in INSTALL_COMMANDS):
-            return Installed.YES
-        for block in _blocks(body):
-            if _installs_here(block, directory) is Installed.YES:
-                return Installed.YES
-        # Checked per file and not per block: what a composite action or a shell script
-        # installs is unknown wherever the directory appears, and a scoping key filled in
-        # at run time could name this tree on any invocation.
-        if DELEGATES.search(body) or SCOPE_IS_DYNAMIC.search(body):
-            verdict = Installed.UNKNOWN
-    return verdict
+        path = PurePosixPath(candidate)
+        if path == wanted or wanted in path.parents:
+            return True
+    return False
 
 
 def _workflow_mentions_dir(repo: Path, sha: str, paths: tuple[str, ...],
                            directory: str) -> bool:
-    """Whether an implicated workflow names this lockfile's directory as a path.
-
-    The broader rule, kept for the case a run *is* implicated: then the whole workflow
-    body is evidence, because something in it demonstrably ran.
-    """
+    """Whether any of these workflows names this lockfile's directory."""
+    if not directory or directory == ".":
+        return False
     for path in paths:
         body = _text_at(repo, sha, path)
-        # Comments are kept here, unlike in the precise rule. That one asks what a step
-        # executes, and a commented-out command executes nothing; this one asks whether the
-        # workflow refers to the directory at all, under evidence that something in it ran
-        # — and "# deploys examples/app" is a person saying it does.
-        if body is not None and directory and _mentions(body, directory):
+        if body is not None and _mentions(body, directory):
             return True
     return False
 
@@ -251,52 +149,66 @@ def _text_at_cached(repo: str, sha: str, path: str) -> str | None:
 
 
 def _text_at(repo: Path, sha: str, path: str) -> str | None:
-    """One blob at one commit, read once — but only when the ref names a fixed object.
+    """One blob at one commit, read once, keyed on a ref that fixes the content.
 
     Uncached, classifying one exposure per lockfile per advisory package re-read every
     workflow every time: 780 git subprocesses and a 12x wall clock on a repository with
     thirty fixture lockfiles, for a byte-identical answer.
 
-    A symbolic ref is not cached, because it does not fix the content: `HEAD` moves, and a
-    long-lived process would keep answering from before it moved.
+    The ref has to be resolved to an object id first. Judging it by shape does not work —
+    a branch may be named ``deadbeef`` — and caching a name that can move means answering
+    from before it moved.
     """
-    if not _is_object_id(sha):
+    resolved = _object_id(repo, sha)
+    if resolved is None:
         try:
             return _git_text(repo, "show", f"{sha}:{path}")
         except GitError:
             return None
-    return _text_at_cached(str(repo), sha, path)
+    return _text_at_cached(str(repo), resolved, path)
 
 
-_OBJECT_ID = re.compile(r"^[0-9a-f]{7,40}$")
+@lru_cache(maxsize=1024)
+def _object_id(repo: Path, ref: str) -> str | None:
+    """The immutable id ``ref`` points at, or ``None`` if it cannot be resolved.
 
-
-def _is_object_id(ref: str) -> bool:
-    return _OBJECT_ID.match(ref) is not None
+    Cached on the pair, which is safe in the direction that matters: a name that moves
+    would be re-resolved by a fresh process, and within one scan the commit under
+    examination does not change. A ref that does not resolve is not cached as an answer.
+    """
+    try:
+        return _git_text(repo, "rev-parse", f"{ref}^{{commit}}").strip() or None
+    except GitError:
+        return None
 
 
 def _classify_tree(repo: Path, graded: GradedExposure) -> Installed:
     """Whether this exposure sits in a tree some workflow would have installed.
 
-    Answered from the repository at that commit, never from the strength of the CI
-    evidence. Whether ``examples/app`` is a real application is a fact about the tree; it
-    does not change because a run record expired. Weakened evidence must weaken a grade,
-    never remove a finding.
+    ``UNKNOWN`` is the answer that was missing. A workflow naming the directory is
+    evidence about the tree; whether that workflow *ran* is evidence about CI, and the two
+    were conflated. So losing a run record used to turn "installed" into "not installed"
+    and delete the finding — measured at exit 0 with ``scan_complete: true`` for a
+    repository whose CI demonstrably installed the malicious version. Weakened evidence
+    must weaken a grade, never remove a finding.
     """
     lockfile = graded.exposure.lockfile_path
     if is_probably_installed(lockfile):
         return Installed.YES
     directory = str(PurePosixPath(lockfile).parent)
     sha = graded.exposure.commit
-    paths = graded.workflow_paths or _workflows_at(repo, sha)
-    answer = _workflow_installs_dir(repo, sha, paths, directory)
-    if answer is not Installed.NO:
-        return answer
-    # Never narrower than before: where a run is implicated, the whole workflow body is
-    # evidence, which is the rule this function has always applied.
+    # Installed only where a run is implicated *and* its own workflow names the directory:
+    # what another workflow does is not evidence about the run that happened.
     if graded.grade is Grade.CONFIRMED and _workflow_mentions_dir(
             repo, sha, graded.workflow_paths, directory):
         return Installed.YES
+    # But any workflow at that commit naming it is enough to withhold a clearance, even one
+    # that did not run here — it could on the next push, and the run records that would
+    # show it are exactly what may be missing. Under stronger CI evidence this tree would
+    # have been kept, so answering "test data" would make the classification a function of
+    # what the runs API happened to return.
+    if _workflow_mentions_dir(repo, sha, _workflows_at(repo, sha), directory):
+        return Installed.UNKNOWN
     return Installed.NO
 
 
@@ -366,6 +278,11 @@ class TimelineEntry:
     evidence: tuple[str, ...]
     run_ids: tuple[str, ...] = ()
     probably_installed: bool = True
+    # Neither installed nor cleared. Kept apart from ``probably_installed`` being False,
+    # which is a statement that nothing installs this tree — the two were the same flag,
+    # so one exposure appeared under "fixture or example trees, not installed by any
+    # workflow" and under "could not classify" at once, and counted toward neither grade.
+    unresolved: bool = False
 
 
 @dataclass
@@ -404,8 +321,18 @@ class OrgReport:
 
     @property
     def set_aside(self) -> tuple[TimelineEntry, ...]:
-        """Exposures in fixture or example trees, kept visible but not rotated."""
-        return tuple(e for e in self.timeline if not e.probably_installed)
+        """Exposures in fixture or example trees, kept visible but not rotated.
+
+        Only those a workflow demonstrably does not install. One it *might* install is a
+        different statement and has its own section.
+        """
+        return tuple(e for e in self.timeline
+                     if not e.probably_installed and not e.unresolved)
+
+    @property
+    def unclassified(self) -> tuple[TimelineEntry, ...]:
+        """Exposures whose tree could be installed by something unreadable."""
+        return tuple(e for e in self.timeline if e.unresolved)
 
     @property
     def rotation_items(self) -> tuple[RotationItem, ...]:
@@ -511,7 +438,11 @@ class OrgReport:
     def worst_grade(self) -> Grade:
         """The strongest grade anywhere in the report, including repos whose
         history could not be read — those carry POSSIBLE with no timeline entry."""
-        grades = [e.grade for e in self.timeline if e.probably_installed]
+        # An exposure that could not be classified counts too: it was found, and nothing
+        # ruled it out. Excluding it left a report whose worst grade was NO_EVIDENCE while
+        # naming a compromised version it had just declined to clear.
+        grades = [e.grade for e in self.timeline
+                  if e.probably_installed or e.unresolved]
         grades += [f.worst_grade for f in self.findings]
         for grade in (Grade.CONFIRMED, Grade.LIKELY, Grade.POSSIBLE):
             if grade in grades:
@@ -593,6 +524,7 @@ def scan_organization(repos: Iterable[tuple[str, Path]], plan: QueryPlan, *,
                     repo=name, package=query.package, exposure=g.exposure,
                     grade=g.grade, evidence=g.evidence, run_ids=g.run_ids,
                     probably_installed=answer is Installed.YES,
+                    unresolved=answer is Installed.UNKNOWN,
                 )
                 for g, answer in classified
             )
