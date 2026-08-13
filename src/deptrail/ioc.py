@@ -22,6 +22,18 @@ time, which is typically hours before removal — and when it is not published, 
 deliberately late bound is the safe error: a wide window over-reports exposure,
 a narrow one hides it.
 
+A window's **start** is derivable and its **end** is not. A registry packument
+keeps ``time[version]`` after the version is unpublished — measured against
+``registry.npmjs.org`` for chalk 5.6.1, debug 4.4.2 and ansi-styles 6.2.2, each
+present in ``time`` and absent from ``versions`` — so the first malicious publish
+is a recorded fact. Nothing anywhere records when the registry stopped serving it.
+So ``window.end`` may be ``null``, meaning "not known to have closed", and that is
+the honest default rather than an edge case. An open end over-reports exposure; a
+guessed closed one hides it, and only one of those errors is recoverable.
+
+``end`` must still be *present*. An omitted key is indistinguishable from a typo,
+and this module infers nothing: writing ``null`` is a decision a reader can see.
+
 Windows are inclusive on both ends and must be written as full ISO-8601
 timestamps with a UTC offset — no bare dates, because deciding which instants a
 published date covers is a judgment that belongs in the feed, visible to whoever
@@ -135,15 +147,19 @@ def _parse_bound(value: object, *, where: str) -> datetime:
     return stamp
 
 
-def _parse_window(raw: object, where: str) -> tuple[datetime, datetime]:
+def _parse_window(raw: object, where: str) -> tuple[datetime, datetime | None]:
+    """One window. ``end: null`` means "not known to have stopped being installable"."""
     _require(isinstance(raw, dict), f"{where}: must be an object")
     window = dict(raw)  # type: ignore[arg-type]
     _reject_unknown(window, _WINDOW_KEYS, where)
     for key in _WINDOW_KEYS:
         _require(key in window, f"{where}: missing {key!r}")
     start = _parse_bound(window["start"], where=f"{where}.start")
-    end = _parse_bound(window["end"], where=f"{where}.end")
-    _require(start <= end, f"{where}: window start is after its end")
+    # Present but null: the feed says the right edge is unknown. Absent is still an
+    # error — a missing key reads the same as a mistyped one.
+    end = (None if window["end"] is None
+           else _parse_bound(window["end"], where=f"{where}.end"))
+    _require(end is None or start <= end, f"{where}: window start is after its end")
     return start, end
 
 
@@ -165,7 +181,7 @@ class Advisory:
     id: str
     name: str
     ecosystem: str
-    window: tuple[datetime, datetime]
+    window: tuple[datetime, datetime | None]
     coverage: str
     packages: tuple[CompromisedPackage, ...]
     sources: tuple[str, ...]
@@ -300,7 +316,7 @@ def parse_advisory(text: str) -> Advisory:
         versions = _versions(raw["versions"], f"{where}.versions")
         pkg_window = _parse_window(raw["window"], f"{where}.window") if "window" in raw else None
         if pkg_window is not None:
-            _require(window[0] <= pkg_window[0] and pkg_window[1] <= window[1],
+            _require(window[0] <= pkg_window[0] and _closes_within(pkg_window[1], window[1]),
                      f"{where}.window: {_fmt_window(pkg_window)} is not inside the advisory "
                      f"window {_fmt_window(window)}; widen the advisory window instead")
         # A package may appear twice only for genuinely different waves, so each
@@ -325,8 +341,22 @@ def parse_advisory(text: str) -> Advisory:
     )
 
 
+def _closes_within(inner: datetime | None, outer: datetime | None) -> bool:
+    """Whether one window's end stays inside another's.
+
+    An open end is the *latest* possible end, so it fits inside another open end and
+    inside nothing else: a package window that never closes cannot sit inside an
+    advisory window that does, because it would claim exposure past the advisory's
+    own edge.
+    """
+    if outer is None:
+        return True
+    return inner is not None and inner <= outer
+
+
 def _fmt_window(window: tuple[datetime, datetime]) -> str:
-    return f"[{window[0].isoformat()} .. {window[1].isoformat()}]"
+    end = "open" if window[1] is None else window[1].isoformat()
+    return f"[{window[0].isoformat()} .. {end}]"
 
 
 def _package_name(raw: object, where: str) -> str:
@@ -448,7 +478,10 @@ def bundled_feeds() -> list[str]:
 WINDOW_NOTE = (
     "window is the interval the malicious artifact was INSTALLABLE — first malicious "
     "publish to registry removal — not the interval the attacker was active. The two "
-    "differ, and using the second makes every scan report CLEAN. See docs/ioc-format.md."
+    "differ, and using the second makes every scan report CLEAN. 'end': null means the "
+    "removal time is unknown, which is the usual case: no registry records it. Leave it "
+    "null rather than guessing — a wide window over-reports, a narrow one hides. "
+    "See docs/ioc-format.md."
 )
 
 TEMPLATE_HINTS = {
@@ -483,7 +516,12 @@ def advisory_template(*, package: str | None = None, versions: tuple[str, ...] =
         "coverage": "partial",
         "window": {
             "start": start or f"{PLACEHOLDER}: 2025-11-24T00:00:00+00:00",
-            "end": end or f"{PLACEHOLDER}: 2025-11-26T23:59:59+00:00",
+            # `null`, not a placeholder. A placeholder here asks the author for a number
+            # nothing records, and the number nearest to hand is the advisory's
+            # publication time — typically hours before the artifact actually stopped
+            # being served, which is the one error that hides exposure. Left null the
+            # template still fails validation on its other blanks.
+            "end": end,
         },
         "packages": [{
             "name": package or PLACEHOLDER,

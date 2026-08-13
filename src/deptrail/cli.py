@@ -33,7 +33,7 @@ import errno
 import json
 import subprocess
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .demo import advisory_path, build, runs_provider, secrets_provider
@@ -177,8 +177,11 @@ def _as_dict(report: OrgReport, advisory: Advisory | None) -> dict:
     }
     if advisory is not None:
         payload["advisory"].update({
+            # `null` is the value, not a missing key: a consumer must be able to tell
+            # "not known to have closed" from "we forgot to say".
             "window": {"start": advisory.window[0].isoformat(),
-                       "end": advisory.window[1].isoformat()},
+                       "end": (None if advisory.window[1] is None
+                               else advisory.window[1].isoformat())},
             "coverage": advisory.coverage,
             "sources": list(advisory.sources),
             "packages": [{"name": p.name, "versions": list(p.versions)}
@@ -253,9 +256,16 @@ def _clone_org(org: str, workdir: Path, *, limit: int,
     return repos, errors, transient
 
 
-def _github_runs(slug_of, window: tuple[datetime, datetime], *, annotate: bool):
-    """CI history for a repository, restricted to the advisory's window."""
+def _github_runs(slug_of, window: tuple[datetime, datetime | None], *, annotate: bool):
+    """CI history for a repository, restricted to the advisory's window.
+
+    An open upper bound means the artifact is not known to have stopped being
+    installable, so the runs that matter run up to now: bounding the query at the
+    window's end would collect nothing for the whole period after it.
+    """
     since, until = window
+    if until is None:
+        until = datetime.now(timezone.utc)
 
     def provider(path: Path, name: str) -> RunHistory:
         history = runs_from_github(slug_of(name),
@@ -399,8 +409,13 @@ def cmd_advisory_validate(args: argparse.Namespace) -> int:
         return EXIT_BAD_INPUT
     start, end = advisory.window
     print(f"{advisory.id} — {advisory.name}")
-    print(f"  window     {start.isoformat()} → {end.isoformat()}"
-          f"  ({(end - start).days}d {((end - start).seconds // 3600)}h, inclusive)")
+    if end is None:
+        print(f"  window     {start.isoformat()} → still open"
+              "  (no removal time is recorded anywhere, so exposure cannot be "
+              "ruled out after this)")
+    else:
+        print(f"  window     {start.isoformat()} → {end.isoformat()}"
+              f"  ({(end - start).days}d {((end - start).seconds // 3600)}h, inclusive)")
     print(f"  coverage   {advisory.coverage}"
           + ("" if advisory.coverage == "complete"
              else " — absence of exposure will not be provable"))

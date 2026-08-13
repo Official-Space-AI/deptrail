@@ -119,19 +119,36 @@ class Commit:
 
 @dataclass(frozen=True)
 class WindowQuery:
-    """The minimal question an advisory asks: package, bad versions, attack window."""
+    """The minimal question an advisory asks: package, bad versions, attack window.
+
+    ``window_end`` is ``None`` when the artifact is **not known to have stopped
+    being installable**. That is the ordinary case, not an edge one: a registry
+    packument keeps ``time[version]`` after a version is unpublished but records
+    no removal time anywhere, so the right edge of the window cannot be computed
+    and can only be asserted. ``None`` says so, and every comparison against it
+    treats the window as still open — which over-reports rather than hides, the
+    safe direction for this tool.
+    """
 
     package: str
     malicious_versions: frozenset[str]
     window_start: datetime
-    window_end: datetime
+    window_end: datetime | None
 
     def __post_init__(self) -> None:
         for dt in (self.window_start, self.window_end):
+            if dt is None:
+                continue
             if dt.tzinfo is None or dt.utcoffset() is None:
                 raise ValueError("attack window datetimes must be timezone-aware")
-        if self.window_start > self.window_end:
+        if self.window_end is not None and self.window_start > self.window_end:
             raise ValueError("attack window start is after its end")
+
+    def covers(self, moment: datetime) -> bool:
+        """Whether an instant falls in the window. An open end covers everything after."""
+        if moment < self.window_start:
+            return False
+        return self.window_end is None or moment <= self.window_end
 
 
 @dataclass(frozen=True)
@@ -366,7 +383,7 @@ def _existed_during(repo: Path, path: str, query: WindowQuery,
                 if successor.sha in forward and not here(successor.sha):
                     end = successor.late
                     break
-            if commit.early > query.window_end:
+            if query.window_end is not None and commit.early > query.window_end:
                 continue
             if end is not None and end <= query.window_start:
                 continue
@@ -562,7 +579,8 @@ def _scan_ref_chain(repo: Path, path: str, ref: str, chain: list[Commit],
         since = commit.early
 
         # Half-open [since, until) against the inclusive window.
-        if since > query.window_end or (until is not None and until <= query.window_start):
+        if ((query.window_end is not None and since > query.window_end)
+                or (until is not None and until <= query.window_start)):
             continue
         # Only a commit dated before its own parent is skewed; two commits on
         # parallel branches appearing out of date order in a topological listing

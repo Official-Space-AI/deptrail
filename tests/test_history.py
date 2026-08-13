@@ -659,3 +659,87 @@ class TestWindowQueryValidation:
     def test_inverted_window_rejected(self):
         with pytest.raises(ValueError):
             WindowQuery("x", frozenset({"1"}), WINDOW.window_end, WINDOW.window_start)
+
+
+OPEN_WINDOW = WindowQuery(
+    package="chalk",
+    malicious_versions=frozenset({"5.6.1"}),
+    window_start=datetime.fromisoformat("2025-11-24T00:00:00+00:00"),
+    window_end=None,
+)
+
+
+class TestOpenUpperBound:
+    """A closed right edge is an assertion; believing it can clear a live repository.
+
+    No registry records when a malicious version stopped being served — measured
+    against `registry.npmjs.org`, where an unpublished version keeps its
+    `time[version]` and gains no removal timestamp. So `end: null` is the honest
+    default, and these tests hold the two verdicts it changes (#23).
+    """
+
+    def test_a_pin_that_began_after_a_closed_window_reads_as_clean(self, tmp_path):
+        repo = make_repo(tmp_path, "late", [
+            ("2025-11-20T10:00:00+00:00", None),
+            ("2025-12-10T10:00:00+00:00", "5.6.1"),
+        ])
+        # The closed window says the artifact was already gone, so this pin could not
+        # have installed it.
+        assert scan_repo(repo, WINDOW).verdict is Verdict.CLEAN
+
+    def test_the_same_repository_is_exposed_when_the_window_never_closed(self, tmp_path):
+        repo = make_repo(tmp_path, "late", [
+            ("2025-11-20T10:00:00+00:00", None),
+            ("2025-12-10T10:00:00+00:00", "5.6.1"),
+        ])
+        finding = scan_repo(repo, OPEN_WINDOW)
+        # Nobody recorded a removal, so "it was gone by December" is a claim, not a
+        # fact — and the tool must not clear a repository on a claim.
+        assert finding.verdict is Verdict.EXPOSED
+        assert [e.version for e in finding.exposures] == ["5.6.1"]
+
+    def test_an_open_window_still_excludes_what_ended_before_it_opened(self, tmp_path):
+        repo = make_repo(tmp_path, "early", [
+            ("2025-10-01T10:00:00+00:00", "5.6.1"),
+            ("2025-10-05T10:00:00+00:00", "5.6.0"),
+        ])
+        # Open on the right, not on the left: a pin that was gone before the malicious
+        # version existed is not exposure, and an open end must not turn into "always".
+        assert scan_repo(repo, OPEN_WINDOW).verdict is Verdict.CLEAN
+
+    def test_a_pin_still_in_place_is_exposed_under_an_open_window(self, tmp_path):
+        repo = make_repo(tmp_path, "still", [
+            ("2025-11-25T10:00:00+00:00", "5.6.1"),
+        ])
+        finding = scan_repo(repo, OPEN_WINDOW)
+        assert finding.verdict is Verdict.EXPOSED
+        assert finding.exposures[0].still_pinned
+
+    def test_a_foreign_lockfile_added_after_a_closed_window_is_not_judged(self, tmp_path):
+        repo = tmp_path / "yarnlate"
+        repo.mkdir()
+        git(repo, "init", "-q")
+        (repo / "README.md").write_text("x")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "init", date="2025-11-20T10:00:00+00:00")
+        (repo / "yarn.lock").write_text('# yarn lockfile v1\n\n"chalk@^5.6.0":\n  version "5.6.1"\n')
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "yarn", date="2025-12-10T10:00:00+00:00")
+        # The tree that cannot be read only matters if it existed while the artifact
+        # was installable. Under a closed window this one arrived afterwards.
+        assert scan_repo(repo, WINDOW).unread_trees == []
+
+    def test_the_same_foreign_lockfile_is_unread_under_an_open_window(self, tmp_path):
+        repo = tmp_path / "yarnlate"
+        repo.mkdir()
+        git(repo, "init", "-q")
+        (repo / "README.md").write_text("x")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "init", date="2025-11-20T10:00:00+00:00")
+        (repo / "yarn.lock").write_text('# yarn lockfile v1\n\n"chalk@^5.6.0":\n  version "5.6.1"\n')
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "yarn", date="2025-12-10T10:00:00+00:00")
+        finding = scan_repo(repo, OPEN_WINDOW)
+        # With no recorded removal, a December tree was inside the window too — and it
+        # is a tree whose versions this tool cannot read, so it must not be cleared.
+        assert [t.path for t in finding.unread_trees] == ["yarn.lock"]

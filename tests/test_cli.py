@@ -729,3 +729,85 @@ class TestAdvisoryAuthoring:
         assert code == EXIT_INCOMPLETE
         assert payload["decision"]["scan_complete"] is False
         assert any("partial coverage" in c for c in payload["caveats"]), payload
+
+
+class TestOpenWindowReachesEveryOutput:
+    """An open upper bound must be visible in all three renderers, never as a blank.
+
+    "Not known to have closed" is a statement about the evidence. A reader who cannot
+    tell it from a recorded end will read a widened verdict as a narrow one.
+    """
+
+    OPEN = {
+        "schema_version": 1, "id": "GHSA-open", "name": "Open ended",
+        "ecosystem": "npm", "coverage": "complete",
+        "window": {"start": "2025-09-08T13:13:05+00:00", "end": None},
+        "packages": [{"name": "chalk", "versions": ["5.6.1"],
+                      "sources": ["https://example.test/a"]}],
+        "sources": ["https://example.test/a"],
+    }
+
+    @pytest.fixture
+    def advisory(self, tmp_path):
+        path = tmp_path / "open.json"
+        path.write_text(json.dumps(self.OPEN))
+        return path
+
+    def test_validate_says_the_window_is_still_open(self, advisory, capsys):
+        assert main(["advisory", "validate", str(advisory)]) == 0
+        out = capsys.readouterr().out
+        assert "still open" in out
+        assert "no removal time is recorded" in out
+
+    def test_json_carries_null_rather_than_omitting_the_key(self, advisory, tmp_path,
+                                                           capsys):
+        repo = tmp_path / "clean"
+        repo.mkdir()
+        subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True,
+                       capture_output=True)
+        (repo / "README.md").write_text("x")
+        subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t", "-c",
+                        "user.name=t", "add", "-A"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t", "-c",
+                        "user.name=t", "commit", "-qm", "i"], check=True,
+                       capture_output=True)
+        main(["scan", "--ioc", str(advisory), "--repo", str(repo), "--no-ci",
+              "--format", "json"])
+        payload = json.loads(capsys.readouterr().out)
+        # A consumer must be able to tell "not known to have closed" from a forgotten
+        # field, so the key is present and the value is null.
+        assert "end" in payload["advisory"]["window"]
+        assert payload["advisory"]["window"]["end"] is None
+
+    def test_html_says_it_in_words(self, advisory, tmp_path):
+        from deptrail.ioc import load_advisory
+        from deptrail.org import OrgReport
+        from deptrail.report import render_html
+
+        report = OrgReport(advisory_id="GHSA-open", advisory_name="Open ended")
+        html = render_html(report, load_advisory(str(advisory)))
+        assert "still open" in html
+        assert "no removal time is recorded" in html
+
+
+class TestRunCollectionUnderAnOpenWindow:
+    def test_an_open_end_collects_runs_up_to_now(self, monkeypatch):
+        from datetime import datetime, timezone
+
+        import deptrail.cli as cli
+        from deptrail.grading import RunHistory
+
+        seen = {}
+
+        def fake(slug, *, since, until):
+            seen.update(since=since, until=until)
+            return RunHistory(source="fake")
+
+        monkeypatch.setattr(cli, "runs_from_github", fake)
+        start = datetime(2025, 9, 8, 13, tzinfo=timezone.utc)
+        provider = cli._github_runs(lambda name: "o/r", (start, None), annotate=False)
+        provider(Path("."), "r")
+        # Bounding the query at the window's end would collect nothing for the whole
+        # period after it — which, for an open window, is everything that matters.
+        assert seen["until"] > datetime(2026, 1, 1, tzinfo=timezone.utc)
+        assert seen["since"] < start

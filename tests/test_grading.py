@@ -391,3 +391,77 @@ class TestRunListParsing:
 
     def test_empty_response(self):
         assert parse_run_list("", source="test").records == ()
+
+
+OPEN_WINDOW = WindowQuery(
+    package="chalk",
+    malicious_versions=frozenset({"5.6.1"}),
+    window_start=datetime(2025, 11, 24, tzinfo=timezone.utc),
+    window_end=None,
+)
+
+
+class TestOpenUpperBoundChangesVerdicts:
+    """An unknown removal time must widen the answer, never narrow it (#23).
+
+    The right edge of a window is recorded nowhere, so a closed one is an assertion.
+    These are the places where believing that assertion clears a repository that a
+    responder would have wanted flagged.
+    """
+
+    def test_a_run_after_a_closed_window_is_only_likely(self):
+        after = run(at=datetime(2025, 11, 27, 10, tzinfo=timezone.utc))
+        graded = grade_exposure(exposure(), WINDOW, history(after))
+        # The closed window says the artifact was gone, so the install may have failed.
+        assert graded.grade is Grade.LIKELY
+        assert graded.implicates_install is False
+        assert any("no longer served" in e for e in graded.evidence)
+
+    def test_the_same_run_is_confirmed_when_the_window_never_closed(self):
+        after = run(at=datetime(2025, 11, 27, 10, tzinfo=timezone.utc))
+        graded = grade_exposure(exposure(), OPEN_WINDOW, history(after))
+        # Nothing is "after" an end nobody recorded. Downgrading here would rest the
+        # whole conclusion on a number the ecosystem does not publish.
+        assert graded.grade is Grade.CONFIRMED
+        assert graded.implicates_install is True
+        assert not any("no longer served" in e for e in graded.evidence)
+
+    def test_a_run_years_later_still_counts_under_an_open_window(self):
+        graded = grade_exposure(
+            exposure(until=None),
+            OPEN_WINDOW,
+            history(run(at=datetime(2030, 1, 1, tzinfo=timezone.utc)),
+                    oldest=datetime(2029, 1, 1, tzinfo=timezone.utc)),
+        )
+        assert graded.grade is Grade.CONFIRMED
+
+    def test_an_open_window_and_a_still_pinned_lockfile_leave_the_overlap_open(self):
+        from deptrail.grading import _overlap
+
+        start, end = _overlap(exposure(until=None), OPEN_WINDOW)
+        assert start == datetime(2025, 11, 25, tzinfo=timezone.utc)
+        assert end is None
+
+    def test_a_closing_pin_still_closes_the_overlap_under_an_open_window(self):
+        from deptrail.grading import _overlap
+
+        _, end = _overlap(exposure(), OPEN_WINDOW)
+        # The pin ended even though the artifact's removal was never recorded, so the
+        # overlap ends with the pin.
+        assert end == datetime(2025, 11, 28, tzinfo=timezone.utc)
+
+
+class TestNothingIsAfterAnOpenEnd:
+    def test_a_run_predating_the_pin_is_not_called_late(self):
+        # `later` exists to say "the artifact was already gone". Under an open end there
+        # is no such moment, and the only runs that fall through to it are ones that
+        # predate the pin — a re-used sha or a skewed clock. Describing those as "after
+        # the window closed" inverts the fact.
+        early = run(at=datetime(2025, 11, 24, 6, tzinfo=timezone.utc))
+        graded = grade_exposure(
+            exposure(since=datetime(2025, 11, 25, tzinfo=timezone.utc)),
+            OPEN_WINDOW, history(early),
+        )
+        assert graded.grade is not Grade.LIKELY
+        assert not any("no longer served" in e for e in graded.evidence)
+        assert graded.implicates_install is False

@@ -364,3 +364,84 @@ class TestQueryPlan:
         entry = plan.entries[0]
         assert entry.sources == entry.package.sources
         assert entry.query.package == entry.package.name
+
+
+class TestOpenUpperBound:
+    """``end: null`` means "not known to have stopped being installable".
+
+    Measured against the real registry: a packument keeps ``time[version]`` after a
+    version is unpublished — chalk 5.6.1, debug 4.4.2 and ansi-styles 6.2.2 are each in
+    ``time`` and absent from ``versions`` — while nothing anywhere records when the
+    registry stopped serving it. So the left edge is a fact and the right edge can only
+    be asserted (#23).
+    """
+
+    def _advisory(self, end, **over):
+        body = {
+            "schema_version": 1, "id": "GHSA-open", "name": "Open ended",
+            "ecosystem": "npm", "coverage": "complete",
+            "window": {"start": "2025-09-08T13:13:05+00:00", "end": end},
+            "packages": [{"name": "chalk", "versions": ["5.6.1"],
+                          "sources": ["https://example.test/a"]}],
+            "sources": ["https://example.test/a"],
+        }
+        body.update(over)
+        return json.dumps(body)
+
+    def test_a_null_end_parses_as_open(self):
+        advisory = parse_advisory(self._advisory(None))
+        assert advisory.window[1] is None
+        query = advisory.plan().entries[0].query
+        assert query.window_end is None
+
+    def test_a_missing_end_is_still_an_error(self):
+        body = json.loads(self._advisory(None))
+        del body["window"]["end"]
+        # Absent and null are different statements. An omitted key reads the same as a
+        # mistyped one, and this module infers nothing.
+        with pytest.raises(IocError, match="missing 'end'"):
+            parse_advisory(json.dumps(body))
+
+    def test_an_open_window_covers_every_later_instant(self):
+        query = parse_advisory(self._advisory(None)).plan().entries[0].query
+        assert not query.covers(datetime(2025, 9, 8, 13, tzinfo=timezone.utc))
+        assert query.covers(datetime(2025, 9, 8, 14, tzinfo=timezone.utc))
+        assert query.covers(datetime(2030, 1, 1, tzinfo=timezone.utc))
+
+    def test_a_closed_window_stops(self):
+        query = parse_advisory(
+            self._advisory("2025-09-08T14:47:54+00:00")).plan().entries[0].query
+        assert query.covers(datetime(2025, 9, 8, 14, tzinfo=timezone.utc))
+        assert not query.covers(datetime(2025, 9, 8, 15, tzinfo=timezone.utc))
+
+    def test_a_package_window_may_not_outlive_a_closed_advisory_window(self):
+        body = json.loads(self._advisory("2025-09-08T14:47:54+00:00"))
+        body["packages"][0]["window"] = {"start": "2025-09-08T13:13:05+00:00", "end": None}
+        # An open end is the latest possible end, so it cannot sit inside one that closes.
+        with pytest.raises(IocError, match="not inside the advisory window"):
+            parse_advisory(json.dumps(body))
+
+    def test_an_open_package_window_fits_an_open_advisory_window(self):
+        body = json.loads(self._advisory(None))
+        body["packages"][0]["window"] = {"start": "2025-09-09T00:00:00+00:00", "end": None}
+        advisory = parse_advisory(json.dumps(body))
+        assert advisory.plan().entries[0].query.window_end is None
+
+    def test_the_error_message_names_an_open_window_as_open(self):
+        body = json.loads(self._advisory(None))
+        body["packages"][0]["window"] = {"start": "2025-09-01T00:00:00+00:00", "end": None}
+        with pytest.raises(IocError, match=r"\.\. open\]"):
+            parse_advisory(json.dumps(body))
+
+    def test_the_template_leaves_the_end_null_rather_than_asking_for_a_guess(self):
+        from deptrail.ioc import advisory_template
+
+        body = json.loads(advisory_template(package="chalk", versions=("5.6.1",),
+                                            start="2025-09-08T13:13:05+00:00"))
+        # A placeholder here asks for a number nothing records, and the nearest number
+        # to hand — the advisory's publication time — is the error that hides exposure.
+        assert body["window"]["end"] is None
+        assert "null" in body["notes"]
+        # The template as a whole must still refuse to validate on its other blanks.
+        with pytest.raises(IocError):
+            parse_advisory(json.dumps(body))

@@ -81,8 +81,10 @@ def render_html(report: OrgReport, advisory=None) -> str:
     ]
 
     if advisory is not None:
+        closed = advisory.window[1]
         window = (f"{advisory.window[0]:%Y-%m-%d %H:%M %Z} → "
-                  f"{advisory.window[1]:%Y-%m-%d %H:%M %Z}")
+                  + (f"{closed:%Y-%m-%d %H:%M %Z}" if closed is not None
+                     else "still open (no removal time is recorded)"))
         sources = " · ".join(escape(s) for s in advisory.sources)
         out.append(
             "<h2>Advisory</h2><p class='sub'>installable window "

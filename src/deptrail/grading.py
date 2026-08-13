@@ -216,11 +216,15 @@ class GradedFinding:
         return self.worst_grade in (Grade.CONFIRMED, Grade.LIKELY, Grade.POSSIBLE)
 
 
-def _overlap(exposure: Exposure, query: WindowQuery) -> tuple[datetime, datetime]:
-    """The instants when the pin and the window coincide — where an install counts."""
+def _overlap(exposure: Exposure, query: WindowQuery) -> tuple[datetime, datetime | None]:
+    """The instants when the pin and the window coincide — where an install counts.
+
+    The end is ``None`` when neither bound closes: the pin is still in place and the
+    artifact is not known to have been withdrawn, so the overlap is still running.
+    """
     start = max(exposure.since, query.window_start)
-    end = query.window_end if exposure.until is None else min(exposure.until, query.window_end)
-    return start, end
+    closes = [d for d in (exposure.until, query.window_end) if d is not None]
+    return start, (min(closes) if closes else None)
 
 
 # Events whose run checks out the head commit itself. A ``pull_request`` run
@@ -248,7 +252,7 @@ def grade_exposure(exposure: Exposure, query: WindowQuery,
     """
     live_start = max(exposure.since, query.window_start)
     on_commit = [r for r in history.records if r.head_sha == exposure.commit]
-    during = [r for r in on_commit if live_start <= r.at <= query.window_end]
+    during = [r for r in on_commit if live_start <= r.at and query.covers(r.at)]
     confirming = [r for r in during
                   if r.installs_dependencies is True
                   and r.event in HEAD_CHECKOUT_EVENTS]
@@ -292,7 +296,11 @@ def grade_exposure(exposure: Exposure, query: WindowQuery,
             implicates_install=any(r.installs_dependencies is not False for r in during),
         )
 
-    later = [r for r in on_commit if r.at > query.window_end]
+    # Nothing is "after" an open end. Without a recorded removal we cannot say the
+    # artifact was gone by the time a run built the commit, and claiming it would
+    # downgrade a live exposure on an assertion nobody measured.
+    later = ([] if query.window_end is None
+             else [r for r in on_commit if r.at > query.window_end])
     if later:
         run = later[0]
         return GradedExposure(
