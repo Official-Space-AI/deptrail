@@ -1469,3 +1469,61 @@ class TestADirectoryNameIsNotAnInstallClaim:
                                    runs=runs_with(head(repo)),
                                    secrets=lambda p, n: ("NPM_TOKEN",))
         assert report.exposed_repos == ("confirmed",)
+
+    def test_an_exposure_with_nothing_to_rotate_is_exit_two(self, tmp_path, plan):
+        from deptrail.cli import EXIT_INCOMPLETE, _exit_code
+
+        repo = make_repo(tmp_path, "api", [("2025-11-25T10:00:00+00:00", "5.6.1")])
+        report = scan_organization([("api", repo)], plan, runs=no_runs,
+                                   secrets=lambda p, n: ())
+        # The exit-code half of the contract, which the CLI cannot reach without a live
+        # `gh` to return an empty secret listing: an exposure was found, there is nothing
+        # to act on, and 0 would say absence was established.
+        assert _exit_code(report) == EXIT_INCOMPLETE
+
+    def test_the_workflows_are_read_at_the_commit_not_at_head(self, tmp_path, plan):
+        # A workflow that installed the directory during the window and was retired
+        # afterwards is exactly the evidence that matters. Reading HEAD instead loses it,
+        # and the repository is cleared — a false clean, with no CI records needed.
+        repo = tmp_path / "retired"
+        (repo / "examples/app").mkdir(parents=True)
+        (repo / ".github/workflows").mkdir(parents=True)
+        git(repo, "init", "-q")
+        (repo / ".github/workflows/deploy.yml").write_text(
+            "name: Deploy\non: [push]\njobs:\n  d:\n    steps:\n"
+            "      - run: npm ci --prefix examples/app\n")
+        (repo / "examples/app/package-lock.json").write_text(lock("5.6.1"))
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "deps", date="2025-11-25T10:00:00+00:00")
+        (repo / ".github/workflows/deploy.yml").unlink()
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "retire the deploy workflow",
+            date="2026-01-10T10:00:00+00:00")
+        report = scan_organization([("retired", repo)], plan, runs=no_runs,
+                                   secrets=lambda p, n: ("NPM_TOKEN",))
+        assert report.exposed_repos == ("retired",)
+        assert report.proves_absence is False
+
+    def test_the_implicated_workflows_are_consulted_before_every_workflow(self, tmp_path,
+                                                                         plan):
+        # The fallback is a fallback. CI ran only ci.yml, which installs at the root and
+        # says nothing about examples/app; an unrelated workflow at the same commit does
+        # install there but never ran. Preferring the second over the first would report
+        # an exposure on a tree the implicated run did not touch.
+        repo = tmp_path / "twoflows"
+        (repo / "examples/app").mkdir(parents=True)
+        (repo / ".github/workflows").mkdir(parents=True)
+        git(repo, "init", "-q")
+        (repo / ".github/workflows/ci.yml").write_text(
+            "name: CI\non: [push]\njobs:\n  b:\n    steps:\n      - run: npm ci\n")
+        (repo / ".github/workflows/examples.yml").write_text(
+            "name: Examples\non: [workflow_dispatch]\njobs:\n  e:\n    steps:\n"
+            "      - run: npm ci --prefix examples/app\n")
+        (repo / "examples/app/package-lock.json").write_text(lock("5.6.1"))
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "deps", date="2025-11-25T10:00:00+00:00")
+        report = scan_organization([("twoflows", repo)], plan,
+                                   runs=runs_with(head(repo)),
+                                   secrets=lambda p, n: ("NPM_TOKEN",))
+        assert report.exposed_repos == ()
+        assert len(report.set_aside) == 1

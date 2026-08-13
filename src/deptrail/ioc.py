@@ -129,7 +129,7 @@ _MEANT_UNKNOWN = frozenset({
 def _clip(value: object, limit: int = 80) -> str:
     """A value quoted for an error message, never long enough to bury the message.
 
-    An unbounded ``{value!r}`` turned one mistyped field into a 100,140-character error
+    An unbounded ``repr`` turned one mistyped field into a 100,140-character error
     whose first line — the field path, the only part that says what to fix — scrolled
     away.
     """
@@ -150,8 +150,9 @@ def _parse_bound(value: object, *, where: str) -> datetime:
              + (", or unquoted null if the removal time is unknown"
                 if where.endswith(".end") else ""))
     text = str(value).strip().replace("Z", "+00:00")
-    # Before any shape test: "TBD" contains a T, so a check ordered after the
-    # time-of-day branch would send it to the ISO parser and answer with the wrong hint.
+    # Before any shape test. The spellings without a `T` in them — `null`, `unknown`,
+    # `n/a`, `-` — fall into the time-of-day branch, and a check ordered after it would
+    # answer them with a hint built by slicing the junk: "write nullT00:00:00+00:00".
     if where.endswith(".end") and text.strip().lower() in _MEANT_UNKNOWN:
         raise IocError(
             f"{where}: {_clip(value)} looks like an attempt to say the removal time "
@@ -165,25 +166,28 @@ def _parse_bound(value: object, *, where: str) -> datetime:
     if not _HAS_SECONDS.search(text):
         if re.match(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}", text, re.ASCII):
             raise IocError(
-                f"{where}: {value!r} omits seconds — write them out (a missing second "
+                f"{where}: {_clip(value)} omits seconds — write them out (a missing second "
                 "would silently become :00 and move the edge of the window)"
             )
         raise IocError(f"{where}: {_clip(value)} is not an ISO-8601 timestamp")
     if text.endswith("-00:00"):
         raise IocError(
-            f"{where}: {value!r} uses -00:00, which means 'offset unknown'; "
+            f"{where}: {_clip(value)} uses -00:00, which means 'offset unknown'; "
             "write +00:00 if the bound really is UTC"
         )
     try:
         stamp = datetime.fromisoformat(text)
     except ValueError as e:
-        raise IocError(f"{where}: not an ISO-8601 timestamp ({e})") from e
+        # The exception embeds the whole value, so it is clipped too — this is the branch
+        # a long mistyped bound actually reaches, and it was still emitting 100 kB.
+        raise IocError(f"{where}: not an ISO-8601 timestamp ({_clip(e)})") from e
     if stamp.tzinfo is None or stamp.utcoffset() is None:
-        raise IocError(f"{where}: missing UTC offset in {value!r}")
+        raise IocError(f"{where}: missing UTC offset in {_clip(value)}")
     return stamp
 
 
-def _parse_window(raw: object, where: str) -> tuple[datetime, datetime | None]:
+def _parse_window(raw: object, where: str, now: datetime | None = None,
+                  ) -> tuple[datetime, datetime | None]:
     """One window. ``end: null`` means "not known to have stopped being installable"."""
     _require(isinstance(raw, dict), f"{where}: must be an object")
     window = dict(raw)  # type: ignore[arg-type]
@@ -201,7 +205,7 @@ def _parse_window(raw: object, where: str) -> tuple[datetime, datetime | None]:
     # catch it for free and no longer does when the end is open: a mistyped year — 2025
     # for 2026, the likeliest slip at 3 a.m. — then produced a window containing nothing
     # that has happened yet, so every scan answered "no exposure found" and exited 0.
-    now = datetime.now(timezone.utc)
+    now = now or datetime.now(timezone.utc)
     _require(start <= now + _CLOCK_SLACK,
              f"{where}.start: {start.isoformat()} is in the future — this host's clock "
              f"reads {now.isoformat()}. An advisory describes an incident that already "
@@ -325,8 +329,13 @@ def _no_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
     return dict(pairs)
 
 
-def parse_advisory(text: str) -> Advisory:
-    """Parse and validate advisory JSON. Every violation raises IocError."""
+def parse_advisory(text: str, now: datetime | None = None) -> Advisory:
+    """Parse and validate advisory JSON. Every violation raises IocError.
+
+    ``now`` is the clock the future-start check compares against. It exists so that check
+    is testable without depending on the host's clock — this function is otherwise pure,
+    and that check is the one thing in the module that is not.
+    """
     try:
         data = json.loads(text, object_pairs_hook=_no_duplicate_keys)
     except json.JSONDecodeError as e:
@@ -345,7 +354,7 @@ def parse_advisory(text: str) -> Advisory:
              f"advisory.ecosystem: only 'npm' is supported, got {data['ecosystem']!r}")
     _require(data["coverage"] in COVERAGE_VALUES,
              f"advisory.coverage: must be one of {list(COVERAGE_VALUES)}")
-    window = _parse_window(data["window"], "advisory.window")
+    window = _parse_window(data["window"], "advisory.window", now)
     sources = _url_list(data["sources"], "advisory.sources")
 
     raw_packages = data["packages"]
@@ -360,7 +369,8 @@ def parse_advisory(text: str) -> Advisory:
             _require(key in raw, f"{where}: missing required field {key!r}")
         name = _package_name(raw["name"], f"{where}.name")
         versions = _versions(raw["versions"], f"{where}.versions")
-        pkg_window = _parse_window(raw["window"], f"{where}.window") if "window" in raw else None
+        pkg_window = (_parse_window(raw["window"], f"{where}.window", now)
+                      if "window" in raw else None)
         if pkg_window is not None:
             _require(window[0] <= pkg_window[0] and _closes_within(pkg_window[1], window[1]),
                      f"{where}.window: {_fmt_window(pkg_window)} is not inside the advisory "

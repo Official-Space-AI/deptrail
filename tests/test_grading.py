@@ -536,9 +536,13 @@ class TestTruncatedRunListIsNotCoverage:
         return runs
 
     def test_a_truncated_read_does_not_claim_the_requested_range(self, monkeypatch):
-        runs = self._gh(monkeypatch, total=1045, returned=1000)
+        returned = 1000
+        self._gh(monkeypatch, total=1045, returned=returned)
         history = runs_from_github("o/r", since=self.SINCE, until=None)
-        oldest_returned = min(_parse_iso(r["run_started_at"]) for r in runs)
+        # Written out rather than recomputed with the module's own parser: the fake serves
+        # `newest - i hours`, so the oldest is the last one.
+        oldest_returned = datetime(2026, 8, 1, tzinfo=timezone.utc) - timedelta(
+            hours=returned - 1)
         # Coverage reaches only as far back as what arrived, so the incident period is
         # unanswered rather than quiet.
         assert history.oldest_available == oldest_returned
@@ -644,3 +648,83 @@ class TestTruncatedRunListIsNotCoverage:
         assert history.records == ()
         assert history.oldest_available is None
         assert not history.covers(self.SINCE)
+
+    def test_pagination_drift_is_not_coverage_even_when_the_count_matches(self, monkeypatch):
+        import subprocess as sp
+
+        import deptrail.grading as grading
+
+        # `--paginate` walks offsets. A run created between two page requests shifts every
+        # later page by one: a boundary run arrives twice and the oldest is pushed off the
+        # end, while the total collected is unchanged. Counting alone certifies a read with
+        # a hole in the middle of it.
+        def page(ids, month, total):
+            return {"total_count": total, "workflow_runs": [
+                {"id": i, "head_sha": OTHER, "event": "push", "name": "CI",
+                 "run_started_at": f"2026-{month:02d}-01T00:00:00+00:00"} for i in ids]}
+
+        pages = [page(range(200, 100, -1), 8, 200), page(range(101, 1, -1), 7, 201)]
+        collected = [r["id"] for p in pages for r in p["workflow_runs"]]
+        assert len(collected) == 200 and len(set(collected)) == 199 and 1 not in collected
+        monkeypatch.setattr(grading.subprocess, "run", lambda *a, **k: sp.CompletedProcess(
+            [], 0, stdout=json.dumps(pages), stderr=""))
+        history = runs_from_github("o/r", since=self.SINCE, until=None)
+        assert not history.covers(self.SINCE)
+        assert "arrived twice" in history.source
+
+    def test_a_total_that_changes_between_pages_is_not_coverage(self, monkeypatch):
+        import subprocess as sp
+
+        import deptrail.grading as grading
+
+        # Page 1's count must AGREE with what arrived, and the ids must be distinct, so
+        # that the disagreement between pages is the only thing left to notice. A fixture
+        # that also fails the count check tests the count check twice and this not at all.
+        pages = [
+            {"total_count": 2, "workflow_runs": [
+                {"id": 1, "head_sha": OTHER, "event": "push", "name": "CI",
+                 "run_started_at": "2026-08-01T00:00:00+00:00"}]},
+            {"total_count": 99, "workflow_runs": [
+                {"id": 2, "head_sha": OTHER, "event": "push", "name": "CI",
+                 "run_started_at": "2026-07-01T00:00:00+00:00"}]},
+        ]
+        monkeypatch.setattr(grading.subprocess, "run", lambda *a, **k: sp.CompletedProcess(
+            [], 0, stdout=json.dumps(pages), stderr=""))
+        history = runs_from_github("o/r", since=self.SINCE, until=None)
+        assert not history.covers(self.SINCE)
+        assert "changed between pages" in history.source
+
+    def test_the_empty_page_past_the_cap_is_not_mistaken_for_drift(self, monkeypatch):
+        import subprocess as sp
+
+        import deptrail.grading as grading
+
+        # The live API reports the same total on every non-empty page and 0 on the empty
+        # one past the cap, so empty pages must not count toward the disagreement test.
+        pages = [
+            {"total_count": 2, "workflow_runs": [
+                {"id": i, "head_sha": OTHER, "event": "push", "name": "CI",
+                 "run_started_at": f"2026-08-0{i}T00:00:00+00:00"} for i in (1, 2)]},
+            {"total_count": 0, "workflow_runs": []},
+        ]
+        monkeypatch.setattr(grading.subprocess, "run", lambda *a, **k: sp.CompletedProcess(
+            [], 0, stdout=json.dumps(pages), stderr=""))
+        assert runs_from_github("o/r", since=self.SINCE, until=None).covers(self.SINCE)
+
+    def test_a_total_that_is_missing_or_not_a_number_is_not_coverage(self, monkeypatch):
+        import subprocess as sp
+
+        import deptrail.grading as grading
+
+        run = {"id": 1, "head_sha": OTHER, "event": "push", "name": "CI",
+               "run_started_at": "2026-08-01T00:00:00+00:00"}
+        # Without a usable total there is nothing to check the read against, and "we could
+        # not check" is not "we saw everything". Fail closed.
+        for total in ({}, {"total_count": None}, {"total_count": "many"}):
+            monkeypatch.setattr(grading.subprocess, "run",
+                                lambda *a, _t=total, **k: sp.CompletedProcess(
+                                    [], 0, stdout=json.dumps([{**_t, "workflow_runs": [run]}]),
+                                    stderr=""))
+            history = runs_from_github("o/r", since=self.SINCE, until=None)
+            assert not history.covers(self.SINCE), total
+            assert "no usable total" in history.source, total

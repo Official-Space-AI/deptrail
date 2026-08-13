@@ -553,3 +553,133 @@ class TestWindowBoundariesAreInclusive:
         # nothing that has happened, and every scan answered "no exposure found".
         with pytest.raises(IocError, match="is in the future"):
             parse_advisory(json.dumps(body))
+
+
+class TestTheFutureStartCheckTakesAClock:
+    BODY = {
+        "schema_version": 1, "id": "GHSA-clock", "name": "n", "ecosystem": "npm",
+        "coverage": "complete",
+        "window": {"start": "2025-09-08T13:13:05+00:00", "end": None},
+        "packages": [{"name": "chalk", "versions": ["5.6.1"],
+                      "sources": ["https://a.test/x"]}],
+        "sources": ["https://a.test/x"],
+    }
+
+    def test_an_injected_clock_decides_it(self):
+        # The one check in this module that is not pure, so it takes the clock as an
+        # argument rather than reaching for one — otherwise the behaviour cannot be pinned
+        # without depending on the host.
+        before = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        with pytest.raises(IocError, match="is in the future"):
+            parse_advisory(json.dumps(self.BODY), now=before)
+        after = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        assert parse_advisory(json.dumps(self.BODY), now=after).window[1] is None
+
+    SLACK = timedelta(days=1)  # duplicated on purpose: see below
+
+    def test_the_slack_matches_the_documented_day(self):
+        from deptrail.ioc import _CLOCK_SLACK
+
+        # Reading the constant to build the expectation is what let a slack of zero pass:
+        # `now = start - 0` satisfies `start <= now + 0`. So the value is pinned here once,
+        # against a literal, and the behaviour tests below use the literal.
+        assert _CLOCK_SLACK == self.SLACK
+
+    def test_a_slow_clock_within_the_slack_still_accepts(self):
+        start = datetime.fromisoformat(self.BODY["window"]["start"])
+        # Clock skew on the scanner host is ordinary; the error this exists to catch is off
+        # by a year. Both edges are pinned so neither can drift silently.
+        assert parse_advisory(json.dumps(self.BODY),
+                              now=start - timedelta(hours=23)).window[0] == start
+        with pytest.raises(IocError, match="is in the future"):
+            parse_advisory(json.dumps(self.BODY),
+                           now=start - timedelta(days=2))
+
+    def test_the_message_names_the_host_clock_as_a_suspect(self):
+        with pytest.raises(IocError, match="check the clock"):
+            parse_advisory(json.dumps(self.BODY),
+                           now=datetime(2020, 1, 1, tzinfo=timezone.utc))
+
+    def test_a_package_window_start_is_checked_too(self):
+        body = json.loads(json.dumps(self.BODY))
+        body["packages"][0]["window"] = {"start": "2026-09-08T00:00:00+00:00", "end": None}
+        with pytest.raises(IocError, match=r"packages\[0\]\.window\.start"):
+            parse_advisory(json.dumps(body),
+                           now=datetime(2025, 10, 1, tzinfo=timezone.utc))
+
+
+class TestEveryBoundErrorIsBounded:
+    """Every branch of `_parse_bound`, on both fields, with a 100 kB value.
+
+    Mutation review found the earlier test covered exactly one of them: `"x" * 100_000`
+    has no `T` and no space, so it reached the time-of-day branch and nothing else. Two
+    others were still emitting 100 kB — including the one a long mistyped bound actually
+    reaches, where the message came from the `fromisoformat` exception rather than from
+    the value.
+    """
+
+    HUGE = "x" * 100_000
+    CASES = {
+        "no time of day": HUGE,
+        "omits seconds": "2025-09-08T14:00" + HUGE,
+        "unparseable after a valid prefix": "2025-09-08T14:00:00" + HUGE,
+        "minus zero offset": "2025-09-08T14:00:00-00:00" + HUGE,
+    }
+
+    @pytest.mark.parametrize("field", ["start", "end"])
+    @pytest.mark.parametrize("label", list(CASES))
+    def test_the_message_stays_short_and_leads_with_the_field(self, field, label):
+        window = {"start": "2025-09-08T13:13:05+00:00", "end": None}
+        window[field] = self.CASES[label]
+        body = dict(MINIMAL, window=window)
+        with pytest.raises(IocError) as caught:
+            parse_advisory(json.dumps(body), now=datetime(2026, 1, 1, tzinfo=timezone.utc))
+        message = str(caught.value)
+        assert len(message) < 400, (field, label, len(message))
+        assert message.startswith(f"advisory.window.{field}:")
+
+    def test_the_clipped_value_is_still_shown_with_its_true_length(self):
+        body = dict(MINIMAL, window={"start": "2025-09-08T13:13:05+00:00",
+                                     "end": self.HUGE})
+        with pytest.raises(IocError) as caught:
+            parse_advisory(json.dumps(body), now=datetime(2026, 1, 1, tzinfo=timezone.utc))
+        message = str(caught.value)
+        # Clipping must not hide that clipping happened, or a reader cannot tell a long
+        # value from a short one — and it must still show enough to recognise.
+        assert "xxxx" in message
+        assert "(100002 chars)" in message
+
+    def test_a_short_value_is_shown_whole(self):
+        body = dict(MINIMAL, window={"start": "2025-09-08T13:13:05+00:00",
+                                     "end": "2025-09-08"})
+        with pytest.raises(IocError) as caught:
+            parse_advisory(json.dumps(body), now=datetime(2026, 1, 1, tzinfo=timezone.utc))
+        # A limit of zero would satisfy "short message" while showing nothing at all.
+        assert "'2025-09-08'" in str(caught.value)
+        assert "chars)" not in str(caught.value)
+
+    def test_the_unknown_spelling_hint_is_only_for_the_end(self):
+        # `"start": null` is not a thing, so pointing the author at it would send them to
+        # a different rejection. The hint belongs to the field that may be null.
+        body = dict(MINIMAL, window={"start": "unknown", "end": None})
+        with pytest.raises(IocError) as caught:
+            parse_advisory(json.dumps(body), now=datetime(2026, 1, 1, tzinfo=timezone.utc))
+        assert "unquoted null" not in str(caught.value)
+        assert "has no time of day" in str(caught.value)
+
+    def test_the_end_still_gets_it(self):
+        body = dict(MINIMAL, window={"start": "2025-09-08T13:13:05+00:00", "end": "unknown"})
+        with pytest.raises(IocError, match="unquoted null"):
+            parse_advisory(json.dumps(body), now=datetime(2026, 1, 1, tzinfo=timezone.utc))
+
+
+class TestTemplatePrecedence:
+    def test_end_unknown_wins_over_a_supplied_end(self):
+        from deptrail.ioc import advisory_template
+
+        # The CLI refuses the combination, so this is only reachable from a library
+        # caller — but "unknown" is the weaker, safer claim and must not be overridden
+        # silently by a value the caller also passed.
+        body = json.loads(advisory_template(end="2025-09-08T14:47:54+00:00",
+                                            end_unknown=True))
+        assert body["window"]["end"] is None

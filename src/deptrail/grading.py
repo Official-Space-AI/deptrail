@@ -394,6 +394,42 @@ def parse_run_list(raw: str, *, source: str,
     return RunHistory(records=tuple(records), oldest_available=covered_from, source=note)
 
 
+def _coverage_doubt(pages: list, runs: list, announced: object) -> str | None:
+    """Why this read cannot certify the range it asked for, or ``None`` if it can.
+
+    Three signals, because the endpoint gives no direct one. It stops at a fixed number of
+    items, newest first, with HTTP 200 and nothing in the body to say so.
+
+    Counting is necessary and not sufficient. `--paginate` walks offsets, and a run created
+    between two page requests shifts every later page by one: a boundary run arrives twice
+    while the oldest is pushed off the end, and the total collected is unchanged. Measured
+    at 200 collected against 199 distinct, with the oldest run missing and the count still
+    matching — which is why duplicate ids are checked too.
+
+    The third signal is `total_count` disagreeing between pages. Against the live API it is
+    identical on every non-empty page (1045 across ten of them for `expressjs/express`) and
+    0 on the empty page past the cap, so a difference among the non-empty ones means the
+    list moved underfoot. Empty pages are excluded for exactly that reason.
+    """
+    if not pages:
+        return "the API returned no pages at all, so nothing was read"
+    if announced is None or not isinstance(announced, int):
+        return f"the API reported no usable total ({announced!r}), so the read cannot be checked"
+    if announced != len(runs):
+        return (f"the API returned {len(runs)} run(s) against a reported total of "
+                f"{announced}, newest first, so the oldest part of the range was not "
+                "delivered")
+    ids = [run.get("id") for run in runs if run.get("id") is not None]
+    if len(ids) != len(set(ids)):
+        return (f"{len(ids) - len(set(ids))} run(s) arrived twice, so the list shifted "
+                "between page requests and an older run was pushed out of it")
+    totals = {page.get("total_count") for page in pages if page.get("workflow_runs")}
+    if len(totals) > 1:
+        return (f"the reported total changed between pages ({sorted(map(str, totals))}), "
+                "so the list shifted while it was being read")
+    return None
+
+
 def runs_from_github(repo_slug: str, *, since: datetime | None = None,
                      until: datetime | None = None) -> RunHistory:
     """Read run records for a date range through the GitHub API.
@@ -426,17 +462,11 @@ def runs_from_github(repo_slug: str, *, since: datetime | None = None,
     # runs and returns the newest thousand, so the runs from the *incident* are exactly
     # the ones missing. Believing the requested range was covered then reports that
     # period as quiet rather than as unanswered, which is a false clean.
-    # `total_count` is on every page but is not stable — the page past the cap reports 0 —
-    # so page 1 is the one to believe. Anything other than exact agreement means the count
-    # cannot be used to certify the read: fewer runs than announced is the cap, more is a
-    # list that shifted mid-pagination, and no pages at all is a `gh` that printed nothing.
     announced = pages[0].get("total_count") if pages else None
-    if announced != len(runs):
+    if doubt := _coverage_doubt(pages, runs, announced):
         unverified = parse_run_list(
             json.dumps({"workflow_runs": runs}),
-            source=(f"{source}: the API returned {len(runs)} run(s) against a reported "
-                    f"total of {announced}, newest first, so the oldest part of the range "
-                    "was not delivered — narrow the window, or the range of repositories"),
+            source=f"{source}: {doubt} — narrow the window, or the range of repositories",
             covered_from=None,
         )
         # From the records that survived parsing, and from ``RunRecord.at`` — the same

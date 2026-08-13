@@ -795,6 +795,8 @@ class TestRunCollectionUnderAnOpenWindow:
     def test_an_open_end_collects_runs_up_to_now(self, monkeypatch):
         from datetime import datetime, timezone
 
+        from datetime import timedelta
+
         import deptrail.cli as cli
         from deptrail.grading import RunHistory
 
@@ -810,8 +812,11 @@ class TestRunCollectionUnderAnOpenWindow:
         provider(Path("."), "r")
         # Bounding the query at the window's end would collect nothing for the whole
         # period after it — which, for an open window, is everything that matters.
-        assert seen["until"] > datetime(2026, 1, 1, tzinfo=timezone.utc)
-        assert seen["since"] < start
+        # "now", not merely "later than some fixed date a frozen clock would also pass".
+        # A day of padding is added on top of it, the same as on `since`.
+        expected = datetime.now(timezone.utc) + timedelta(days=1)
+        assert abs((seen["until"] - expected).total_seconds()) < 120
+        assert seen["since"] == start - timedelta(days=1)
 
 
 class TestAnExposureNeverExitsZero:
@@ -851,6 +856,11 @@ class TestAnExposureNeverExitsZero:
         assert payload["timeline"], "the fixture must find the exposure"
         assert payload["decision"]["scan_complete"] is False
         assert code != EXIT_CLEAN
+        # This fixture has no secrets provider, so the whole store is unnameable and 1 is
+        # the right answer. The exit-2 half of the contract — an exposure with nothing at
+        # all to rotate — is pinned at the report level in test_org.py, because the CLI
+        # cannot produce an empty secret *listing* without a live `gh`.
+        assert code == EXIT_ROTATE
 
 
 class TestAdvisoryInitDoesNotInferUnknown:
@@ -879,6 +889,11 @@ class TestAdvisoryInitDoesNotInferUnknown:
                      "--source", "https://a.test/x", "--output", str(target)])
         assert json.loads(target.read_text())["window"]["end"] is None
         assert code == EXIT_CLEAN
+        # The name says "and validates", so check that rather than the exit code, which is
+        # 0 for a template with blanks too.
+        err = capsys.readouterr().err
+        assert "complete and valid" in err
+        assert "still to fill in" not in err
 
     def test_the_two_flags_contradict_each_other(self, tmp_path):
         code = main(["advisory", "init", "--id", "GHSA-1", "--name", "n",
@@ -890,31 +905,46 @@ class TestAdvisoryInitDoesNotInferUnknown:
 
 
 class TestTheTextReportShowsTheWindow:
-    def _report(self, end):
-        from deptrail.ioc import parse_advisory
-        from deptrail.org import OrgReport, render_report
+    """Asserted through `scan --format text`, not by calling the renderer.
 
-        advisory = parse_advisory(json.dumps({
+    The renderer takes the advisory as an optional argument, so testing it directly proves
+    only that it *can* print the window. What matters is that `_emit` passes it — the wiring
+    is the thing that was missing, and it is the format the composite action writes to its
+    step summary.
+    """
+
+    def _run(self, tmp_path, end, capsys):
+        repo = tmp_path / "clean"
+        repo.mkdir()
+        subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True,
+                       capture_output=True)
+        (repo / "README.md").write_text("x")
+        subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t", "-c",
+                        "user.name=t", "add", "-A"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t", "-c",
+                        "user.name=t", "commit", "-qm", "i"], check=True,
+                       capture_output=True)
+        advisory = tmp_path / "a.json"
+        advisory.write_text(json.dumps({
             "schema_version": 1, "id": "GHSA-x", "name": "n", "ecosystem": "npm",
             "coverage": "complete",
             "window": {"start": "2025-09-08T13:13:05+00:00", "end": end},
             "packages": [{"name": "chalk", "versions": ["5.6.1"],
                           "sources": ["https://a.test/x"]}],
             "sources": ["https://a.test/x"]}))
-        return render_report(OrgReport(advisory_id="GHSA-x", advisory_name="n"), advisory)
+        main(["scan", "--ioc", str(advisory), "--repo", str(repo), "--no-ci",
+              "--format", "text"])
+        return capsys.readouterr().out
 
-    def test_an_open_window_says_so(self):
-        # This is the format the composite action writes to its step summary. Without the
-        # window a reader cannot tell "it cannot have been installed since" from "it
-        # still can".
-        text = self._report(None)
-        assert "installable window" in text
-        assert "still open" in text
+    def test_an_open_window_says_so(self, tmp_path, capsys):
+        out = self._run(tmp_path, None, capsys)
+        assert "installable window" in out
+        assert "still open" in out
 
-    def test_a_closed_window_prints_its_end(self):
-        text = self._report("2025-09-08T14:47:54+00:00")
-        assert "2025-09-08T14:47:54+00:00" in text
-        assert "still open" not in text
+    def test_a_closed_window_prints_its_end(self, tmp_path, capsys):
+        out = self._run(tmp_path, "2025-09-08T14:47:54+00:00", capsys)
+        assert "2025-09-08T14:47:54+00:00" in out
+        assert "still open" not in out
 
 
 class TestBoundErrorsNameTheFix:
@@ -983,6 +1013,7 @@ class TestRunQueryPadding:
         # a grade lost. The closed branch had no test at all.
         assert seen["since"] == start - timedelta(days=1)
         if expect_now:
-            assert seen["until"] > datetime(2026, 1, 1, tzinfo=timezone.utc)
+            expected = datetime.now(timezone.utc) + timedelta(days=1)
+            assert abs((seen["until"] - expected).total_seconds()) < 120
         else:
             assert seen["until"] == end + timedelta(days=1)
