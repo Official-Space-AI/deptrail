@@ -110,7 +110,7 @@ def _emit(report: OrgReport, args: argparse.Namespace, advisory: Advisory | None
     elif args.format == "html":
         text = render_html(report, advisory)
     else:
-        text = render_report(report)
+        text = render_report(report, advisory)
     if not args.output:
         print(text)
         return EXIT_CLEAN
@@ -373,10 +373,14 @@ def cmd_advisory_init(args: argparse.Namespace) -> int:
     template: the whole point of the strict loader is that a half-filled advisory fails
     before it can produce a confident CLEAN.
     """
+    if args.end and args.end_unknown:
+        print("--end and --end-unknown contradict each other; pass one",
+              file=sys.stderr)
+        return EXIT_BAD_INPUT
     text = advisory_template(
         package=args.package, versions=tuple(args.version or ()),
-        start=args.start, end=args.end, source=args.source,
-        identifier=args.id, name=args.name,
+        start=args.start, end=args.end, end_unknown=args.end_unknown,
+        source=args.source, identifier=args.id, name=args.name,
     )
     if args.output:
         try:
@@ -470,6 +474,9 @@ def build_parser() -> argparse.ArgumentParser:
                                       "installable, e.g. 2025-11-24T00:00:00+00:00")
     init.add_argument("--end", help="last instant it was still installable — the "
                                     "registry's removal, not the advisory's publication")
+    init.add_argument("--end-unknown", action="store_true",
+                      help="write 'end': null — no removal time is recorded anywhere, "
+                           "which is usually the truth; say it rather than guessing")
     init.add_argument("--source", help="URL the claim comes from")
     init.add_argument("--output", help="write here instead of stdout")
     init.set_defaults(func=cmd_advisory_init)

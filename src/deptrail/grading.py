@@ -216,15 +216,15 @@ class GradedFinding:
         return self.worst_grade in (Grade.CONFIRMED, Grade.LIKELY, Grade.POSSIBLE)
 
 
-def _overlap(exposure: Exposure, query: WindowQuery) -> tuple[datetime, datetime | None]:
-    """The instants when the pin and the window coincide — where an install counts.
+def _overlap_start(exposure: Exposure, query: WindowQuery) -> datetime:
+    """The first instant the pin and the window coincide — where an install counts.
 
-    The end is ``None`` when neither bound closes: the pin is still in place and the
-    artifact is not known to have been withdrawn, so the overlap is still running.
+    Only the start is returned because only the start is used. This returned the whole
+    interval until review pointed out that no caller ever read the end, so the
+    arithmetic for it was dead and the tests written for it asserted a value no report
+    could show.
     """
-    start = max(exposure.since, query.window_start)
-    closes = [d for d in (exposure.until, query.window_end) if d is not None]
-    return start, (min(closes) if closes else None)
+    return max(exposure.since, query.window_start)
 
 
 # Events whose run checks out the head commit itself. A ``pull_request`` run
@@ -350,7 +350,7 @@ def grade_finding(finding: RepoFinding, query: WindowQuery, history: RunHistory,
     graded.graded.extend(grade_exposure(e, query, history) for e in finding.exposures)
 
     if finding.exposures:
-        earliest = min(_overlap(e, query)[0] for e in finding.exposures)
+        earliest = min(_overlap_start(e, query) for e in finding.exposures)
         newest = max((r.at for r in history.records), default=None)
         beyond_retention = newest is not None and earliest < newest - RETENTION
         if not history.covers(earliest) or beyond_retention:
@@ -418,11 +418,33 @@ def runs_from_github(repo_slug: str, *, since: datetime | None = None,
         raise ToolFailure(f"could not read CI runs for {repo_slug}: {e}") from e
     pages = json.loads(raw or "[]")
     runs = [run for page in pages for run in page.get("workflow_runs", [])]
+    source = f"gh api repos/{repo_slug}/actions/runs ({query})"
+    # The endpoint stops at a fixed number of items, newest first, with HTTP 200 and no
+    # marker in the body — the only way to notice is that page 1 announced a larger
+    # `total_count` than the number of runs that arrived. Measured against
+    # `expressjs/express`, an ordinary repository: an eleven-month range reports 1,045
+    # runs and returns the newest thousand, so the runs from the *incident* are exactly
+    # the ones missing. Believing the requested range was covered then reports that
+    # period as quiet rather than as unanswered, which is a false clean.
+    announced = pages[0].get("total_count") if pages else None
+    if announced is not None and len(runs) < announced:
+        oldest = min((r.get("run_started_at") or r.get("created_at") for r in runs
+                      if r.get("run_started_at") or r.get("created_at")), default=None)
+        return parse_run_list(
+            json.dumps({"workflow_runs": runs}),
+            source=(f"{source}: the API returned {len(runs)} of {announced} runs, newest "
+                    "first, so the oldest part of the range was never delivered — "
+                    "narrow the window or the range of repositories"),
+            # Coverage reaches only as far back as what actually arrived. `None` when
+            # nothing usable did, which reads as "no records" rather than "no runs".
+            covered_from=_parse_iso(oldest) if oldest else None,
+        )
     return parse_run_list(
         json.dumps({"workflow_runs": runs}),
-        source=f"gh api repos/{repo_slug}/actions/runs ({query})",
-        # Coverage is exactly the range requested; an unbounded query establishes
-        # nothing about how far back the platform still keeps runs.
+        source=source,
+        # Everything the filter matched arrived, so the requested range really was
+        # covered — including the case where it matched nothing, which is evidence
+        # that no run happened rather than evidence of a truncated read.
         covered_from=since,
     )
 

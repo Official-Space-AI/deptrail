@@ -743,3 +743,21 @@ class TestOpenUpperBound:
         # With no recorded removal, a December tree was inside the window too — and it
         # is a tree whose versions this tool cannot read, so it must not be cleared.
         assert [t.path for t in finding.unread_trees] == ["yarn.lock"]
+
+    def test_a_foreign_lockfile_deleted_at_the_first_instant_is_not_unread(self, tmp_path):
+        repo = tmp_path / "edge"
+        repo.mkdir()
+        git(repo, "init", "-q")
+        (repo / "yarn.lock").write_text('# yarn lockfile v1\n')
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "yarn", date="2025-11-20T10:00:00+00:00")
+        (repo / "yarn.lock").unlink()
+        git(repo, "add", "-A")
+        # Deleted at the window's very first instant: it was not there while the
+        # artifact was installable, so it says nothing. A strict comparison here made
+        # the repository INDETERMINATE and moved the exit code from 0 to 2.
+        git(repo, "commit", "-qm", "drop", date="2025-11-24T00:00:00+00:00")
+        for query in (WINDOW, OPEN_WINDOW):
+            finding = scan_repo(repo, query)
+            assert finding.unread_trees == [], query.window_end
+            assert finding.verdict is Verdict.CLEAN

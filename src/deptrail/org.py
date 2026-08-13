@@ -101,13 +101,27 @@ def _workflow_mentions_dir(repo: Path, sha: str, paths: tuple[str, ...],
 
 
 def _is_installed_tree(repo: Path, graded: GradedExposure) -> bool:
-    """Whether this exposure sits in a tree some workflow would have installed."""
+    """Whether this exposure sits in a tree some workflow would have installed.
+
+    Answered from the repository at that commit, never from the strength of the CI
+    evidence. Whether ``examples/app`` is a real application is a fact about the tree;
+    it does not change because a run record expired.
+
+    It used to require ``CONFIRMED`` *and* read only the workflows of implicated runs,
+    which made the classification depend on CI evidence twice. Losing that evidence then
+    deleted the finding rather than weakening it, and the report went on to assert
+    absence: measured at exit 0 with ``scan_complete: true`` for a repository whose CI
+    demonstrably installed the malicious version, once an open window widened the run
+    query past the API's undocumented cap. Weakened evidence must weaken a grade, never
+    remove a finding.
+    """
     lockfile = graded.exposure.lockfile_path
     if is_probably_installed(lockfile):
         return True
     directory = str(PurePosixPath(lockfile).parent)
-    return graded.grade is Grade.CONFIRMED and _workflow_mentions_dir(
-        repo, graded.exposure.commit, graded.workflow_paths, directory
+    sha = graded.exposure.commit
+    return _workflow_mentions_dir(
+        repo, sha, graded.workflow_paths or _workflows_at(repo, sha), directory
     )
 
 
@@ -330,8 +344,15 @@ class OrgReport:
         # question open regardless of what the aggregate verdict became.
         readable = all(f.verdict is not Verdict.INDETERMINATE and not f.warnings
                        for f in self.findings)
+        # And nothing may have been *found*. This is the sentence the exit code speaks —
+        # code 0 says "absence of exposure was established" — so an exposure in the
+        # timeline contradicts it outright, however little can be done about it. Without
+        # this, a repository holding a compromised version whose credentials could not be
+        # named exited 0: no rotation item to raise the code to 1, and no unread tree or
+        # truncated clone to lower it to 2.
         return (not self.errors and not self.transient and not self.partial_coverage
-                and readable and not self.unread and not self.incomplete)
+                and readable and not self.unread and not self.incomplete
+                and not self.exposed_repos)
 
 
 def scan_organization(repos: Iterable[tuple[str, Path]], plan: QueryPlan, *,
@@ -516,13 +537,24 @@ def _rotate_summary(items: tuple[RotationItem, ...], repos: tuple[str, ...]) -> 
     return ", ".join(parts)
 
 
-def render_report(report: OrgReport) -> str:
-    """A terminal report: the timeline, then the rotation list, then the caveats."""
+def render_report(report: OrgReport, advisory=None) -> str:
+    """A terminal report: the timeline, then the rotation list, then the caveats.
+
+    The advisory is optional but wanted: this is the format the composite action writes
+    to its step summary, and without it the report never showed the window at all — so a
+    reader could not tell a window known to have closed from one still open, which is the
+    difference between "this cannot have been installed since" and "it still can".
+    """
     lines = [
         f"advisory {report.advisory_id} — {report.advisory_name}",
         f"scanned {report.repos_scanned} repo(s); worst grade {report.worst_grade.value}",
-        "",
     ]
+    if advisory is not None:
+        start, end = advisory.window
+        closed = ("still open — no removal time is recorded, so exposure cannot be "
+                  "ruled out after this" if end is None else end.isoformat())
+        lines += _folded(f"installable window {start.isoformat()} → ", closed, " " * 4)
+    lines.append("")
     installed = [e for e in report.timeline if e.probably_installed]
     if installed:
         lines.append("timeline")

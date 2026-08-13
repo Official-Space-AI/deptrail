@@ -433,15 +433,123 @@ class TestOpenUpperBound:
         with pytest.raises(IocError, match=r"\.\. open\]"):
             parse_advisory(json.dumps(body))
 
-    def test_the_template_leaves_the_end_null_rather_than_asking_for_a_guess(self):
+    def test_the_template_writes_null_only_when_asked_to(self):
         from deptrail.ioc import advisory_template
 
-        body = json.loads(advisory_template(package="chalk", versions=("5.6.1",),
-                                            start="2025-09-08T13:13:05+00:00"))
-        # A placeholder here asks for a number nothing records, and the nearest number
-        # to hand — the advisory's publication time — is the error that hides exposure.
-        assert body["window"]["end"] is None
-        assert "null" in body["notes"]
-        # The template as a whole must still refuse to validate on its other blanks.
-        with pytest.raises(IocError):
+        # Silence is not a statement that the end is unknown. Inferring one from the
+        # other would turn a forgotten flag into a window that never closes, and this
+        # module infers nothing anywhere else.
+        silent = json.loads(advisory_template(package="chalk", versions=("5.6.1",),
+                                              start="2025-09-08T13:13:05+00:00"))
+        assert silent["window"]["end"].startswith("REPLACE-ME")
+        assert "--end-unknown" in silent["window"]["end"]
+
+        asked = json.loads(advisory_template(package="chalk", versions=("5.6.1",),
+                                             start="2025-09-08T13:13:05+00:00",
+                                             end_unknown=True))
+        assert asked["window"]["end"] is None
+        assert "null" in asked["notes"]
+
+    def test_a_template_with_blanks_still_refuses_to_validate(self):
+        from deptrail.ioc import advisory_template
+
+        for kwargs in ({}, {"end_unknown": True}):
+            with pytest.raises(IocError):
+                parse_advisory(advisory_template(**kwargs))
+
+
+class TestWindowBoundariesAreInclusive:
+    """Every comparison this feature rewrote, tested at the instant it turns over.
+
+    Mutation review found nine of these unguarded: the tests probed hours either side
+    of an edge and never the edge itself, so an off-by-one at any boundary passed the
+    whole suite. `docs/ioc-format.md` promises "inclusive on both ends", and one of
+    those off-by-ones removes proof that CI executed the artifact.
+    """
+
+    START = datetime(2025, 9, 8, 13, 13, 5, tzinfo=timezone.utc)
+    END = datetime(2025, 9, 8, 14, 47, 54, tzinfo=timezone.utc)
+
+    def _query(self, end):
+        body = {
+            "schema_version": 1, "id": "GHSA-edge", "name": "Edges",
+            "ecosystem": "npm", "coverage": "complete",
+            "window": {"start": self.START.isoformat(),
+                       "end": None if end is None else end.isoformat()},
+            "packages": [{"name": "chalk", "versions": ["5.6.1"],
+                          "sources": ["https://example.test/a"]}],
+            "sources": ["https://example.test/a"],
+        }
+        return parse_advisory(json.dumps(body)).plan().entries[0].query
+
+    @pytest.mark.parametrize("end", [None, END])
+    def test_the_first_instant_is_inside(self, end):
+        # A run at exactly the publish instant fetched the artifact. Excluding it turns
+        # a CONFIRMED execution into "no CI run built this", and the credential from
+        # REPO_WIDE into DEVELOPER.
+        query = self._query(end)
+        assert query.covers(self.START)
+        assert not query.covers(self.START - timedelta(seconds=1))
+
+    def test_the_last_instant_of_a_closed_window_is_inside(self):
+        query = self._query(self.END)
+        assert query.covers(self.END)
+        assert not query.covers(self.END + timedelta(seconds=1))
+
+    def test_a_one_instant_window_is_legal(self):
+        # Inclusive on both ends means start == end names exactly one instant. Rejecting
+        # it would refuse a feed whose only known fact is the publish time.
+        query = self._query(self.START)
+        assert query.covers(self.START)
+        assert not query.covers(self.START + timedelta(seconds=1))
+
+    def test_a_package_window_may_end_exactly_when_the_advisory_does(self):
+        body = {
+            "schema_version": 1, "id": "GHSA-edge", "name": "Edges",
+            "ecosystem": "npm", "coverage": "complete",
+            "window": {"start": self.START.isoformat(), "end": self.END.isoformat()},
+            "packages": [{"name": "chalk", "versions": ["5.6.1"],
+                          "window": {"start": self.START.isoformat(),
+                                     "end": self.END.isoformat()},
+                          "sources": ["https://example.test/a"]}],
+            "sources": ["https://example.test/a"],
+        }
+        # Coincident edges are inside, not outside. The message for the rejection would
+        # have declared two identical intervals not-inside one another.
+        query = parse_advisory(json.dumps(body)).plan().entries[0].query
+        assert query.window_end == self.END
+
+    def test_a_package_window_end_reaches_the_query(self):
+        narrow = self.START + timedelta(minutes=30)
+        body = {
+            "schema_version": 1, "id": "GHSA-edge", "name": "Edges",
+            "ecosystem": "npm", "coverage": "complete",
+            "window": {"start": self.START.isoformat(), "end": None},
+            "packages": [{"name": "chalk", "versions": ["5.6.1"],
+                          "window": {"start": self.START.isoformat(),
+                                     "end": narrow.isoformat()},
+                          "sources": ["https://example.test/a"]}],
+            "sources": ["https://example.test/a"],
+        }
+        # A closed package window inside an open advisory window is the combination this
+        # feature newly legalised, and the end has to survive the trip into the query —
+        # asserting `is None` when the advisory's end is also None cannot tell which of
+        # the two it read.
+        query = parse_advisory(json.dumps(body)).plan().entries[0].query
+        assert query.window_end == narrow
+
+    def test_a_start_in_the_future_is_refused_with_an_open_end(self):
+        future = datetime.now(timezone.utc) + timedelta(days=365)
+        body = {
+            "schema_version": 1, "id": "GHSA-typo", "name": "Mistyped year",
+            "ecosystem": "npm", "coverage": "complete",
+            "window": {"start": future.isoformat(), "end": None},
+            "packages": [{"name": "chalk", "versions": ["5.6.1"],
+                          "sources": ["https://example.test/a"]}],
+            "sources": ["https://example.test/a"],
+        }
+        # `start <= end` used to catch a mistyped year for free. With an open end there
+        # was no constraint at all, so the feed validated, described a window containing
+        # nothing that has happened, and every scan answered "no exposure found".
+        with pytest.raises(IocError, match="is in the future"):
             parse_advisory(json.dumps(body))

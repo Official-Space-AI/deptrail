@@ -20,8 +20,9 @@ from deptrail.grading import (
     parse_run_list,
     grade_finding,
     installs_from_workflows,
+    runs_from_github,
 )
-from deptrail.history import Exposure, RepoFinding, Verdict, WindowQuery
+from deptrail.history import Exposure, RepoFinding, Verdict, WindowQuery, _parse_iso
 
 WINDOW = WindowQuery(
     package="chalk",
@@ -435,20 +436,15 @@ class TestOpenUpperBoundChangesVerdicts:
         )
         assert graded.grade is Grade.CONFIRMED
 
-    def test_an_open_window_and_a_still_pinned_lockfile_leave_the_overlap_open(self):
-        from deptrail.grading import _overlap
+    def test_the_overlap_starts_at_whichever_began_later(self):
+        from deptrail.grading import _overlap_start
 
-        start, end = _overlap(exposure(until=None), OPEN_WINDOW)
-        assert start == datetime(2025, 11, 25, tzinfo=timezone.utc)
-        assert end is None
-
-    def test_a_closing_pin_still_closes_the_overlap_under_an_open_window(self):
-        from deptrail.grading import _overlap
-
-        _, end = _overlap(exposure(), OPEN_WINDOW)
-        # The pin ended even though the artifact's removal was never recorded, so the
-        # overlap ends with the pin.
-        assert end == datetime(2025, 11, 28, tzinfo=timezone.utc)
+        # The window opens first, so the pin's own start is where an install counts.
+        assert _overlap_start(exposure(until=None), OPEN_WINDOW) == datetime(
+            2025, 11, 25, tzinfo=timezone.utc)
+        # And the reverse: a pin older than the incident counts from the window.
+        early = exposure(since=datetime(2025, 1, 1, tzinfo=timezone.utc))
+        assert _overlap_start(early, OPEN_WINDOW) == OPEN_WINDOW.window_start
 
 
 class TestNothingIsAfterAnOpenEnd:
@@ -465,3 +461,117 @@ class TestNothingIsAfterAnOpenEnd:
         assert graded.grade is not Grade.LIKELY
         assert not any("no longer served" in e for e in graded.evidence)
         assert graded.implicates_install is False
+
+
+class TestBoundaryInstants:
+    """The edges of the two run filters this feature rewrote."""
+
+    def test_a_run_at_the_exact_window_start_confirms(self):
+        # `during` uses `live_start <= r.at`. Making it strict loses proof that CI
+        # fetched the artifact, and quietly moves the credential from REPO_WIDE to
+        # DEVELOPER scope — the responder is told the Actions secret was not exercised.
+        at_start = run(at=OPEN_WINDOW.window_start)
+        graded = grade_exposure(
+            exposure(since=datetime(2025, 11, 20, tzinfo=timezone.utc), until=None),
+            OPEN_WINDOW, history(at_start),
+        )
+        assert graded.grade is Grade.CONFIRMED
+        assert graded.implicates_install is True
+
+    def test_a_run_at_the_exact_window_end_confirms(self):
+        at_end = run(at=WINDOW.window_end)
+        graded = grade_exposure(
+            exposure(since=datetime(2025, 11, 25, tzinfo=timezone.utc), until=None),
+            WINDOW, history(at_end),
+        )
+        assert graded.grade is Grade.CONFIRMED
+
+    def test_a_run_at_the_exact_window_end_is_not_late(self):
+        # `later` uses `r.at > window_end`. At `>=` the same run is described as having
+        # run "after ... when 5.6.1 was no longer served", which is false at the
+        # inclusive edge.
+        late_side = WindowQuery(
+            package="chalk", malicious_versions=frozenset({"5.6.1"}),
+            window_start=datetime(2025, 11, 24, tzinfo=timezone.utc),
+            window_end=datetime(2025, 11, 26, 23, 59, 59, tzinfo=timezone.utc),
+        )
+        at_end = run(at=late_side.window_end)
+        graded = grade_exposure(
+            exposure(since=datetime(2025, 11, 27, tzinfo=timezone.utc), until=None),
+            late_side, history(at_end),
+        )
+        assert not any("no longer served" in e for e in graded.evidence)
+
+
+class TestTruncatedRunListIsNotCoverage:
+    """The runs endpoint stops at a fixed count, newest first, with HTTP 200.
+
+    Nothing in the body says so — the only signal is that page 1 announced a larger
+    `total_count` than the number of runs that arrived. Believing the requested range
+    was covered reports the incident period as quiet rather than unanswered, and for a
+    lockfile outside the repository root that demotion deletes the finding: measured at
+    exit 0 with `scan_complete: true` for a repository whose CI installed chalk 5.6.1.
+
+    An open-ended window makes the range wide enough to hit the cap on ordinary
+    repositories — `expressjs/express` reports 1,045 runs over eleven months.
+    """
+
+    SINCE = datetime(2025, 9, 7, tzinfo=timezone.utc)
+
+    def _gh(self, monkeypatch, *, total, returned):
+        """Fake `gh api --paginate --slurp`, newest-first and capped like the real one."""
+        import subprocess as sp
+
+        import deptrail.grading as grading
+
+        # The runs that arrive are the newest ones, and they built later commits — the
+        # runs on the exposing commit are exactly the ones the cap dropped.
+        newest = datetime(2026, 8, 1, tzinfo=timezone.utc)
+        runs = [{"id": i, "head_sha": OTHER, "event": "push", "name": "CI",
+                 "run_started_at": (newest - timedelta(hours=i)).isoformat()}
+                for i in range(returned)]
+        page = {"total_count": total, "workflow_runs": runs}
+        monkeypatch.setattr(grading.subprocess, "run", lambda *a, **k: sp.CompletedProcess(
+            a[0] if a else [], 0, stdout=json.dumps([page]), stderr=""))
+        return runs
+
+    def test_a_truncated_read_does_not_claim_the_requested_range(self, monkeypatch):
+        runs = self._gh(monkeypatch, total=1045, returned=1000)
+        history = runs_from_github("o/r", since=self.SINCE, until=None)
+        oldest_returned = min(_parse_iso(r["run_started_at"]) for r in runs)
+        # Coverage reaches only as far back as what arrived, so the incident period is
+        # unanswered rather than quiet.
+        assert history.oldest_available == oldest_returned
+        assert not history.covers(self.SINCE)
+        assert "1000 of 1045" in history.source
+
+    def test_the_exposure_stays_unproven_rather_than_becoming_clean(self, monkeypatch):
+        self._gh(monkeypatch, total=1045, returned=1000)
+        history = runs_from_github("o/r", since=self.SINCE, until=None)
+        window = WindowQuery(
+            package="chalk", malicious_versions=frozenset({"5.6.1"}),
+            window_start=self.SINCE, window_end=None,
+        )
+        graded = grade_exposure(
+            exposure(since=datetime(2025, 9, 8, tzinfo=timezone.utc), until=None),
+            window, history,
+        )
+        assert graded.grade is Grade.POSSIBLE
+        assert any("no CI records reach back" in e for e in graded.evidence)
+        # And the report says which read fell short, or the caveat is unactionable.
+        assert any("1000 of 1045" in e for e in graded.evidence)
+
+    def test_a_complete_read_still_claims_the_range(self, monkeypatch):
+        self._gh(monkeypatch, total=3, returned=3)
+        history = runs_from_github("o/r", since=self.SINCE, until=None)
+        assert history.oldest_available == self.SINCE
+        assert history.covers(self.SINCE)
+        assert "of" not in history.source.split("actions/runs")[1]
+
+    def test_an_empty_range_is_evidence_not_truncation(self, monkeypatch):
+        self._gh(monkeypatch, total=0, returned=0)
+        history = runs_from_github("o/r", since=self.SINCE, until=None)
+        # Nothing matched the filter, which means no run happened — real evidence. A
+        # truncated read must not be confused with a quiet repository, nor the reverse.
+        assert history.oldest_available == self.SINCE
+        assert history.covers(self.SINCE)

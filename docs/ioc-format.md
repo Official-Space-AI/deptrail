@@ -16,14 +16,14 @@ An advisory is the question DepTrail answers: *which package versions were malic
   "coverage": "partial",
   "window": {
     "start": "2026-01-02T19:20:42+00:00",
-    "end": "2026-01-03T04:10:00+00:00"
+    "end": null
   },
   "packages": [
     {
       "name": "example-package",
       "versions": ["1.2.3", "1.2.4"],
       "sources": ["https://example.test/advisory"],
-      "notes": "start = publish time of 1.2.3; end = when the registry no longer served either version (verified, see notes)."
+      "notes": "start = time['1.2.3'] from the registry packument. end = null: no registry records when a version stopped being served, so it is not known to have closed."
     }
   ],
   "sources": ["https://example.test/advisory"]
@@ -31,8 +31,9 @@ An advisory is the question DepTrail answers: *which package versions were malic
 ```
 
 The window above is a **placeholder with the right shape**: start at the first
-malicious publish, end after the artifact stopped being installable. Do not copy
-timestamps from an advisory's headline — read the next section first.
+malicious publish, read from the registry; end `null`, because no registry records a
+removal. Do not copy timestamps from an advisory's headline — read the next section
+first.
 
 ## Fields
 
@@ -114,7 +115,8 @@ any repo could install the bad artifact, so every scan returns CLEAN.
 
 **Nothing is inferred.** Unknown fields are an error, not a shrug — a typo'd key
 in a feed transcribed at 3 a.m. would otherwise silently scan for the wrong
-thing. Bounds must be full timestamps with a UTC offset: a bare `2025-11-24` is
+thing. `window.end` may be `null` and nothing else may be omitted; every bound that is
+written must be a full timestamp with a UTC offset, so a bare `2025-11-24` is
 rejected, because deciding which instants a published date covers is a judgment,
 and it belongs in the feed where a reader of the report can see it (write
 `2025-11-24T00:00:00+00:00` and `2025-11-24T23:59:59+00:00` yourself).
@@ -131,7 +133,7 @@ under a partial feed means "nothing found among the packages this feed lists".
 ```python
 from deptrail.ioc import load_advisory
 advisory = load_advisory("example-demo")        # bundled feed name, or any file path
-queries = advisory.queries()                   # one WindowQuery per package
+queries = advisory.plan().queries              # one WindowQuery per package
 ```
 
 | Feed | Incident | Coverage |

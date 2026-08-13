@@ -1351,3 +1351,38 @@ class TestRenderersDeriveTheMergeOnce:
          "html": lambda: render_html(report),
          "json": lambda: _as_dict(report, None)}[renderer]()
         assert len(calls) == 1, f"{renderer} derived the rotation merge {len(calls)} times"
+
+
+class TestAbsenceIsNeverProvenAlongsideAnExposure:
+    def test_an_exposed_repo_stops_the_all_clear(self, tmp_path, plan):
+        repo = make_repo(tmp_path, "api", [("2025-11-25T10:00:00+00:00", "5.6.1")])
+        report = scan_organization([("api", repo)], plan, runs=no_runs,
+                                   secrets=lambda p, n: ())
+        # The repository holds no secrets, so there is no rotation item to raise the exit
+        # code and no unread tree to lower it — and the exposure is in the timeline.
+        # `proves_absence` is the sentence exit 0 speaks; it cannot be true here.
+        assert report.exposed_repos == ("api",)
+        assert report.rotation_items == ()
+        assert report.proves_absence is False
+
+    def test_a_clean_repo_still_proves_absence(self, tmp_path, plan):
+        repo = make_repo(tmp_path, "web", [("2025-11-25T10:00:00+00:00", "5.6.0")])
+        report = scan_organization([("web", repo)], plan, runs=no_runs,
+                                   secrets=secrets_provider)
+        assert report.exposed_repos == ()
+        assert report.proves_absence is True
+
+    def test_a_set_aside_fixture_still_proves_absence(self, tmp_path, plan):
+        # A fixture tree raises no credential and is not an exposure of the repository,
+        # so it must not cost every tooling project its all-clear either.
+        repo = tmp_path / "tool"
+        (repo / "tests/fixtures").mkdir(parents=True)
+        git(repo, "init", "-q")
+        (repo / "tests/fixtures/package-lock.json").write_text(lock("5.6.1"))
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "fixtures", date="2025-11-25T10:00:00+00:00")
+        report = scan_organization([("tool", repo)], plan, runs=no_runs,
+                                   secrets=secrets_provider)
+        assert report.exposed_repos == ()
+        assert report.set_aside
+        assert report.proves_absence is True
