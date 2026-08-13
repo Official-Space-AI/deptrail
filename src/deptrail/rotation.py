@@ -142,10 +142,19 @@ class RotationItem:
     secret: str
     scope: Scope
     grade: Grade
-    # No default: an item with no cause renders as a rotation line ending in a bare
-    # em dash, which is a credential on a checklist with the reason missing.
     causes: tuple[Caveat, ...]
     run_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        # Refused rather than merely undefaulted. Dropping the default stops the field
+        # being forgotten; it does not stop an explicit `()` or a
+        # `replace(item, causes=())`, and either renders a rotation line that ends in
+        # a bare em dash — a credential on a checklist with its reason missing.
+        if not self.causes:
+            raise ValueError(
+                f"{self.repo}: {self.secret} has no cause; a credential goes on the "
+                "rotation list only with the evidence that put it there"
+            )
 
     @property
     def is_narrowed(self) -> bool:

@@ -138,17 +138,35 @@ Two consequences worth knowing:
   evidence lines are not folded and can still run past 96; they are one fact each,
   and they did not change here.)
 
-  Two things the fold deliberately does *not* do. It never breaks a word, so a
-  secret name, a lockfile path or a `package@version` stays greppable in a saved
-  report — which means a single token longer than 96 columns will exceed it. And it
-  never folds the identity that opens a line (`grade`, repo, secret, scope, run ids):
-  a long repository and secret name together can push that one line past the width,
-  and it takes a line of its own rather than pushing the body over too.
+  Two things the fold deliberately does *not* do, with the measured limits rather
+  than the intended ones:
 
-One caveat is not yet grouped this way and still prints once per package: the
-CI-retention note bakes a per-package timestamp into its prose, and the useful merged
-form is a single earliest instant rather than a list of them, which makes it a
-semantics change rather than a rendering one. See issue #33.
+  - **It never breaks a word**, so a secret name or a `package@version` survives
+    intact for `grep`. The continuation indent counts against the width, so the
+    longest run of non-whitespace that can be kept *and* hold the line to 96 columns
+    is **80** characters; a longer one is still kept whole and its line runs over —
+    an 82-character lockfile path produces a 99-column line. The unit is the
+    whitespace-delimited run, not the path, so trailing punctuation counts against
+    it. A path containing whitespace is therefore the exception: it is not one run, a
+    long enough one is folded at its space, and the exact path string will not be
+    found in the output.
+  - **It never folds the identity that opens a line** (grade, repo, secret, scope,
+    run ids). A long repository and secret name together can push that line past the
+    width; it takes a line of its own rather than pushing the body over too.
+
+Two things are **not** solved by this, both measured:
+
+- **One caveat still prints once per package.** The CI-retention note bakes a
+  per-package timestamp into its prose, and the useful merged form is a single
+  earliest instant rather than a list of them, which makes it a semantics change
+  rather than a rendering one. See issue #33.
+- **At monorepo scale the rotation list is still too long to act on.** Grouping works
+  within one credential, so eight credentials implicated by the same 50 lockfiles ×
+  180 packages print that evidence eight times: 16,414 lines for eight actions. It is
+  4.2× smaller than before the grouping — which produced 14 lines of roughly 440 kB
+  each — and still not actionable. Fixing it means grouping *items* by identical cause
+  set and treating the lockfile path as a subject rather than as prose, the same
+  lesson one level up. See issue #35.
 
 ## What the report refuses to claim
 

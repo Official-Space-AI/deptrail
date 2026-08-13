@@ -247,14 +247,25 @@ class OrgReport:
         """
         return tuple(sorted({r.repo for r in self.rotations if r.unnamed}))
 
-    @property
-    def rotation_required(self) -> bool:
+    def requires_rotation(self, items: tuple[RotationItem, ...] | None = None) -> bool:
         """Whether a responder has credentials to act on.
 
         True when items were named *or* a repository's credentials are at risk but
         could not be listed — an empty item list is not an all-clear.
+
+        Takes the items when a caller already has them. ``rotation_items`` is a merge
+        quadratic in the items, and a caller that needs both the list and this answer
+        would otherwise pay for it twice; the rule itself lives here so the two
+        cannot drift apart.
         """
-        return bool(self.rotation_items) or any(r.unnamed for r in self.rotations)
+        if items is None:
+            items = self.rotation_items
+        return bool(items) or any(r.unnamed for r in self.rotations)
+
+    @property
+    def rotation_required(self) -> bool:
+        """``requires_rotation`` for callers that do not hold the items."""
+        return self.requires_rotation()
 
     def _grouped(self, pick: Callable[[RepoRotation], Iterable[Caveat]],
                  ) -> tuple[str, ...]:
@@ -462,8 +473,10 @@ def _folded(prefix: str, body: str, indent: str) -> list[str]:
     is not foldable: a repository or secret name has to stay in one piece.
 
     Words are never broken, so a secret name, a flag or a ``package@version``
-    survives intact for whoever greps the output — which means a single token longer
-    than the width will exceed it, and that is the trade this makes deliberately.
+    survives intact for whoever greps the output. That is a deliberate trade against
+    the width: since the continuation indent counts, a token longer than
+    ``BODY_WIDTH - len(indent)`` is kept whole and its line runs over. A path
+    containing whitespace is not one token and is the case this cannot keep.
     """
     if len(prefix) + MIN_BODY > BODY_WIDTH:
         folded = textwrap.wrap(body, width=BODY_WIDTH, initial_indent=indent,
@@ -575,10 +588,11 @@ def render_report(report: OrgReport) -> str:
         lines += [f"  {u}" for u in report.unread]
     # The same reasons reach `rotation_notes` for a repo that also rotates; print
     # each once, under the heading that explains it.
-    if report.caveats:
+    caveats = report.caveats
+    if caveats:
         lines.append("")
         lines.append("caveats")
-        for caveat in report.caveats:
+        for caveat in caveats:
             lines += _folded("  ", caveat, " " * 4)
     if not report.proves_absence:
         lines += ["", "this scan cannot prove absence of exposure"]

@@ -7,6 +7,7 @@ claim an all-clear.
 import json
 import os
 import subprocess
+from dataclasses import replace
 from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
@@ -965,6 +966,27 @@ class TestOneSentencePerRepoNotPerPackage:
         for line in report.unnamed_rotations:
             assert line not in report.caveats
 
+    def test_the_renderers_actually_use_that_subtraction(self, tmp_path, three):
+        from deptrail.report import render_html
+
+        repo = make_multi_repo(tmp_path, "r2")
+        report = scan_organization([("r2", repo)], three, runs=no_runs)
+        assert report.unnamed_rotations
+        # Asserting on `report.caveats` alone tests a property no renderer is obliged
+        # to call: reverting render_report to its own older subtraction printed the
+        # same risk twice and every test still passed. So the assertion has to be made
+        # against the rendered output, where the duplication would actually be read.
+        #
+        # Compared as normalised words rather than as lines, because the terminal
+        # renderer folds a long line and the two copies would carry different indents.
+        text = " ".join(render_report(report).split())
+        html = " ".join(render_html(report).split())
+        for line in report.unnamed_rotations:
+            sentence = " ".join(line.split())
+            assert text.count(sentence) == 1, sentence
+            # The HTML escapes it, so the escaped form is what to count there.
+            assert html.count(escape(sentence)) == 1, sentence
+
     def test_merged_reason_keeps_every_version_and_the_whole_sentence(self, tmp_path,
                                                                      three):
         repo = make_multi_repo(tmp_path, "r2")
@@ -1201,6 +1223,37 @@ class TestFoldingHoldsItsPromise:
         assert path in text
         assert "package-lock.json" in text
 
+    def test_the_width_holds_only_up_to_the_foldable_token_length(self):
+        from deptrail.org import _folded
+
+        indent = " " * 16
+        # The continuation indent counts against the width, so the real limit is not
+        # BODY_WIDTH — it is BODY_WIDTH minus the indent. The 76-character fixture
+        # above sits under it and so cannot see the boundary at all.
+        #
+        # And the unit is the whitespace-delimited chunk, not the path: a trailing
+        # comma travels with it and costs one character. Writing this test against the
+        # path length alone got the boundary wrong by exactly that comma.
+        limit = self.WIDTH - len(indent)
+        for length, expected in ((limit, True), (limit + 1, False)):
+            chunk = "services/" + "a" * (length - 27) + "/package-lock.json"
+            assert len(chunk) == length
+            lines = _folded("  [X] api: K — ", f"pinned in {chunk} and nothing ran", indent)
+            assert any(chunk in line for line in lines), "the chunk must survive whole"
+            assert (max(len(line) for line in lines) <= self.WIDTH) is expected, chunk
+
+    def test_a_path_with_a_space_is_the_case_folding_cannot_keep(self):
+        from deptrail.org import _folded
+
+        # Whitespace is legal in a git path, and it is what makes a path not one
+        # token. Documented as the exception rather than claimed away, so this pins
+        # the honest behaviour: the words survive, the exact path string does not.
+        spaced = "services/" + "a" * 38 + " " + "b" * 32 + "/package-lock.json"
+        lines = _folded("  [CONFIRMED  ] api: K [REPO_WIDE] — ",
+                        f"pinned in {spaced}, and nothing ran", " " * 16)
+        assert not any(spaced in line for line in lines)
+        assert any("package-lock.json" in line for line in lines)
+
     def test_nothing_to_say_produces_no_line_at_all(self):
         from deptrail.org import _folded
 
@@ -1242,3 +1295,59 @@ class TestRenderedShapeIsPinned:
         # is the whole reason the sentence is not buried at 180 subjects.
         assert rendered.startswith("what is true")
         assert rendered == "what is true (covers a@1, b@2)"
+
+
+class TestRotationItemRefusesToBeReasonless:
+    def test_an_empty_cause_tuple_is_refused(self):
+        from deptrail.grading import Grade as G
+        from deptrail.rotation import Caveat, RotationItem
+
+        # Dropping the field's default stops it being forgotten; it does not stop an
+        # explicit `()`, and either renders a credential on a checklist with its
+        # reason missing — a rotation line ending in a bare em dash.
+        with pytest.raises(ValueError, match="no cause"):
+            RotationItem(repo="api", secret="K", scope=Scope.REPO_WIDE, grade=G.CONFIRMED,
+                         causes=())
+        valid = RotationItem(repo="api", secret="K", scope=Scope.REPO_WIDE,
+                             grade=G.CONFIRMED, causes=(Caveat("because"),))
+        with pytest.raises(ValueError, match="no cause"):
+            replace(valid, causes=())
+
+
+class TestRenderersDeriveTheMergeOnce:
+    """``rotation_items`` is quadratic in the items, so each renderer gets one look.
+
+    This is a performance contract with a correctness-shaped consequence: the report a
+    responder reads during an incident took 44 s to produce when one renderer derived
+    it three times, and 27 s when the JSON path did. Both were found by review rather
+    than by a test, twice, which is what this pins.
+    """
+
+    @staticmethod
+    def _counting_report():
+        from deptrail.grading import Grade as G
+        from deptrail.org import OrgReport
+        from deptrail.rotation import Caveat, RepoRotation, RotationItem
+
+        item = RotationItem(repo="api", secret="K", scope=Scope.DEVELOPER, grade=G.POSSIBLE,
+                            causes=(Caveat("pinned in package-lock.json", ("chalk@5.6.1",)),))
+        return OrgReport(advisory_id="x", advisory_name="x",
+                         rotations=[RepoRotation(repo="api", items=[item])])
+
+    @pytest.mark.parametrize("renderer", ["text", "html", "json"])
+    def test_one_derivation_per_render(self, renderer, monkeypatch):
+        from deptrail.cli import _as_dict
+        from deptrail.org import OrgReport
+        from deptrail.report import render_html
+
+        calls = []
+        original = OrgReport.rotation_items.fget
+        monkeypatch.setattr(
+            OrgReport, "rotation_items",
+            property(lambda self: (calls.append(1), original(self))[1]),
+        )
+        report = self._counting_report()
+        {"text": lambda: render_report(report),
+         "html": lambda: render_html(report),
+         "json": lambda: _as_dict(report, None)}[renderer]()
+        assert len(calls) == 1, f"{renderer} derived the rotation merge {len(calls)} times"

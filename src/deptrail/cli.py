@@ -71,7 +71,7 @@ class Parser(argparse.ArgumentParser):
         raise SystemExit(EXIT_BAD_INPUT)
 
 
-def _exit_code(report: OrgReport) -> int:
+def _exit_code(report: OrgReport, items=None) -> int:
     """One code per outcome, with no overlap.
 
     Rotation wins over everything: a responder who has credentials to rotate must
@@ -79,8 +79,11 @@ def _exit_code(report: OrgReport) -> int:
     that could not run outranks a history that could not be cleared — one is worth
     retrying and the other is not, and folding them together let a failed API call
     leave as exit 2, which the Action then passes off as a warning (#20).
+
+    ``items`` lets a caller that already merged the rotation list pass it in rather
+    than pay for the merge again.
     """
-    if report.rotation_required:
+    if report.requires_rotation(items):
         return EXIT_ROTATE
     if report.transient:
         return EXIT_TRANSIENT
@@ -120,11 +123,20 @@ def _emit(report: OrgReport, args: argparse.Namespace, advisory: Advisory | None
 
 
 def _as_dict(report: OrgReport, advisory: Advisory | None) -> dict:
-    """The report as data: the decision first, then the evidence behind it."""
+    """The report as data: the decision first, then the evidence behind it.
+
+    ``rotation_items`` is derived once and threaded through. It is a merge that is
+    quadratic in the items, and this function used to reach it three times — once
+    through ``_exit_code``, once through ``rotation_required``, once for the
+    ``rotate`` list — which made the JSON output three times the cost of the text
+    one on the same report.
+    """
+    items = report.rotation_items
+    rotation_required = report.requires_rotation(items)
     payload = {
         "decision": {
-            "exit_code": _exit_code(report),
-            "rotation_required": report.rotation_required,
+            "exit_code": _exit_code(report, items=items),
+            "rotation_required": rotation_required,
             "scan_complete": report.proves_absence,
             "worst_grade": report.worst_grade.value,
         },
@@ -150,7 +162,7 @@ def _as_dict(report: OrgReport, advisory: Advisory | None) -> dict:
         "rotate": [
             {"repo": i.repo, "secret": i.secret, "scope": i.scope.value,
              "grade": i.grade.value, "reason": i.reason, "run_ids": list(i.run_ids)}
-            for i in report.rotation_items
+            for i in items
         ],
         "rotate_unnamed": list(report.unnamed_rotations),
         "errors": list(report.errors),
