@@ -22,13 +22,16 @@ human can overrule the classification; they simply do not produce rotation items
 """
 from __future__ import annotations
 
+import re
 import subprocess
 import textwrap
+from functools import lru_cache
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 
 from .grading import (
+    INSTALL_COMMANDS,
     Grade,
     GradedExposure,
     GradedFinding,
@@ -81,6 +84,37 @@ def is_probably_installed(lockfile_path: str) -> bool:
     return not any(part.lower() in NON_DEPLOYED_DIRS for part in directories)
 
 
+# Ways a workflow says it installs dependencies *in* a directory, rather than merely
+# containing its name somewhere. A bare substring test is not one of them: "test" sits
+# inside `ubuntu-latest`, `pytest` and `npm test`, so a `test/` lockfile matched almost
+# any workflow ever written once the grade gate came off.
+SCOPES_TO_DIR = re.compile(
+    r"working-directory\s*:|cache-dependency-path\s*:|--prefix|(?:^|\s)-C\s|(?:^|;|&)\s*cd\s")
+
+
+def _workflow_installs_dir(repo: Path, sha: str, paths: tuple[str, ...],
+                           directory: str) -> bool:
+    """Whether a workflow at ``sha`` installs dependencies **in** ``directory``.
+
+    The directory has to appear on a line that also installs something, or on one of the
+    keys that scopes a step to a directory. That is a claim about behaviour; a name
+    appearing in a runner label, a step title or a comment is not.
+    """
+    if not directory or directory == ".":
+        return False
+    for path in paths:
+        body = _text_at(repo, sha, path)
+        if body is None:
+            continue
+        for line in body.splitlines():
+            if directory not in line:
+                continue
+            if (any(command in line for command in INSTALL_COMMANDS)
+                    or SCOPES_TO_DIR.search(line)):
+                return True
+    return False
+
+
 def _workflow_mentions_dir(repo: Path, sha: str, paths: tuple[str, ...],
                            directory: str) -> bool:
     """Whether an implicated workflow refers to this lockfile's directory.
@@ -91,13 +125,28 @@ def _workflow_mentions_dir(repo: Path, sha: str, paths: tuple[str, ...],
     ``npm ci`` would be credited with installing ``tests/fixtures``.
     """
     for path in paths:
-        try:
-            body = _git_text(repo, "show", f"{sha}:{path}")
-        except GitError:
-            continue
-        if directory and directory in body:
+        body = _text_at(repo, sha, path)
+        if body is not None and directory and directory in body:
             return True
     return False
+
+
+@lru_cache(maxsize=1024)
+def _text_at_cached(repo: str, sha: str, path: str) -> str | None:
+    try:
+        return _git_text(Path(repo), "show", f"{sha}:{path}")
+    except GitError:
+        return None
+
+
+def _text_at(repo: Path, sha: str, path: str) -> str | None:
+    """One blob at one commit, read once. Keyed on the sha, which fixes the content.
+
+    Uncached, classifying one exposure per lockfile per advisory package re-read every
+    workflow every time: 780 git subprocesses and a 12x wall clock on a repository with
+    thirty fixture lockfiles, for a byte-identical answer.
+    """
+    return _text_at_cached(str(repo), sha, path)
 
 
 def _is_installed_tree(repo: Path, graded: GradedExposure) -> bool:
@@ -120,8 +169,14 @@ def _is_installed_tree(repo: Path, graded: GradedExposure) -> bool:
         return True
     directory = str(PurePosixPath(lockfile).parent)
     sha = graded.exposure.commit
-    return _workflow_mentions_dir(
-        repo, sha, graded.workflow_paths or _workflows_at(repo, sha), directory
+    if _workflow_installs_dir(
+            repo, sha, graded.workflow_paths or _workflows_at(repo, sha), directory):
+        return True
+    # And never narrower than before: where a run is implicated, the whole workflow body
+    # stays evidence, which is the rule this function has always applied. Only the
+    # evidence-independent path above is new, and it is precise on purpose.
+    return graded.grade is Grade.CONFIRMED and _workflow_mentions_dir(
+        repo, sha, graded.workflow_paths, directory
     )
 
 
@@ -132,12 +187,17 @@ def _workflows_at(repo: Path, sha: str) -> tuple[str, ...]:
     during the window and was deleted afterwards is exactly the evidence that
     matters, and looking at today's tree loses it.
     """
+    listing = _tree_at(str(repo), sha)
+    return tuple(line for line in listing.splitlines() if line.strip())
+
+
+@lru_cache(maxsize=1024)
+def _tree_at(repo: str, sha: str) -> str:
     try:
-        out = _git_text(repo, "ls-tree", "-r", "--name-only", sha,
-                        ".github/workflows")
+        return _git_text(Path(repo), "ls-tree", "-r", "--name-only", sha,
+                         ".github/workflows")
     except GitError:
-        return ()
-    return tuple(line for line in out.splitlines() if line.strip())
+        return ""
 
 
 def _is_installed_unread_tree(repo: Path, tree: UnreadTree) -> bool:

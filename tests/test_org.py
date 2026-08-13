@@ -1386,3 +1386,86 @@ class TestAbsenceIsNeverProvenAlongsideAnExposure:
         assert report.exposed_repos == ()
         assert report.set_aside
         assert report.proves_absence is True
+
+
+class TestADirectoryNameIsNotAnInstallClaim:
+    """Widening the classification must not widen it to substring coincidences.
+
+    Dropping the grade gate let every set-aside exposure match its directory name against
+    every workflow, by bare substring. `"test"` sits inside `ubuntu-latest`, `pytest` and
+    `npm test`, so a `test/package-lock.json` matched almost any workflow ever written and
+    a clean repository started failing its own CI: exit 0 became exit 1, or 2 where the
+    secret listing was empty.
+    """
+
+    WORKFLOWS = {
+        "runner label": "name: CI\non: [push]\njobs:\n  b:\n    runs-on: ubuntu-latest\n"
+                        "    steps:\n      - run: echo hi\n",
+        "a test command": "name: CI\non: [push]\njobs:\n  b:\n    steps:\n"
+                          "      - run: pytest tests/e2e\n",
+        "a step title": "name: CI\non: [push]\njobs:\n  b:\n    steps:\n"
+                        "      - name: record the demo video\n        run: echo hi\n",
+        "a comment": "name: CI\non: [push]\njobs:\n  b:\n    steps:\n"
+                     "      # examples/app is never installed here\n      - run: echo hi\n",
+    }
+    INSTALLS = {
+        "a prefixed install": "name: CI\non: [push]\njobs:\n  b:\n    steps:\n"
+                              "      - run: npm ci --prefix test\n",
+        "a scoped step": "name: CI\non: [push]\njobs:\n  b:\n    steps:\n"
+                         "      - working-directory: test\n        run: npm ci\n",
+        "a cache path": "name: CI\non: [push]\njobs:\n  b:\n    steps:\n"
+                        "      - uses: actions/setup-node@v4\n"
+                        "        with:\n          cache-dependency-path: test/package-lock.json\n"
+                        "      - run: npm ci\n",
+    }
+
+    def _scan(self, tmp_path, name, workflow, directory="test"):
+        repo = tmp_path / name
+        (repo / directory).mkdir(parents=True)
+        (repo / ".github/workflows").mkdir(parents=True)
+        git(repo, "init", "-q")
+        (repo / ".github/workflows/ci.yml").write_text(workflow)
+        (repo / directory / "package-lock.json").write_text(lock("5.6.1"))
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "deps", date="2025-11-25T10:00:00+00:00")
+        return scan_organization([(name, repo)], self.plan, runs=no_runs,
+                                 secrets=lambda p, n: ("NPM_TOKEN",))
+
+    @pytest.fixture(autouse=True)
+    def _plan(self, plan):
+        self.plan = plan
+
+    @pytest.mark.parametrize("label", list(WORKFLOWS))
+    def test_a_mention_alone_does_not_install(self, tmp_path, label):
+        directory = "examples/app" if label == "a comment" else "test"
+        report = self._scan(tmp_path, f"r{abs(hash(label)) % 999}", self.WORKFLOWS[label],
+                            directory)
+        assert report.rotation_items == (), label
+        assert report.set_aside, label
+
+    @pytest.mark.parametrize("label", list(INSTALLS))
+    def test_an_install_in_that_directory_does(self, tmp_path, label):
+        report = self._scan(tmp_path, f"i{abs(hash(label)) % 999}", self.INSTALLS[label])
+        # Evidence-independent on purpose: no CI record was consulted, and the workflow
+        # says plainly that it installs there.
+        assert {i.secret for i in report.rotation_items} == {"NPM_TOKEN"}, label
+        assert report.set_aside == (), label
+
+    def test_a_confirmed_run_keeps_the_older_broader_rule(self, tmp_path, plan):
+        # Never narrower than before: with a run implicated, the whole workflow body is
+        # still evidence, which is what this function always did.
+        repo = tmp_path / "confirmed"
+        (repo / "examples/app").mkdir(parents=True)
+        (repo / ".github/workflows").mkdir(parents=True)
+        git(repo, "init", "-q")
+        (repo / ".github/workflows/ci.yml").write_text(
+            "name: CI\non: [push]\njobs:\n  b:\n    steps:\n      - run: npm ci\n"
+            "      # deploys examples/app\n      - run: deploy\n        env:\n"
+            "          T: ${{ secrets.NPM_TOKEN }}\n")
+        (repo / "examples/app/package-lock.json").write_text(lock("5.6.1"))
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "deps", date="2025-11-25T10:00:00+00:00")
+        report = scan_organization([("confirmed", repo)], plan,
+                                   runs=runs_with(head(repo)),
+                                   secrets=lambda p, n: ("NPM_TOKEN",))
+        assert report.exposed_repos == ("confirmed",)

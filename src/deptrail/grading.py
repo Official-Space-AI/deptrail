@@ -39,7 +39,7 @@ from __future__ import annotations
 
 import json
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
@@ -426,19 +426,27 @@ def runs_from_github(repo_slug: str, *, since: datetime | None = None,
     # runs and returns the newest thousand, so the runs from the *incident* are exactly
     # the ones missing. Believing the requested range was covered then reports that
     # period as quiet rather than as unanswered, which is a false clean.
+    # `total_count` is on every page but is not stable — the page past the cap reports 0 —
+    # so page 1 is the one to believe. Anything other than exact agreement means the count
+    # cannot be used to certify the read: fewer runs than announced is the cap, more is a
+    # list that shifted mid-pagination, and no pages at all is a `gh` that printed nothing.
     announced = pages[0].get("total_count") if pages else None
-    if announced is not None and len(runs) < announced:
-        oldest = min((r.get("run_started_at") or r.get("created_at") for r in runs
-                      if r.get("run_started_at") or r.get("created_at")), default=None)
-        return parse_run_list(
+    if announced != len(runs):
+        unverified = parse_run_list(
             json.dumps({"workflow_runs": runs}),
-            source=(f"{source}: the API returned {len(runs)} of {announced} runs, newest "
-                    "first, so the oldest part of the range was never delivered — "
-                    "narrow the window or the range of repositories"),
-            # Coverage reaches only as far back as what actually arrived. `None` when
-            # nothing usable did, which reads as "no records" rather than "no runs".
-            covered_from=_parse_iso(oldest) if oldest else None,
+            source=(f"{source}: the API returned {len(runs)} run(s) against a reported "
+                    f"total of {announced}, newest first, so the oldest part of the range "
+                    "was not delivered — narrow the window, or the range of repositories"),
+            covered_from=None,
         )
+        # From the records that survived parsing, and from ``RunRecord.at`` — the same
+        # clock the grader compares against. Taken from the raw list instead, a single
+        # run serialised with a zero date claimed coverage back to year 1, which is the
+        # widest claim expressible from a branch written to narrow one; and a re-run's
+        # rewritten ``run_started_at`` put the horizon after records the history was
+        # holding, so ``covers()`` denied them.
+        return replace(unverified, oldest_available=min(
+            (r.at for r in unverified.records), default=None))
     return parse_run_list(
         json.dumps({"workflow_runs": runs}),
         source=source,

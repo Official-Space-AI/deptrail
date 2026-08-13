@@ -44,7 +44,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .history import WindowQuery
@@ -85,6 +85,13 @@ _WINDOW_KEYS = {"start", "end"}
 # fields that happen to have a format (a window, a URL) let an advisory validate with no
 # identity at all — it printed "REPLACE-ME — REPLACE-ME" and exited 0.
 PLACEHOLDER = "REPLACE-ME"
+
+
+# The one place this module consults a clock, and the reason is that `start <= end` used
+# to catch a mistyped year for free and cannot when the end is open. The slack is for the
+# scanner host, not for the feed: a machine minutes or hours off still works, while the
+# error this exists to catch is off by a year.
+_CLOCK_SLACK = timedelta(days=1)
 
 
 class IocError(ValueError):
@@ -195,10 +202,10 @@ def _parse_window(raw: object, where: str) -> tuple[datetime, datetime | None]:
     # for 2026, the likeliest slip at 3 a.m. — then produced a window containing nothing
     # that has happened yet, so every scan answered "no exposure found" and exited 0.
     now = datetime.now(timezone.utc)
-    _require(start <= now,
-             f"{where}.start: {start.isoformat()} is in the future (now is "
-             f"{now.isoformat()}) — an advisory describes an incident that already "
-             "happened, so check the year")
+    _require(start <= now + _CLOCK_SLACK,
+             f"{where}.start: {start.isoformat()} is in the future — this host's clock "
+             f"reads {now.isoformat()}. An advisory describes an incident that already "
+             "happened, so check the year; if the date is right, check the clock")
     return start, end
 
 
