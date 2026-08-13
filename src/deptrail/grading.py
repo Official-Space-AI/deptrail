@@ -40,7 +40,7 @@ from __future__ import annotations
 import json
 import subprocess
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 
@@ -394,7 +394,8 @@ def parse_run_list(raw: str, *, source: str,
     return RunHistory(records=tuple(records), oldest_available=covered_from, source=note)
 
 
-def _coverage_doubt(pages: list, runs: list, announced: object) -> str | None:
+def _coverage_doubt(pages: list, runs: list, announced: object,
+                    until: datetime | None = None) -> str | None:
     """Why this read cannot certify the range it asked for, or ``None`` if it can.
 
     Three signals, because the endpoint gives no direct one. It stops at a fixed number of
@@ -413,7 +414,9 @@ def _coverage_doubt(pages: list, runs: list, announced: object) -> str | None:
     """
     if not pages:
         return "the API returned no pages at all, so nothing was read"
-    if announced is None or not isinstance(announced, int):
+    # `type(...) is int` and not `isinstance`: `True` is an instance of `int` in Python, so
+    # a malformed `"total_count": true` passed a fail-closed check as a number.
+    if type(announced) is not int:
         return f"the API reported no usable total ({announced!r}), so the read cannot be checked"
     if announced != len(runs):
         return (f"the API returned {len(runs)} run(s) against a reported total of "
@@ -427,6 +430,19 @@ def _coverage_doubt(pages: list, runs: list, announced: object) -> str | None:
     if len(totals) > 1:
         return (f"the reported total changed between pages ({sorted(map(str, totals))}), "
                 "so the list shifted while it was being read")
+    # And the three signals above are still only necessary, not sufficient. A run created
+    # between two page requests shifts the offsets while an unrelated deletion restores the
+    # total: same count, same total, no duplicate id, and a run missing from the middle.
+    # Nothing in an offset-paginated response rules that out.
+    #
+    # What does rule it out is the range itself. A run is created with `created_at` of now,
+    # so a range whose upper bound is already past cannot gain one, and a deletion lowers
+    # the count and is caught above. A single page cannot be shifted at all. Anything else
+    # — several pages reaching up to today — is the case that cannot be certified.
+    if len(pages) > 1 and not (until and until.date() < datetime.now(timezone.utc).date()):
+        return (f"{len(pages)} pages were read over a range that reaches the present, and "
+                "offset pagination gives no snapshot — a run created between two requests "
+                "shifts the rest and can hide one without changing any count")
     return None
 
 
@@ -463,20 +479,19 @@ def runs_from_github(repo_slug: str, *, since: datetime | None = None,
     # the ones missing. Believing the requested range was covered then reports that
     # period as quiet rather than as unanswered, which is a false clean.
     announced = pages[0].get("total_count") if pages else None
-    if doubt := _coverage_doubt(pages, runs, announced):
+    if doubt := _coverage_doubt(pages, runs, announced, until):
         unverified = parse_run_list(
             json.dumps({"workflow_runs": runs}),
             source=f"{source}: {doubt} — narrow the window, or the range of repositories",
             covered_from=None,
         )
-        # From the records that survived parsing, and from ``RunRecord.at`` — the same
-        # clock the grader compares against. Taken from the raw list instead, a single
-        # run serialised with a zero date claimed coverage back to year 1, which is the
-        # widest claim expressible from a branch written to narrow one; and a re-run's
-        # rewritten ``run_started_at`` put the horizon after records the history was
-        # holding, so ``covers()`` denied them.
-        return replace(unverified, oldest_available=min(
-            (r.at for r in unverified.records), default=None))
+        # No horizon at all, not the oldest record's timestamp. That would claim the range
+        # from there to `until` is contiguous, and none of the signals above says where the
+        # hole is: a read can deliver August and June while July is missing, and
+        # `min(r.at)` then answers "covered" straight across it. The records stay as
+        # positive evidence — a run that confirms still confirms — but they are not
+        # evidence of absence.
+        return unverified
     return parse_run_list(
         json.dumps({"workflow_runs": runs}),
         source=source,

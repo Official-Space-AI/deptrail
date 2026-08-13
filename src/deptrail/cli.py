@@ -169,6 +169,7 @@ def _as_dict(report: OrgReport, advisory: Advisory | None) -> dict:
         "could_not_run": list(report.transient),
         "incomplete_view": list(report.incomplete),
         "not_judged": list(report.unread),
+        "unclassified": list(report.unresolved),
         # The dedicated keys above already carry these lines; repeating them here made
         # a JSON consumer count every gap twice while the text and HTML reports showed
         # it once. The subtraction lives on the report so all three renderers do it

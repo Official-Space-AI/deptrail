@@ -1527,3 +1527,129 @@ class TestADirectoryNameIsNotAnInstallClaim:
                                    secrets=lambda p, n: ("NPM_TOKEN",))
         assert report.exposed_repos == ()
         assert len(report.set_aside) == 1
+
+
+class TestClassifyingATreeHasThreeAnswers:
+    """"Could not tell" is not "not installed", and forcing it to be was wrong twice.
+
+    As a boolean this was wrong in both directions at once. `"test"` inside `ubuntu-latest`
+    made a fixture look installed — a clean repository failing its own CI. Narrowing it to
+    an install command on the same line then made a real `npm ci --prefix examples/app`
+    reached through a composite action, a wrapper script or a matrix variable look like
+    test data — a false clean. Neither answer was available, because the honest one is
+    "unknown".
+    """
+
+    from deptrail.org import Installed
+
+    INSTALLS = {
+        "a prefixed install": "      - run: npm ci --prefix examples/app\n",
+        "a scoped step": "      - working-directory: examples/app\n        run: npm ci\n",
+        "cd inside a run block":
+            "      - run: |\n          cd examples/app\n          npm ci\n",
+        "flags before the verb": "      - run: npm --workspace examples/app install\n",
+        "a filtered install": "      - run: pnpm -F examples/app install\n",
+        "a cache path":
+            "      - uses: actions/setup-node@v4\n        with:\n"
+            "          cache-dependency-path: examples/app/package-lock.json\n"
+            "      - run: npm ci\n",
+    }
+    UNREADABLE = {
+        "a local composite action": "      - uses: ./.github/actions/setup\n",
+        "a wrapper script": "      - run: ./scripts/setup.sh\n",
+        "a make target": "      - run: make install\n",
+        "a directory chosen at run time":
+            "      - working-directory: ${{ matrix.dir }}\n        run: npm ci\n",
+    }
+    NOT_INSTALLS = {
+        "a runner label": "      - runs-on: ubuntu-latest\n        run: python -m pytest\n",
+        "a test command in that directory":
+            "      - working-directory: examples/app\n        run: npm test\n",
+        "a commented-out install":
+            "      # - run: npm ci --prefix examples/app\n      - run: echo ok\n",
+        "a longer path that starts the same":
+            "      - working-directory: examples/application\n        run: npm ci\n",
+        "reading it with git": "      - run: git -C examples/app status\n",
+        "an install at the root":
+            "      - run: npm ci\n        env:\n          T: ${{ secrets.NPM_TOKEN }}\n",
+    }
+
+    def _classify(self, tmp_path, name, steps):
+        from deptrail.org import _classify_tree
+
+        repo = tmp_path / name
+        (repo / "examples/app").mkdir(parents=True)
+        (repo / ".github/workflows").mkdir(parents=True)
+        git(repo, "init", "-q")
+        (repo / ".github/workflows/ci.yml").write_text(
+            "name: CI\non: [push]\njobs:\n  b:\n    steps:\n" + steps)
+        (repo / "examples/app/package-lock.json").write_text(lock("5.6.1"))
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "deps", date="2025-11-25T10:00:00+00:00")
+        # Classify the exposure the walker found, straight from the source of truth.
+        from deptrail.history import scan_repo
+        walked = scan_repo(repo, self.plan.entries[0].query)
+        from deptrail.grading import grade_finding
+        regraded = grade_finding(walked, self.plan.entries[0].query, no_runs(repo, name))
+        assert regraded.graded, "the fixture must produce an exposure"
+        return _classify_tree(repo, regraded.graded[0])
+
+    @pytest.fixture(autouse=True)
+    def _plan(self, plan):
+        self.plan = plan
+
+    @pytest.mark.parametrize("label", list(INSTALLS))
+    def test_a_readable_install_is_yes(self, tmp_path, label):
+        assert self._classify(tmp_path, f"y{abs(hash(label)) % 9999}",
+                              self.INSTALLS[label]) is self.Installed.YES, label
+
+    @pytest.mark.parametrize("label", list(UNREADABLE))
+    def test_something_this_tool_cannot_read_is_unknown(self, tmp_path, label):
+        # Not YES: a fixture must not raise credentials because the repository happens to
+        # use a composite action. Not NO: the thing it delegates to may well install this.
+        assert self._classify(tmp_path, f"u{abs(hash(label)) % 9999}",
+                              self.UNREADABLE[label]) is self.Installed.UNKNOWN, label
+
+    @pytest.mark.parametrize("label", list(NOT_INSTALLS))
+    def test_a_mention_without_an_install_is_no(self, tmp_path, label):
+        assert self._classify(tmp_path, f"n{abs(hash(label)) % 9999}",
+                              self.NOT_INSTALLS[label]) is self.Installed.NO, label
+
+    def test_unknown_is_named_and_stops_the_all_clear_without_rotating(self, tmp_path,
+                                                                      plan):
+        repo = tmp_path / "delegated"
+        (repo / "examples/app").mkdir(parents=True)
+        (repo / ".github/workflows").mkdir(parents=True)
+        git(repo, "init", "-q")
+        (repo / ".github/workflows/ci.yml").write_text(
+            "name: CI\non: [push]\njobs:\n  b:\n    steps:\n"
+            "      - uses: ./.github/actions/setup\n")
+        (repo / "examples/app/package-lock.json").write_text(lock("5.6.1"))
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "deps", date="2025-11-25T10:00:00+00:00")
+        report = scan_organization([("delegated", repo)], plan, runs=no_runs,
+                                   secrets=lambda p, n: ("NPM_TOKEN",))
+        assert report.rotation_items == (), "a tree we cannot classify raises no credential"
+        assert report.exposed_repos == ()
+        assert report.unresolved, "and it must not vanish"
+        assert "does not read" in report.unresolved[0]
+        assert report.proves_absence is False
+
+    def test_it_reaches_all_three_renderers(self, tmp_path, plan):
+        from deptrail.cli import _as_dict
+        from deptrail.report import render_html
+
+        repo = tmp_path / "delegated2"
+        (repo / "examples/app").mkdir(parents=True)
+        (repo / ".github/workflows").mkdir(parents=True)
+        git(repo, "init", "-q")
+        (repo / ".github/workflows/ci.yml").write_text(
+            "name: CI\non: [push]\njobs:\n  b:\n    steps:\n      - run: ./setup.sh\n")
+        (repo / "examples/app/package-lock.json").write_text(lock("5.6.1"))
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "deps", date="2025-11-25T10:00:00+00:00")
+        report = scan_organization([("delegated2", repo)], plan, runs=no_runs,
+                                   secrets=lambda p, n: ("NPM_TOKEN",))
+        assert "could not classify" in render_report(report)
+        assert "Could not classify" in render_html(report)
+        assert _as_dict(report, None)["unclassified"] == list(report.unresolved)
