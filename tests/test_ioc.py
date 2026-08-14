@@ -111,6 +111,7 @@ class TestWindowBounds:
         ("\x00", "U+0000"),
         ("\t", "U+0009"),
         ("\n", "U+000A"),
+        ("\x7f", "U+007F"),
         ("\x85", "U+0085"),
     ])
     def test_control_characters_are_rejected_before_normalization(
