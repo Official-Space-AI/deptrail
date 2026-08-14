@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import stat
 import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -132,6 +133,15 @@ LAYOUT = (
 SENTINEL = ".deptrail-demo-repo"
 
 
+def _remove_readonly(func, path, exc_info) -> None:
+    """Retry removal of the read-only object files Git creates on Windows."""
+    error = exc_info[1]
+    if os.name != "nt" or not isinstance(error, PermissionError):
+        raise error
+    os.chmod(path, stat.S_IWRITE)
+    func(path)
+
+
 def _git(repo: Path, *args: str, when: str | None = None) -> None:
     env = dict(os.environ)
     if when:
@@ -190,7 +200,7 @@ def build(root: Path) -> list[tuple[str, Path]]:
                     f"{repo} already exists and was not created by deptrail demo; "
                     "choose an empty --workdir"
                 )
-            shutil.rmtree(repo)
+            shutil.rmtree(repo, onerror=_remove_readonly)
         repo.mkdir()
         (repo / SENTINEL).write_text("created by `deptrail demo`\n")
         _git(repo, "init", "-q")

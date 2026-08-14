@@ -63,6 +63,17 @@ EXIT_BAD_INPUT = 3    # the request was malformed; fixing it is the caller's mov
 EXIT_TRANSIENT = 4    # the tool could not run; retrying may help
 
 
+def _configure_utf8_stdio() -> None:
+    """Keep redirected Windows reports from falling back to a legacy code page."""
+    if sys.platform != "win32":
+        return
+    for stream in (sys.stdout, sys.stderr):
+        encoding = (getattr(stream, "encoding", "") or "").lower().replace("_", "-")
+        reconfigure = getattr(stream, "reconfigure", None)
+        if encoding not in {"utf-8", "utf8"} and reconfigure is not None:
+            reconfigure(encoding="utf-8")
+
+
 class Parser(argparse.ArgumentParser):
     """Argparse exits 2 on a usage error, which is this tool's "incomplete scan"."""
 
@@ -101,7 +112,10 @@ _PATH_IS_WRONG = frozenset({
 
 def _write_failure(target: str, error: OSError) -> int:
     print(f"could not write {target}: {error}", file=sys.stderr)
-    return EXIT_BAD_INPUT if error.errno in _PATH_IS_WRONG else EXIT_TRANSIENT
+    # Windows reports writing to a directory as EACCES rather than EISDIR.  The
+    # target is still a malformed request, not an environment worth retrying.
+    wrong_path = error.errno in _PATH_IS_WRONG or Path(target).is_dir()
+    return EXIT_BAD_INPUT if wrong_path else EXIT_TRANSIENT
 
 
 def _emit(report: OrgReport, args: argparse.Namespace, advisory: Advisory | None) -> int:
@@ -542,6 +556,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _configure_utf8_stdio()
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.func is None:
