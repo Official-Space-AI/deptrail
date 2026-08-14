@@ -106,6 +106,24 @@ class TestHappyPath:
 
 
 class TestWindowBounds:
+    @pytest.mark.parametrize("field", ["start", "end"])
+    @pytest.mark.parametrize(("control", "codepoint"), [
+        ("\x00", "U+0000"),
+        ("\t", "U+0009"),
+        ("\n", "U+000A"),
+        ("\x85", "U+0085"),
+    ])
+    def test_control_characters_are_rejected_before_normalization(
+            self, field, control, codepoint):
+        stamp = "2025-11-24T00:00:00+00:00"
+        window = installable_window(stamp, stamp)
+        window[field] = f"{control}{stamp}{control}"
+        with pytest.raises(IocError) as caught:
+            parse_advisory(advisory_with(window=window))
+        message = str(caught.value)
+        assert message.startswith(f"advisory.window.{field}:")
+        assert codepoint in message
+
     def test_bare_date_rejected_with_guidance(self):
         # A published date does not say which instants it covers; the transcriber
         # decides that, and the decision must be visible in the feed.
@@ -712,6 +730,7 @@ class TestEveryBoundErrorIsBounded:
 
     HUGE = "x" * 100_000
     CASES = {
+        "control character": "\x00" + HUGE,
         "no time of day": HUGE,
         "omits seconds": "2025-09-08T14:00" + HUGE,
         "unparseable after a valid prefix": "2025-09-08T14:00:00" + HUGE,
