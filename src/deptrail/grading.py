@@ -142,6 +142,11 @@ class GradedExposure:
     implicates installation for rotation scope, even though registry availability
     and execution are unproven. A run after a recorded removal, or one whose
     workflow installs nothing, is evidence *about* the exposure but not an install.
+
+    ``exact_install_run`` is narrower: a non-PR run checked out the exposing commit
+    and its workflow installs dependencies. It stays true when an unknown removal
+    time caps the grade at LIKELY, allowing tree classification to preserve the run's
+    workflow attribution without treating every LIKELY run as an exact checkout.
     """
 
     exposure: Exposure
@@ -150,6 +155,7 @@ class GradedExposure:
     run_ids: tuple[str, ...] = ()
     workflow_paths: tuple[str, ...] = ()
     implicates_install: bool = False
+    exact_install_run: bool = False
 
 
 @dataclass
@@ -284,6 +290,7 @@ def grade_exposure(exposure: Exposure, query: WindowQuery,
             run_ids=tuple(r.run_id for r in confirming),
             workflow_paths=_known_workflows(confirming),
             implicates_install=True,
+            exact_install_run=True,
         )
 
     if during:

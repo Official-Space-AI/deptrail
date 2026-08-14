@@ -122,6 +122,14 @@ def plan():
     return parse_advisory(json.dumps(ADVISORY)).plan()
 
 
+@pytest.fixture
+def open_plan():
+    advisory = json.loads(json.dumps(ADVISORY))
+    advisory["window"]["end"] = None
+    advisory["window"]["provenance"]["end"]["kind"] = "unknown"
+    return parse_advisory(json.dumps(advisory)).plan()
+
+
 class TestRotationScope:
     def test_confirmed_run_narrows_to_that_workflow_secrets(self, tmp_path, plan):
         repo = make_repo(tmp_path, "api", [
@@ -736,12 +744,15 @@ class TestEvidenceBeatsPathHeuristic:
     """codex: a real app can live under examples/; a root install is not proof
     that a fixture lockfile was installed."""
 
-    def _repo(self, tmp_path, lockfile_dir: str, workflow: str):
+    def _repo(self, tmp_path, lockfile_dir: str, workflow: str,
+              extra_workflows=()):
         repo = tmp_path / "app"
         repo.mkdir()
         git(repo, "init", "-q")
         (repo / ".github/workflows").mkdir(parents=True)
         (repo / ".github/workflows/ci.yml").write_text(workflow)
+        for name, body in extra_workflows:
+            (repo / ".github/workflows" / name).write_text(body)
         target = repo / lockfile_dir
         target.mkdir(parents=True, exist_ok=True)
         (target / "package-lock.json").write_text(lock("5.6.1"))
@@ -761,6 +772,56 @@ class TestEvidenceBeatsPathHeuristic:
         assert report.exposed_repos == ("app",)
         assert report.set_aside == ()
         assert {i.secret for i in report.rotation_items} == {"AWS_KEY"}
+
+    def test_open_end_keeps_an_exact_nested_install_actionable(
+            self, tmp_path, plan, open_plan):
+        workflow = ("name: CI\non: [push]\njobs:\n  install:\n"
+                    "    defaults:\n      run:\n"
+                    "        working-directory: examples/app\n"
+                    "    steps:\n      - run: npm ci\n      - run: publish\n"
+                    "        env:\n          TOKEN: ${{ secrets.NPM_TOKEN }}\n")
+        repo = self._repo(tmp_path, "examples/app", workflow)
+
+        reports = [
+            scan_organization([("app", repo)], candidate,
+                              runs=runs_with(head(repo)), secrets=secrets_provider)
+            for candidate in (plan, open_plan)
+        ]
+
+        assert [report.worst_grade for report in reports] == [
+            Grade.CONFIRMED, Grade.LIKELY,
+        ]
+        for report in reports:
+            assert report.exposed_repos == ("app",)
+            assert report.set_aside == () and report.unresolved == []
+            assert {item.secret for item in report.rotation_items} == {"NPM_TOKEN"}
+            assert report.rotation_required is True
+
+    def test_open_end_does_not_attribute_an_unrun_nested_workflow(
+            self, tmp_path, plan, open_plan):
+        nested = (
+            "name: Nested\non: [workflow_dispatch]\njobs:\n  install:\n    steps:\n"
+            "      - run: npm ci --prefix examples/app\n"
+            "        env:\n          TOKEN: ${{ secrets.NPM_TOKEN }}\n")
+        repo = self._repo(
+            tmp_path, "examples/app", CI_WORKFLOW,
+            extra_workflows=(("nested.yml", nested),),
+        )
+
+        reports = [
+            scan_organization([("app", repo)], candidate,
+                              runs=runs_with(head(repo)), secrets=secrets_provider)
+            for candidate in (plan, open_plan)
+        ]
+
+        assert [report.worst_grade for report in reports] == [
+            Grade.CONFIRMED, Grade.LIKELY,
+        ]
+        for report in reports:
+            assert report.exposed_repos == ()
+            assert report.unclassified
+            assert report.rotation_items == ()
+            assert report.rotation_required is False
 
     def test_root_install_is_not_credited_with_a_fixture_tree(self, tmp_path, plan):
         repo = self._repo(tmp_path, "tests/fixtures", CI_WORKFLOW)

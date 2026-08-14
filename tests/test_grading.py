@@ -344,6 +344,7 @@ class TestPullRequestRuns:
         graded = grade_exposure(exposure(), WINDOW,
                                 history(run(event="pull_request")))
         assert graded.grade is Grade.LIKELY
+        assert graded.exact_install_run is False
         assert any("merge of head and base" in e for e in graded.evidence)
 
     def test_push_run_can_confirm(self):
@@ -427,6 +428,8 @@ class TestOpenUpperBoundChangesVerdicts:
         assert closed.grade is Grade.CONFIRMED
         assert opened.grade is Grade.LIKELY
         assert opened.implicates_install is True
+        assert closed.exact_install_run is True
+        assert opened.exact_install_run is True
         joined = " ".join(opened.evidence)
         assert "removal time is unknown" in joined
         assert "availability" in joined and "not proven" in joined
@@ -448,6 +451,7 @@ class TestOpenUpperBoundChangesVerdicts:
             exposure(), OPEN_WINDOW, history(run(installs=None)),
         )
         assert graded.grade is Grade.LIKELY
+        assert graded.exact_install_run is False
         joined = " ".join(graded.evidence)
         assert "removal time is unknown" in joined
         assert "still served" not in joined
@@ -482,6 +486,7 @@ class TestNothingIsAfterAnOpenEnd:
         assert graded.grade is not Grade.LIKELY
         assert not any("no longer served" in e for e in graded.evidence)
         assert graded.implicates_install is False
+        assert graded.exact_install_run is False
 
 
 class TestBoundaryInstants:
