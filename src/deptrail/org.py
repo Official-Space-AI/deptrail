@@ -327,10 +327,11 @@ def _classify_tree(repo: Path, graded: GradedExposure) -> Installed:
     sha = graded.exposure.commit
     implicated = _workflow_evidence(repo, sha, graded.workflow_paths, directory)
     # A direct literal install is actionable even after the run record expires: POSSIBLE
-    # already means rotate. A confirmed run may use the older, broader reference rule,
-    # because something in that exact workflow demonstrably installed dependencies.
+    # already means rotate. An exact install run may use the older, broader reference
+    # rule, because something in that exact workflow demonstrably installed dependencies.
+    # This is independent of grade: an unknown removal time caps confidence at LIKELY.
     if implicated.direct_install or (
-            graded.grade is Grade.CONFIRMED and implicated.mentions_directory):
+            graded.exact_install_run and implicated.mentions_directory):
         return Installed.YES
     if implicated.mentions_directory or implicated.uncertain:
         return Installed.UNKNOWN
@@ -339,10 +340,10 @@ def _classify_tree(repo: Path, graded: GradedExposure) -> Installed:
     # failure withholds an all-clear. Only a fully read set with none of those says NO.
     all_evidence = _workflow_evidence(repo, sha, _workflows_at(repo, sha), directory)
     if all_evidence.direct_install:
-        # A different workflow naming the tree is not evidence about a CONFIRMED run whose
-        # own workflow did not. The retained history says which workflow ran; the other one
-        # stays a future possibility rather than being attributed to this execution.
-        if graded.grade is Grade.CONFIRMED and graded.workflow_paths:
+        # A different workflow naming the tree is not evidence about an exact install run
+        # whose own workflow did not. The retained history says which workflow ran; the
+        # other one stays a future possibility rather than being attributed to this run.
+        if graded.exact_install_run and graded.workflow_paths:
             return Installed.UNKNOWN
         return Installed.YES
     if all_evidence.mentions_directory or all_evidence.uncertain:
