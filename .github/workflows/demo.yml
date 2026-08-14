@@ -210,6 +210,8 @@ jobs:
             || { echo "fail-on: never must not fail the job"; exit 1; }
           test "${{ steps.permissive.outputs.exit-code }}" = "1" \
             || { echo "expected the scan to find credentials"; exit 1; }
+          test -s scan.txt && grep -q "chalk@5.6.1" scan.txt \
+            || { echo "the scan exited 1 without reporting the exposure"; exit 1; }
       - id: strict
         uses: ./
         continue-on-error: true

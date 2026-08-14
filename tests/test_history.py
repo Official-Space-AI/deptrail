@@ -6,6 +6,7 @@ review of PR #8 — every one of them produced a wrong verdict before the fix.
 """
 import json
 import os
+import stat
 import subprocess
 from datetime import datetime
 from pathlib import Path
@@ -516,6 +517,7 @@ class TestPrecedenceAndDiagnostics:
         finding = scan_repo(repo, WINDOW)
         assert [t.path for t in finding.unread_trees] == ["yarn.lock"]
 
+    @pytest.mark.skipif(os.name == "nt", reason="Windows forbids newlines in paths")
     def test_a_newline_in_a_path_is_not_a_different_path(self, tmp_path):
         repo = self.fresh(tmp_path, "odd-path")
         (repo / "line\nbreak").mkdir()
@@ -620,6 +622,8 @@ class TestPrecedenceAndDiagnostics:
         # Remove the blob the way a promisor clone leaves it: absent from the store.
         loose = repo / ".git/objects" / blob[:2] / blob[2:]
         if loose.exists():
+            if os.name == "nt":
+                loose.chmod(stat.S_IWRITE)
             loose.unlink()
         finding = scan_repo(repo, WINDOW)
         assert finding.verdict is Verdict.INDETERMINATE

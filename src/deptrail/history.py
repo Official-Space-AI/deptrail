@@ -86,7 +86,8 @@ class Verdict(str, Enum):
 
 def _git(repo: Path, *args: str) -> str:
     result = subprocess.run(
-        ["git", "-C", str(repo), *args], capture_output=True, text=True
+        ["git", "-C", str(repo), *args], capture_output=True,
+        text=True, encoding="utf-8",
     )
     if result.returncode != 0:
         raise GitError(f"git {args[0]} failed: {result.stderr.strip()[:200]}")

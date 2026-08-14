@@ -4,9 +4,11 @@ The demo is the path an evaluator takes first, so it is asserted on its output
 and on its exit code — a scan that finds credentials to rotate must say so in a
 way a script can act on, without anyone reading prose.
 """
+import io
 import json
 import os
 import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -218,6 +220,25 @@ class TestFeeds:
         assert "example-demo" in out and "complete" in out
 
 
+class TestOutputEncoding:
+    def test_redirected_windows_output_is_utf8(self, monkeypatch):
+        stdout_bytes, stderr_bytes = io.BytesIO(), io.BytesIO()
+        stdout = io.TextIOWrapper(stdout_bytes, encoding="cp1252")
+        stderr = io.TextIOWrapper(stderr_bytes, encoding="cp1252")
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setattr(sys, "stdout", stdout)
+        monkeypatch.setattr(sys, "stderr", stderr)
+
+        assert main(["feeds"]) == EXIT_CLEAN
+        sys.stdout.write("→")
+        sys.stderr.write("—")
+        sys.stdout.flush()
+        sys.stderr.flush()
+
+        assert stdout_bytes.getvalue().endswith("→".encode())
+        assert stderr_bytes.getvalue() == "—".encode()
+
+
 class TestHelp:
     def test_bare_invocation_prints_help(self, capsys):
         assert main([]) == EXIT_BAD_INPUT
@@ -287,12 +308,16 @@ class TestExitCodeContract:
         # A `gh` that exists and fails is the other half of the contract: 2 says the
         # history was looked at and cannot be cleared, 4 says the call did not happen.
         advisory = self._advisory(tmp_path)
-        binhome = tmp_path / "failing"
-        binhome.mkdir()
-        (binhome / "gh").write_text("#!/bin/sh\necho 'gh: API rate limit' >&2\nexit 1\n")
-        (binhome / "gh").chmod(0o755)
-        real = __import__("os").environ["PATH"]
-        monkeypatch.setenv("PATH", f"{binhome}:{real}")
+        real_run = subprocess.run
+
+        def fail_gh(command, *args, **kwargs):
+            if command[0] == "gh":
+                raise subprocess.CalledProcessError(
+                    1, command, stderr="gh: API rate limit"
+                )
+            return real_run(command, *args, **kwargs)
+
+        monkeypatch.setattr(subprocess, "run", fail_gh)
         code = main(["scan", "--ioc", str(advisory), "--format", "json",
                      "--repo", str(tmp_path / "demo" / "web-frontend"),
                      "--slug", "acme/web-frontend"])
@@ -362,20 +387,18 @@ class TestDemoSafety:
 class TestOrgCacheSafety:
     """E10: a repository nobody looked at must never read as clean."""
 
-    def _fake_gh(self, tmp_path, names, honor_limit=True):
-        binhome = tmp_path / "bin"
-        binhome.mkdir(exist_ok=True)
-        listing = "\n".join(names)
-        script = binhome / "gh"
-        script.write_text(
-            "#!/bin/bash\n"
-            'if [ "$1" = "repo" ]; then\n'
-            "  n=200; prev=\"\"; for a in \"$@\"; do [ \"$prev\" = \"--limit\" ] && n=\"$a\"; prev=\"$a\"; done\n"
-            f'  printf "%s\\n" "{listing}" | head -n ' + ('"$n"' if honor_limit else "200") + "\n"
-            "fi\nexit 0\n"
-        )
-        script.chmod(0o755)
-        return binhome
+    def _fake_gh(self, monkeypatch, names, honor_limit=True):
+        real_run = subprocess.run
+
+        def fake_run(command, *args, **kwargs):
+            if command[0] != "gh":
+                return real_run(command, *args, **kwargs)
+            limit = int(command[command.index("--limit") + 1])
+            listing = names[:limit] if honor_limit else names
+            stdout = "\n".join(listing) + ("\n" if listing else "")
+            return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
 
     def _seed(self, cache: Path, org: str, name: str, remote: str | None = None):
         repo = cache / org / name
@@ -397,8 +420,7 @@ class TestOrgCacheSafety:
 
     def test_truncated_listing_cannot_report_clean(self, tmp_path, capsys, monkeypatch):
         advisory = self._advisory(tmp_path)
-        binhome = self._fake_gh(tmp_path, [f"repo-{i}" for i in range(1, 6)])
-        monkeypatch.setenv("PATH", f"{binhome}:{__import__('os').environ['PATH']}")
+        self._fake_gh(monkeypatch, [f"repo-{i}" for i in range(1, 6)])
         cache = tmp_path / "cache"
         for i in (1, 2):
             self._seed(cache, "acme", f"repo-{i}")
@@ -415,8 +437,7 @@ class TestOrgCacheSafety:
 
     def test_cache_belonging_to_another_org_is_refused(self, tmp_path, capsys, monkeypatch):
         advisory = self._advisory(tmp_path)
-        binhome = self._fake_gh(tmp_path, ["api"])
-        monkeypatch.setenv("PATH", f"{binhome}:{__import__('os').environ['PATH']}")
+        self._fake_gh(monkeypatch, ["api"])
         cache = tmp_path / "cache"
         self._seed(cache, "acme", "api", remote="https://github.com/other/api.git")
         code = main(["scan", "--ioc", str(advisory), "--org", "acme", "--no-ci",
@@ -427,8 +448,7 @@ class TestOrgCacheSafety:
 
     def test_failed_fetch_is_reported_not_ignored(self, tmp_path, capsys, monkeypatch):
         advisory = self._advisory(tmp_path)
-        binhome = self._fake_gh(tmp_path, ["api"])
-        monkeypatch.setenv("PATH", f"{binhome}:{__import__('os').environ['PATH']}")
+        self._fake_gh(monkeypatch, ["api"])
         monkeypatch.setenv("GIT_TERMINAL_PROMPT", "0")
         cache = tmp_path / "cache"
         self._seed(cache, "acme", "api")  # remote does not exist, so fetch fails
@@ -641,7 +661,7 @@ class TestAdvisoryAuthoring:
         assert "REPLACE-ME" in out
         assert "still to fill in" in err
         template = tmp_path / "blank.json"
-        template.write_text(out)
+        template.write_text(out, encoding="utf-8")
         assert main(["advisory", "validate", str(template)]) == EXIT_BAD_INPUT
 
     def test_the_template_says_what_the_window_means(self, capsys):
