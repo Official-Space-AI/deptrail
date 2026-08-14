@@ -347,7 +347,10 @@ def cmd_scan(args: argparse.Namespace) -> int:
                                               limit=args.limit)
         slug_of = lambda name: f"{args.org}/{name}"  # noqa: E731
     else:
-        repos = [(Path(p).name, Path(p)) for p in args.repo]
+        repos = []
+        for raw_path in args.repo:
+            path = Path(raw_path).resolve()
+            repos.append((path.name or str(path), path))
         slug_of = (lambda name: args.slug) if args.slug else None
     if not repos and not errors and not transient:
         print("nothing to scan: pass --org or one or more --repo paths", file=sys.stderr)
