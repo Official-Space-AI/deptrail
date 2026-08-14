@@ -22,6 +22,18 @@ time, which is typically hours before removal — and when it is not published, 
 deliberately late bound is the safe error: a wide window over-reports exposure,
 a narrow one hides it.
 
+A window's **start** is derivable and its **end** is not. A registry packument
+keeps ``time[version]`` after the version is unpublished — measured against
+``registry.npmjs.org`` for chalk 5.6.1, debug 4.4.2 and ansi-styles 6.2.2, each
+present in ``time`` and absent from ``versions`` — so the first malicious publish
+is a recorded fact. Nothing anywhere records when the registry stopped serving it.
+So ``window.end`` may be ``null``, meaning "not known to have closed", and that is
+the honest default rather than an edge case. An open end over-reports exposure; a
+guessed closed one hides it, and only one of those errors is recoverable.
+
+``end`` must still be *present*. An omitted key is indistinguishable from a typo,
+and this module infers nothing: writing ``null`` is a decision a reader can see.
+
 Windows are inclusive on both ends and must be written as full ISO-8601
 timestamps with a UTC offset — no bare dates, because deciding which instants a
 published date covers is a judgment that belongs in the feed, visible to whoever
@@ -32,7 +44,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .history import WindowQuery
@@ -75,6 +87,13 @@ _WINDOW_KEYS = {"start", "end"}
 PLACEHOLDER = "REPLACE-ME"
 
 
+# The one place this module consults a clock, and the reason is that `start <= end` used
+# to catch a mistyped year for free and cannot when the end is open. The slack is for the
+# scanner host, not for the feed: a machine minutes or hours off still works, while the
+# error this exists to catch is off by a year.
+_CLOCK_SLACK = timedelta(days=1)
+
+
 class IocError(ValueError):
     """The advisory input is malformed. Never raised for merely surprising data."""
 
@@ -98,6 +117,26 @@ def _reject_unknown(obj: dict, allowed: set[str], where: str) -> None:
     _require(not unknown, f"{where}: unknown field(s) {unknown}; allowed {sorted(allowed)}")
 
 
+# Spellings a responder reaches for when they mean "nobody recorded it". Answering
+# these with a timestamp hint sends them off to invent one, which is the error that
+# hides exposure.
+_MEANT_UNKNOWN = frozenset({
+    "null", "none", "nil", "nan", "unknown", "unknowable", "open", "n/a", "na", "tbd",
+    "?", "-", "--", "not known", "no removal", "never", "ongoing", "still open",
+})
+
+
+def _clip(value: object, limit: int = 80) -> str:
+    """A value quoted for an error message, never long enough to bury the message.
+
+    An unbounded ``repr`` turned one mistyped field into a 100,140-character error
+    whose first line — the field path, the only part that says what to fix — scrolled
+    away.
+    """
+    shown = repr(value)
+    return shown if len(shown) <= limit else f"{shown[:limit]}… ({len(shown)} chars)"
+
+
 def _parse_bound(value: object, *, where: str) -> datetime:
     """Parse one window bound: a full ISO-8601 timestamp with a UTC offset.
 
@@ -107,43 +146,70 @@ def _parse_bound(value: object, *, where: str) -> datetime:
     decision belongs in the feed where a reader can see it.
     """
     _require(isinstance(value, str) and str(value).strip() != "",
-             f"{where}: must be a non-empty string")
+             f"{where}: must be a full timestamp such as 2025-09-08T13:13:05+00:00"
+             + (", or unquoted null if the removal time is unknown"
+                if where.endswith(".end") else ""))
     text = str(value).strip().replace("Z", "+00:00")
+    # Before any shape test. The spellings without a `T` in them — `null`, `unknown`,
+    # `n/a`, `-` — fall into the time-of-day branch, and a check ordered after it would
+    # answer them with a hint built by slicing the junk: "write nullT00:00:00+00:00".
+    if where.endswith(".end") and text.strip().lower() in _MEANT_UNKNOWN:
+        raise IocError(
+            f"{where}: {_clip(value)} looks like an attempt to say the removal time "
+            "is unknown — write unquoted null instead (\"end\": null)"
+        )
     if "T" not in text and " " not in text:
         raise IocError(
-            f"{where}: {value!r} has no time of day — write a full timestamp with "
+            f"{where}: {_clip(value)} has no time of day — write a full timestamp with "
             f"an offset, e.g. {text[:10]}T00:00:00+00:00 for the start of that day"
         )
     if not _HAS_SECONDS.search(text):
         if re.match(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}", text, re.ASCII):
             raise IocError(
-                f"{where}: {value!r} omits seconds — write them out (a missing second "
+                f"{where}: {_clip(value)} omits seconds — write them out (a missing second "
                 "would silently become :00 and move the edge of the window)"
             )
-        raise IocError(f"{where}: {value!r} is not an ISO-8601 timestamp")
+        raise IocError(f"{where}: {_clip(value)} is not an ISO-8601 timestamp")
     if text.endswith("-00:00"):
         raise IocError(
-            f"{where}: {value!r} uses -00:00, which means 'offset unknown'; "
+            f"{where}: {_clip(value)} uses -00:00, which means 'offset unknown'; "
             "write +00:00 if the bound really is UTC"
         )
     try:
         stamp = datetime.fromisoformat(text)
     except ValueError as e:
-        raise IocError(f"{where}: not an ISO-8601 timestamp ({e})") from e
+        # The exception embeds the whole value, so it is clipped too — this is the branch
+        # a long mistyped bound actually reaches, and it was still emitting 100 kB.
+        raise IocError(f"{where}: not an ISO-8601 timestamp ({_clip(e)})") from e
     if stamp.tzinfo is None or stamp.utcoffset() is None:
-        raise IocError(f"{where}: missing UTC offset in {value!r}")
+        raise IocError(f"{where}: missing UTC offset in {_clip(value)}")
     return stamp
 
 
-def _parse_window(raw: object, where: str) -> tuple[datetime, datetime]:
+def _parse_window(raw: object, where: str, now: datetime | None = None,
+                  ) -> tuple[datetime, datetime | None]:
+    """One window. ``end: null`` means "not known to have stopped being installable"."""
     _require(isinstance(raw, dict), f"{where}: must be an object")
     window = dict(raw)  # type: ignore[arg-type]
     _reject_unknown(window, _WINDOW_KEYS, where)
     for key in _WINDOW_KEYS:
         _require(key in window, f"{where}: missing {key!r}")
     start = _parse_bound(window["start"], where=f"{where}.start")
-    end = _parse_bound(window["end"], where=f"{where}.end")
-    _require(start <= end, f"{where}: window start is after its end")
+    # Present but null: the feed says the right edge is unknown. Absent is still an
+    # error — a missing key reads the same as a mistyped one.
+    end = (None if window["end"] is None
+           else _parse_bound(window["end"], where=f"{where}.end"))
+    _require(end is None or start <= end, f"{where}: window start is after its end")
+    # An advisory describes an incident that has already happened, so a start in the
+    # future is a transcription error. Checked separately because `start <= end` used to
+    # catch it for free and no longer does when the end is open: a mistyped year — 2025
+    # for 2026, the likeliest slip at 3 a.m. — then produced a window containing nothing
+    # that has happened yet, so every scan answered "no exposure found" and exited 0.
+    now = now or datetime.now(timezone.utc)
+    _require(start <= now + _CLOCK_SLACK,
+             f"{where}.start: {start.isoformat()} is in the future — this host's clock "
+             f"reads {now.isoformat()}. An advisory describes an incident that already "
+             "happened, so check the year; if the date is right, check the clock")
     return start, end
 
 
@@ -153,7 +219,7 @@ class CompromisedPackage:
 
     name: str
     versions: tuple[str, ...]
-    window: tuple[datetime, datetime] | None  # overrides the advisory window
+    window: tuple[datetime, datetime | None] | None  # overrides the advisory window
     sources: tuple[str, ...]
     notes: str | None = None
 
@@ -165,7 +231,7 @@ class Advisory:
     id: str
     name: str
     ecosystem: str
-    window: tuple[datetime, datetime]
+    window: tuple[datetime, datetime | None]
     coverage: str
     packages: tuple[CompromisedPackage, ...]
     sources: tuple[str, ...]
@@ -263,8 +329,13 @@ def _no_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
     return dict(pairs)
 
 
-def parse_advisory(text: str) -> Advisory:
-    """Parse and validate advisory JSON. Every violation raises IocError."""
+def parse_advisory(text: str, now: datetime | None = None) -> Advisory:
+    """Parse and validate advisory JSON. Every violation raises IocError.
+
+    ``now`` is the clock the future-start check compares against. It exists so that check
+    is testable without depending on the host's clock — this function is otherwise pure,
+    and that check is the one thing in the module that is not.
+    """
     try:
         data = json.loads(text, object_pairs_hook=_no_duplicate_keys)
     except json.JSONDecodeError as e:
@@ -283,7 +354,7 @@ def parse_advisory(text: str) -> Advisory:
              f"advisory.ecosystem: only 'npm' is supported, got {data['ecosystem']!r}")
     _require(data["coverage"] in COVERAGE_VALUES,
              f"advisory.coverage: must be one of {list(COVERAGE_VALUES)}")
-    window = _parse_window(data["window"], "advisory.window")
+    window = _parse_window(data["window"], "advisory.window", now)
     sources = _url_list(data["sources"], "advisory.sources")
 
     raw_packages = data["packages"]
@@ -298,9 +369,10 @@ def parse_advisory(text: str) -> Advisory:
             _require(key in raw, f"{where}: missing required field {key!r}")
         name = _package_name(raw["name"], f"{where}.name")
         versions = _versions(raw["versions"], f"{where}.versions")
-        pkg_window = _parse_window(raw["window"], f"{where}.window") if "window" in raw else None
+        pkg_window = (_parse_window(raw["window"], f"{where}.window", now)
+                      if "window" in raw else None)
         if pkg_window is not None:
-            _require(window[0] <= pkg_window[0] and pkg_window[1] <= window[1],
+            _require(window[0] <= pkg_window[0] and _closes_within(pkg_window[1], window[1]),
                      f"{where}.window: {_fmt_window(pkg_window)} is not inside the advisory "
                      f"window {_fmt_window(window)}; widen the advisory window instead")
         # A package may appear twice only for genuinely different waves, so each
@@ -325,8 +397,22 @@ def parse_advisory(text: str) -> Advisory:
     )
 
 
-def _fmt_window(window: tuple[datetime, datetime]) -> str:
-    return f"[{window[0].isoformat()} .. {window[1].isoformat()}]"
+def _closes_within(inner: datetime | None, outer: datetime | None) -> bool:
+    """Whether one window's end stays inside another's.
+
+    An open end is the *latest* possible end, so it fits inside another open end and
+    inside nothing else: a package window that never closes cannot sit inside an
+    advisory window that does, because it would claim exposure past the advisory's
+    own edge.
+    """
+    if outer is None:
+        return True
+    return inner is not None and inner <= outer
+
+
+def _fmt_window(window: tuple[datetime, datetime | None]) -> str:
+    end = "open" if window[1] is None else window[1].isoformat()
+    return f"[{window[0].isoformat()} .. {end}]"
 
 
 def _package_name(raw: object, where: str) -> str:
@@ -448,7 +534,10 @@ def bundled_feeds() -> list[str]:
 WINDOW_NOTE = (
     "window is the interval the malicious artifact was INSTALLABLE — first malicious "
     "publish to registry removal — not the interval the attacker was active. The two "
-    "differ, and using the second makes every scan report CLEAN. See docs/ioc-format.md."
+    "differ, and using the second makes every scan report CLEAN. 'end': null means the "
+    "removal time is unknown, which is the usual case: no registry records it. Leave it "
+    "null rather than guessing — a wide window over-reports, a narrow one hides. "
+    "See docs/ioc-format.md."
 )
 
 TEMPLATE_HINTS = {
@@ -457,11 +546,14 @@ TEMPLATE_HINTS = {
     "coverage": "'complete' if this file lists every affected package of the incident, "
                 "'partial' if not — a partial feed can never prove absence",
     "sources": "where each claim came from; a verdict is only as good as its advisory",
+    "end": "the last instant it was installable, or pass --end-unknown to write null — "
+           "no registry records a removal, so null is usually the honest answer",
 }
 
 
 def advisory_template(*, package: str | None = None, versions: tuple[str, ...] = (),
                       start: str | None = None, end: str | None = None,
+                      end_unknown: bool = False,
                       source: str | None = None, identifier: str | None = None,
                       name: str | None = None) -> str:
     """An advisory to edit, or a complete one when every fact is already known.
@@ -483,7 +575,12 @@ def advisory_template(*, package: str | None = None, versions: tuple[str, ...] =
         "coverage": "partial",
         "window": {
             "start": start or f"{PLACEHOLDER}: 2025-11-24T00:00:00+00:00",
-            "end": end or f"{PLACEHOLDER}: 2025-11-26T23:59:59+00:00",
+            # `null` only when the caller *said* the end is unknown. Silence is not that
+            # statement: inferring "unknown" from "flag not passed" is the one thing this
+            # module refuses to do anywhere else, and it would turn a forgotten flag into
+            # a window that never closes. Without either, the blank stands and the
+            # template fails validation by name, as every other blank does.
+            "end": None if end_unknown else (end or f"{PLACEHOLDER}: {TEMPLATE_HINTS['end']}"),
         },
         "packages": [{
             "name": package or PLACEHOLDER,

@@ -93,7 +93,7 @@ deptrail advisory init \
   --name "chalk compromised" \
   --package chalk --version 5.6.1 \
   --start 2025-11-24T00:00:00+00:00 \
-  --end   2025-11-26T23:59:59+00:00 \
+  --end-unknown \
   --source https://github.com/advisories/GHSA-... \
   --output incident.json
 
@@ -105,6 +105,13 @@ loader rejects by name — an advisory with blanks must not validate, because a 
 one would produce a confident `CLEAN`. Nothing is derived: the identifier in particular is
 asked for rather than invented, since there has been more than one `chalk` incident and
 the report keys its verdict on that field.
+
+`--end-unknown` writes `"end": null`, which is usually the truth — no registry records
+when a version stopped being served, so the window's right edge is not a fact anyone
+holds. Pass `--end` only for a removal time somebody actually recorded; the advisory's own
+publication time is not it, and using that hides everyone who installed in the gap. And
+`init` will not accept silence for either: leave both out and the blank stands, because a
+forgotten flag must not become a window that never closes.
 
 The template carries the definition of the window in the file itself, because that is the
 field most easily transcribed wrong and getting it backwards makes every scan report

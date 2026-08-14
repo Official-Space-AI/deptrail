@@ -16,14 +16,14 @@ An advisory is the question DepTrail answers: *which package versions were malic
   "coverage": "partial",
   "window": {
     "start": "2026-01-02T19:20:42+00:00",
-    "end": "2026-01-03T04:10:00+00:00"
+    "end": null
   },
   "packages": [
     {
       "name": "example-package",
       "versions": ["1.2.3", "1.2.4"],
       "sources": ["https://example.test/advisory"],
-      "notes": "start = publish time of 1.2.3; end = when the registry no longer served either version (verified, see notes)."
+      "notes": "start = time['1.2.3'] from the registry packument. end = null: no registry records when a version stopped being served, so it is not known to have closed."
     }
   ],
   "sources": ["https://example.test/advisory"]
@@ -31,8 +31,9 @@ An advisory is the question DepTrail answers: *which package versions were malic
 ```
 
 The window above is a **placeholder with the right shape**: start at the first
-malicious publish, end after the artifact stopped being installable. Do not copy
-timestamps from an advisory's headline — read the next section first.
+malicious publish, read from the registry; end `null`, because no registry records a
+removal. Do not copy timestamps from an advisory's headline — read the next section
+first.
 
 ## Fields
 
@@ -43,7 +44,7 @@ timestamps from an advisory's headline — read the next section first.
 | `name` | ✅ | Human-readable incident name, shown in reports. |
 | `ecosystem` | ✅ | `npm` (the only value the MVP judges). |
 | `coverage` | ✅ | `complete` or `partial` — see below. |
-| `window.start` / `.end` | ✅ | Interval in which the malicious artifact was **installable** (first malicious publish → registry removal), **inclusive on both ends**. See below — this is not the vendor's "attacker activity" window. |
+| `window.start` / `.end` | ✅ | Interval in which the malicious artifact was **installable** (first malicious publish → registry removal), **inclusive on both ends**. `end` may be `null`, meaning "not known to have closed" — usually the honest answer, since no registry records a removal. See below; this is not the vendor's "attacker activity" window. |
 | `packages[]` | ✅ | At least one compromised package. |
 | `packages[].name` | ✅ | Exact npm name, scope included. |
 | `packages[].versions[]` | ✅ | **Exact** versions. No ranges — a range would judge versions the advisory never named. |
@@ -63,28 +64,59 @@ the CI compromise ran 11:29–19:15 UTC, while the malicious versions were
 published from 19:20 UTC onward. A feed built from 11:29–19:15 closes *before*
 any repo could install the bad artifact, so every scan returns CLEAN.
 
-- **Start**: the publish time of the earliest malicious version (npm's registry
-  `time` map gives this per version).
-- **End**: a time you can state the artifact was **no longer installable**. The
-  advisory's publication time is not that time — advisories are published while
-  the bad versions are still up, and an end bound set there hides everyone who
-  installed in the gap. Use whichever you can establish:
-  1. a removal time the registry or advisory states, or
-  2. the moment you personally checked and found the versions gone (`npm view
-     <pkg> versions` no longer lists them) — record that check in `notes`, or
-  3. failing both, the time you are writing the feed, which is by construction
-     after the removal you already know happened.
+**The start is a recorded fact. The end is not, and the format says so.**
 
-  A wide window over-reports exposure; a narrow one hides it. Only one of those
-  two errors is recoverable by a human reading the report.
+- **Start**: the publish time of the malicious version, which npm's registry keeps
+  per version in the packument's `time` map. It survives the version being
+  unpublished — measured against `registry.npmjs.org` on 2026-08-13:
+
+  | package | `time[version]` | still in `versions`? |
+  |---|---|---|
+  | `chalk` 5.6.1 | 2025-09-08T13:13:05.239Z | no |
+  | `debug` 4.4.2 | 2025-09-08T13:12:39.973Z | no |
+  | `ansi-styles` 6.2.2 | 2025-09-08T13:12:10.343Z | no |
+
+  So you never have to guess the start: read it.
+
+- **End**: write `null`, unless you have a removal time somebody actually recorded.
+  `null` means *not known to have stopped being installable*, and it is the ordinary
+  case — **no registry records a removal**. The packument gains no `unpublished` key
+  and no timestamp; the version simply vanishes from `versions` while its `time`
+  entry stays. There is nothing to read.
+
+  The number nearest to hand is the advisory's publication time, and that is the one
+  reliably wrong answer: advisories go out while the bad versions are still up, so an
+  end set there hides everyone who installed in the gap.
+
+  The next-good-version publish time is *not* the end either, and it is not even
+  consistent between packages of one incident. From the same compromise:
+
+  | package | malicious publish | next good version | gap |
+  |---|---|---|---|
+  | `chalk` 5.6.1 | 13:13:05 | 5.6.2 at 14:47:54 | 1h 34m |
+  | `ansi-styles` 6.2.2 | 13:12:10 | 6.2.3 at 14:52:15 | 1h 40m |
+  | `debug` 4.4.2 | 13:12:39 | 4.4.3 on **2025-09-13** | **5 days** |
+
+  What an open end costs you: exposure is reported for any lockfile that pinned the
+  version at any time after the start, including one committed long after the
+  registry stopped serving it. What a guessed end costs you: a repository that was
+  exposed is reported clean. A wide window over-reports; a narrow one hides. Only one
+  of those two errors is recoverable by a human reading the report.
+
+  `end` must still be **present**. Write `"end": null` — an omitted key reads the same
+  as a mistyped one, and this format infers nothing.
+
 - A package-level `window` must sit **inside** the advisory window; it narrows,
-  never extends (extending is a transcription error, and the loader rejects it).
+  never extends (extending is a transcription error, and the loader rejects it). An
+  open end is the latest end there is, so an open package window fits only inside an
+  open advisory window.
 
 ## Two rules that shape the format
 
 **Nothing is inferred.** Unknown fields are an error, not a shrug — a typo'd key
 in a feed transcribed at 3 a.m. would otherwise silently scan for the wrong
-thing. Bounds must be full timestamps with a UTC offset: a bare `2025-11-24` is
+thing. `window.end` may be `null` and nothing else may be omitted; every bound that is
+written must be a full timestamp with a UTC offset, so a bare `2025-11-24` is
 rejected, because deciding which instants a published date covers is a judgment,
 and it belongs in the feed where a reader of the report can see it (write
 `2025-11-24T00:00:00+00:00` and `2025-11-24T23:59:59+00:00` yourself).
@@ -101,7 +133,7 @@ under a partial feed means "nothing found among the packages this feed lists".
 ```python
 from deptrail.ioc import load_advisory
 advisory = load_advisory("example-demo")        # bundled feed name, or any file path
-queries = advisory.queries()                   # one WindowQuery per package
+queries = advisory.plan().queries              # one WindowQuery per package
 ```
 
 | Feed | Incident | Coverage |
@@ -120,7 +152,7 @@ under a `partial` feed as "not found among the packages this feed lists".
 ## Writing a feed on incident day
 
 1. Copy the block at the top of this page.
-2. Set `id`, `name`, and the `window` — the **installable** interval, not the attacker-activity times the advisory leads with (see above).
+2. Set `id`, `name`, and the `window`. Read the start from `https://registry.npmjs.org/<package>` → `time[<version>]`; leave `end` as `null` unless somebody recorded a removal. Do not use the attacker-activity times the advisory leads with (see above).
 3. For each named package, add `name`, exact `versions`, and the URL you read it from.
 4. Leave `coverage` as `partial` until you have the vendor's final list.
 5. Run it — a malformed feed fails immediately with the offending field path.

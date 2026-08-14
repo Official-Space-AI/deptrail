@@ -7,6 +7,7 @@ way a script can act on, without anyone reading prose.
 import json
 import os
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -729,3 +730,290 @@ class TestAdvisoryAuthoring:
         assert code == EXIT_INCOMPLETE
         assert payload["decision"]["scan_complete"] is False
         assert any("partial coverage" in c for c in payload["caveats"]), payload
+
+
+class TestOpenWindowReachesEveryOutput:
+    """An open upper bound must be visible in all three renderers, never as a blank.
+
+    "Not known to have closed" is a statement about the evidence. A reader who cannot
+    tell it from a recorded end will read a widened verdict as a narrow one.
+    """
+
+    OPEN = {
+        "schema_version": 1, "id": "GHSA-open", "name": "Open ended",
+        "ecosystem": "npm", "coverage": "complete",
+        "window": {"start": "2025-09-08T13:13:05+00:00", "end": None},
+        "packages": [{"name": "chalk", "versions": ["5.6.1"],
+                      "sources": ["https://example.test/a"]}],
+        "sources": ["https://example.test/a"],
+    }
+
+    @pytest.fixture
+    def advisory(self, tmp_path):
+        path = tmp_path / "open.json"
+        path.write_text(json.dumps(self.OPEN))
+        return path
+
+    def test_validate_says_the_window_is_still_open(self, advisory, capsys):
+        assert main(["advisory", "validate", str(advisory)]) == 0
+        out = capsys.readouterr().out
+        assert "still open" in out
+        assert "no removal time is recorded" in out
+
+    def test_json_carries_null_rather_than_omitting_the_key(self, advisory, tmp_path,
+                                                           capsys):
+        repo = tmp_path / "clean"
+        repo.mkdir()
+        subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True,
+                       capture_output=True)
+        (repo / "README.md").write_text("x")
+        subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t", "-c",
+                        "user.name=t", "add", "-A"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t", "-c",
+                        "user.name=t", "commit", "-qm", "i"], check=True,
+                       capture_output=True)
+        main(["scan", "--ioc", str(advisory), "--repo", str(repo), "--no-ci",
+              "--format", "json"])
+        payload = json.loads(capsys.readouterr().out)
+        # A consumer must be able to tell "not known to have closed" from a forgotten
+        # field, so the key is present and the value is null.
+        assert "end" in payload["advisory"]["window"]
+        assert payload["advisory"]["window"]["end"] is None
+
+    def test_html_says_it_in_words(self, advisory, tmp_path):
+        from deptrail.ioc import load_advisory
+        from deptrail.org import OrgReport
+        from deptrail.report import render_html
+
+        report = OrgReport(advisory_id="GHSA-open", advisory_name="Open ended")
+        html = render_html(report, load_advisory(str(advisory)))
+        assert "still open" in html
+        assert "no removal time is recorded" in html
+
+
+class TestRunCollectionUnderAnOpenWindow:
+    def test_an_open_end_collects_runs_up_to_now(self, monkeypatch):
+        from datetime import datetime, timezone
+
+        from datetime import timedelta
+
+        import deptrail.cli as cli
+        from deptrail.grading import RunHistory
+
+        seen = {}
+
+        def fake(slug, *, since, until):
+            seen.update(since=since, until=until)
+            return RunHistory(source="fake")
+
+        monkeypatch.setattr(cli, "runs_from_github", fake)
+        start = datetime(2025, 9, 8, 13, tzinfo=timezone.utc)
+        provider = cli._github_runs(lambda name: "o/r", (start, None), annotate=False)
+        provider(Path("."), "r")
+        # Bounding the query at the window's end would collect nothing for the whole
+        # period after it — which, for an open window, is everything that matters.
+        # "now", not merely "later than some fixed date a frozen clock would also pass".
+        # A day of padding is added on top of it, the same as on `since`.
+        expected = datetime.now(timezone.utc) + timedelta(days=1)
+        assert abs((seen["until"] - expected).total_seconds()) < 120
+        assert seen["since"] == start - timedelta(days=1)
+
+
+class TestAnExposureNeverExitsZero:
+    def test_a_found_exposure_with_no_nameable_credential_exits_two(self, tmp_path,
+                                                                    capsys):
+        repo = tmp_path / "app"
+        repo.mkdir()
+        subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True,
+                       capture_output=True)
+        (repo / "package-lock.json").write_text(json.dumps({
+            "name": "app", "lockfileVersion": 3,
+            "packages": {"": {"dependencies": {"chalk": "^5.6.0"}},
+                         "node_modules/chalk": {"version": "5.6.1"}}}))
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True,
+                       capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t", "-c",
+                        "user.name=t", "commit", "-qm", "deps"], check=True,
+                       capture_output=True,
+                       env={**os.environ,
+                            "GIT_AUTHOR_DATE": "2025-11-25T10:00:00+00:00",
+                            "GIT_COMMITTER_DATE": "2025-11-25T10:00:00+00:00"})
+        advisory = tmp_path / "a.json"
+        advisory.write_text(json.dumps({
+            "schema_version": 1, "id": "GHSA-x", "name": "n", "ecosystem": "npm",
+            "coverage": "complete",
+            "window": {"start": "2025-11-24T00:00:00+00:00", "end": None},
+            "packages": [{"name": "chalk", "versions": ["5.6.1"],
+                          "sources": ["https://a.test/x"]}],
+            "sources": ["https://a.test/x"]}))
+        code = main(["scan", "--ioc", str(advisory), "--repo", str(repo), "--no-ci",
+                     "--format", "json"])
+        payload = json.loads(capsys.readouterr().out)
+        # Exit 0 says "absence of exposure was established". An exposure in the timeline
+        # contradicts that however little can be done about it — there is no credential
+        # to raise the code to 1 and no unread tree to lower it to 2, and 0 was the
+        # answer that came out.
+        assert payload["timeline"], "the fixture must find the exposure"
+        assert payload["decision"]["scan_complete"] is False
+        assert code != EXIT_CLEAN
+        # This fixture has no secrets provider, so the whole store is unnameable and 1 is
+        # the right answer. The exit-2 half of the contract — an exposure with nothing at
+        # all to rotate — is pinned at the report level in test_org.py, because the CLI
+        # cannot produce an empty secret *listing* without a live `gh`.
+        assert code == EXIT_ROTATE
+
+
+class TestAdvisoryInitDoesNotInferUnknown:
+    def test_omitting_end_leaves_a_named_blank(self, tmp_path, capsys):
+        target = tmp_path / "a.json"
+        code = main(["advisory", "init", "--id", "GHSA-1", "--name", "n",
+                     "--package", "chalk", "--version", "5.6.1",
+                     "--start", "2025-09-08T13:13:05+00:00",
+                     "--source", "https://a.test/x", "--output", str(target)])
+        body = json.loads(target.read_text())
+        # Silence is not a statement that the removal time is unknown. Treating it as one
+        # turns a forgotten flag into a window that never closes.
+        assert body["window"]["end"].startswith("REPLACE-ME")
+        assert "--end-unknown" in body["window"]["end"]
+        # A template with blanks is the expected output of `init`, so the exit code stays
+        # 0; what must not happen is the blank silently becoming a decision. The loader is
+        # what refuses it, and `init` says so on stderr.
+        assert code == EXIT_CLEAN
+        assert "still to fill in" in capsys.readouterr().err
+
+    def test_end_unknown_writes_null_and_validates(self, tmp_path, capsys):
+        target = tmp_path / "a.json"
+        code = main(["advisory", "init", "--id", "GHSA-1", "--name", "n",
+                     "--package", "chalk", "--version", "5.6.1",
+                     "--start", "2025-09-08T13:13:05+00:00", "--end-unknown",
+                     "--source", "https://a.test/x", "--output", str(target)])
+        assert json.loads(target.read_text())["window"]["end"] is None
+        assert code == EXIT_CLEAN
+        # The name says "and validates", so check that rather than the exit code, which is
+        # 0 for a template with blanks too.
+        err = capsys.readouterr().err
+        assert "complete and valid" in err
+        assert "still to fill in" not in err
+
+    def test_the_two_flags_contradict_each_other(self, tmp_path):
+        code = main(["advisory", "init", "--id", "GHSA-1", "--name", "n",
+                     "--package", "chalk", "--version", "5.6.1",
+                     "--start", "2025-09-08T13:13:05+00:00",
+                     "--end", "2025-09-08T14:47:54+00:00", "--end-unknown",
+                     "--source", "https://a.test/x", "--output", str(tmp_path / "a.json")])
+        assert code == EXIT_BAD_INPUT
+
+
+class TestTheTextReportShowsTheWindow:
+    """Asserted through `scan --format text`, not by calling the renderer.
+
+    The renderer takes the advisory as an optional argument, so testing it directly proves
+    only that it *can* print the window. What matters is that `_emit` passes it — the wiring
+    is the thing that was missing, and it is the format the composite action writes to its
+    step summary.
+    """
+
+    def _run(self, tmp_path, end, capsys):
+        repo = tmp_path / "clean"
+        repo.mkdir()
+        subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True,
+                       capture_output=True)
+        (repo / "README.md").write_text("x")
+        subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t", "-c",
+                        "user.name=t", "add", "-A"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t", "-c",
+                        "user.name=t", "commit", "-qm", "i"], check=True,
+                       capture_output=True)
+        advisory = tmp_path / "a.json"
+        advisory.write_text(json.dumps({
+            "schema_version": 1, "id": "GHSA-x", "name": "n", "ecosystem": "npm",
+            "coverage": "complete",
+            "window": {"start": "2025-09-08T13:13:05+00:00", "end": end},
+            "packages": [{"name": "chalk", "versions": ["5.6.1"],
+                          "sources": ["https://a.test/x"]}],
+            "sources": ["https://a.test/x"]}))
+        main(["scan", "--ioc", str(advisory), "--repo", str(repo), "--no-ci",
+              "--format", "text"])
+        return capsys.readouterr().out
+
+    def test_an_open_window_says_so(self, tmp_path, capsys):
+        out = self._run(tmp_path, None, capsys)
+        assert "installable window" in out
+        assert "still open" in out
+
+    def test_a_closed_window_prints_its_end(self, tmp_path, capsys):
+        out = self._run(tmp_path, "2025-09-08T14:47:54+00:00", capsys)
+        assert "2025-09-08T14:47:54+00:00" in out
+        assert "still open" not in out
+
+
+class TestBoundErrorsNameTheFix:
+    def test_a_quoted_null_is_told_to_unquote_it(self):
+        from deptrail.ioc import IocError, parse_advisory
+
+        for spelling in ("null", "None", "unknown", "open", "n/a", "TBD"):
+            body = {
+                "schema_version": 1, "id": "GHSA-x", "name": "n", "ecosystem": "npm",
+                "coverage": "complete",
+                "window": {"start": "2025-09-08T13:13:05+00:00", "end": spelling},
+                "packages": [{"name": "chalk", "versions": ["5.6.1"],
+                              "sources": ["https://a.test/x"]}],
+                "sources": ["https://a.test/x"]}
+            with pytest.raises(IocError, match="write unquoted null"):
+                parse_advisory(json.dumps(body))
+
+    def test_a_wrong_type_names_null_as_an_option(self):
+        from deptrail.ioc import IocError, parse_advisory
+
+        body = {
+            "schema_version": 1, "id": "GHSA-x", "name": "n", "ecosystem": "npm",
+            "coverage": "complete",
+            "window": {"start": "2025-09-08T13:13:05+00:00", "end": 0},
+            "packages": [{"name": "chalk", "versions": ["5.6.1"],
+                          "sources": ["https://a.test/x"]}],
+            "sources": ["https://a.test/x"]}
+        with pytest.raises(IocError, match="unquoted null"):
+            parse_advisory(json.dumps(body))
+
+    def test_a_huge_value_does_not_bury_the_field_path(self):
+        from deptrail.ioc import IocError, parse_advisory
+
+        body = {
+            "schema_version": 1, "id": "GHSA-x", "name": "n", "ecosystem": "npm",
+            "coverage": "complete",
+            "window": {"start": "2025-09-08T13:13:05+00:00", "end": "x" * 100_000},
+            "packages": [{"name": "chalk", "versions": ["5.6.1"],
+                          "sources": ["https://a.test/x"]}],
+            "sources": ["https://a.test/x"]}
+        with pytest.raises(IocError) as caught:
+            parse_advisory(json.dumps(body))
+        # The field path is the only part that says what to fix, and it opens the message.
+        assert len(str(caught.value)) < 400
+        assert str(caught.value).startswith("advisory.window.end:")
+
+
+class TestRunQueryPadding:
+    @pytest.mark.parametrize("end,expect_now", [
+        (datetime(2025, 9, 8, 14, 47, 54, tzinfo=timezone.utc), False),
+        (None, True),
+    ])
+    def test_both_bounds_keep_a_day_of_padding(self, monkeypatch, end, expect_now):
+        from datetime import timedelta
+
+        import deptrail.cli as cli
+        from deptrail.grading import RunHistory
+
+        seen = {}
+        monkeypatch.setattr(cli, "runs_from_github",
+                            lambda slug, *, since, until: seen.update(
+                                since=since, until=until) or RunHistory(source="fake"))
+        start = datetime(2025, 9, 8, 13, tzinfo=timezone.utc)
+        cli._github_runs(lambda n: "o/r", (start, end), annotate=False)(Path("."), "r")
+        # A day either side, because `created=` filters by date and an uncollected run is
+        # a grade lost. The closed branch had no test at all.
+        assert seen["since"] == start - timedelta(days=1)
+        if expect_now:
+            expected = datetime.now(timezone.utc) + timedelta(days=1)
+            assert abs((seen["until"] - expected).total_seconds()) < 120
+        else:
+            assert seen["until"] == end + timedelta(days=1)
