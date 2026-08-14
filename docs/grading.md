@@ -7,15 +7,17 @@ rotated?* — so every exposure carries a grade and the facts the grade rests on
 
 | Grade | What it means | What the evidence looks like |
 |---|---|---|
-| `CONFIRMED` | An install ran against a lockfile pinning the malicious version | A CI run checked out the exposing commit, started while the artifact was pinned **and** live, and is shown to install dependencies |
-| `LIKELY` | CI activity coincides with the exposure, but the install is not proven | A run on the exposing commit whose steps we could not inspect (or that installs nothing), a run on that commit after the artifact was pulled, or runs in the window on other commits |
+| `CONFIRMED` | An install ran against a lockfile pinning the malicious version | A CI run checked out the exposing commit, started inside a recorded finite window while the artifact was pinned **and** live, and is shown to install dependencies |
+| `LIKELY` | CI activity coincides with the exposure, but availability or execution is not proven | A run at or after malicious publish when the removal time is unknown, a run whose steps we could not inspect (or that installs nothing), a run after the artifact was pulled, or runs on other commits |
 | `POSSIBLE` | The pin overlapped the window and nothing rules an install in or out | No run coincides, records for that period no longer exist, or **the repository's history could not be read at all** |
 | `NO_EVIDENCE` | No exposure interval overlapped the window, and the history was readable | The lockfile never held a named version while it was live |
 
 `CONFIRMED` needs positive evidence on both axes — the run installed
-dependencies, and it ran while the artifact was live. A run that predates the
-version turning malicious fetched the clean artifact and is not evidence at all,
-so it does not raise the grade.
+dependencies, and it ran inside a recorded finite window while the artifact was
+live. With an open end, CI can show an install workflow ran after malicious
+publish, but not whether the registry still served the artifact; that stays
+`LIKELY` while retaining the same rotation scope. A run that predates the version
+turning malicious fetched the clean artifact and is not evidence at all.
 
 ## Why POSSIBLE still means rotate
 
