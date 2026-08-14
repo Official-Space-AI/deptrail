@@ -7,9 +7,10 @@ answer that where they exist, and this module states exactly how far each answer
 reaches:
 
 - ``CONFIRMED``  — a CI run checked out the exposing commit and started inside
-  the window: an install ran against a lockfile pinning the malicious version.
+  a closed window: an install ran while the artifact was known to be live.
 - ``LIKELY``     — CI activity coincides with the exposure, but not on the
-  exposing commit itself, or the run on that commit started outside the window.
+  exposing commit itself, the removal time is unknown, or the run on that
+  commit started outside the window.
 - ``POSSIBLE``   — the pin overlapped the window and nothing rules an install
   in or out. Developer machines leave no run records at all, so this is the
   honest grade for "no CI evidence", never a downgrade to safe.
@@ -17,8 +18,9 @@ reaches:
 
 ``CONFIRMED`` demands positive evidence on both axes: the run must be shown to
 have installed dependencies (its steps are inspected), and it must have started
-while the artifact was live. A run we cannot inspect, or one that ran before the
-version turned malicious, does not confirm anything.
+inside a recorded finite window while the artifact was live. A run we cannot
+inspect, one with no known removal bound, or one that ran before the version
+turned malicious does not confirm execution.
 
 Three failure modes are deliberately designed against. Run records expire
 (GitHub keeps them ~90 days by default), so a window older than the retention
@@ -55,12 +57,10 @@ from .history import (
     _parse_iso,
 )
 
-# Workflow steps that fetch dependencies; a run containing one of these executed
-# whatever the lockfile pinned, including any install scripts it carried.
-# Commands that unambiguously install this ecosystem's dependencies. Only these
-# can raise a grade to CONFIRMED: a step merely named "Install" may be
-# installing anything, and guessing would assert an execution that never
-# happened (measured against real workflows).
+# Commands that unambiguously install this ecosystem's dependencies. A run whose
+# workflow contains one implicates an install, but only a recorded live window can
+# raise it to CONFIRMED: with an unknown removal time, registry availability and
+# execution remain unproven. A step merely named "Install" may install anything.
 INSTALL_COMMANDS = ("npm ci", "npm i ", "npm install", "yarn install", "yarn --frozen",
                     "pnpm install", "pnpm i ", "npm-run-all install")
 # GitHub's default run retention; used only to say "the records for that window
@@ -138,10 +138,10 @@ class GradedExposure:
     because a partial list would narrow the rotation scope on incomplete evidence.
 
     ``implicates_install`` says whether those runs could have installed the
-    malicious version. A run that only started after the artifact was pulled, or
-    one whose workflow installs nothing, is evidence *about* the exposure but not
-    evidence that CI executed it — so the rotation list must still consider a
-    local install.
+    malicious version. A run with an install workflow under an open window still
+    implicates installation for rotation scope, even though registry availability
+    and execution are unproven. A run after a recorded removal, or one whose
+    workflow installs nothing, is evidence *about* the exposure but not an install.
     """
 
     exposure: Exposure
@@ -259,15 +259,28 @@ def grade_exposure(exposure: Exposure, query: WindowQuery,
 
     if confirming:
         run = confirming[0]
-        return GradedExposure(
-            exposure=exposure, grade=Grade.CONFIRMED,
-            evidence=(
+        availability_known = query.window_end is not None
+        if availability_known:
+            evidence = (
                 f"run {run.run_id} ({run.workflow}, {run.event}) built "
                 f"{exposure.commit[:8]} at {run.at.isoformat()}, while "
                 f"{exposure.version} was still served by the registry",
                 f"the workflows at that commit install dependencies, so "
                 f"{exposure.version} executed",
-            ),
+            )
+        else:
+            evidence = (
+                f"run {run.run_id} ({run.workflow}, {run.event}) built "
+                f"{exposure.commit[:8]} at {run.at.isoformat()}, at or after the "
+                f"publish time for {exposure.version}",
+                "the workflows at that commit install dependencies, but the registry "
+                f"removal time is unknown; availability and {exposure.version} "
+                "execution are not proven",
+            )
+        return GradedExposure(
+            exposure=exposure,
+            grade=Grade.CONFIRMED if availability_known else Grade.LIKELY,
+            evidence=evidence,
             run_ids=tuple(r.run_id for r in confirming),
             workflow_paths=_known_workflows(confirming),
             implicates_install=True,
@@ -282,12 +295,17 @@ def grade_exposure(exposure: Exposure, query: WindowQuery,
             why = "the workflows at that commit install no dependencies"
         else:
             why = "the workflows at that commit could not be read"
+        timing = (
+            f"while {exposure.version} was still served, but {why}"
+            if query.window_end is not None else
+            f"at or after the publish time for {exposure.version}; the registry removal "
+            f"time is unknown, and {why}"
+        )
         return GradedExposure(
             exposure=exposure, grade=Grade.LIKELY,
             evidence=(
                 f"run {run.run_id} ({run.workflow}, {run.event}) built "
-                f"{exposure.commit[:8]} at {run.at.isoformat()}, while "
-                f"{exposure.version} was still served, but {why}",
+                f"{exposure.commit[:8]} at {run.at.isoformat()}, {timing}",
             ),
             run_ids=tuple(r.run_id for r in during),
             workflow_paths=_known_workflows(during),
@@ -325,12 +343,17 @@ def grade_exposure(exposure: Exposure, query: WindowQuery,
             ),
         )
 
+    period = (
+        f"while {exposure.version} was served"
+        if query.window_end is not None else
+        f"at or after the publish time for {exposure.version} "
+        "(registry removal time unknown)"
+    )
     return GradedExposure(
         exposure=exposure, grade=Grade.POSSIBLE,
         evidence=(
-            f"no CI run built {exposure.commit[:8]} while {exposure.version} was "
-            "served; a developer machine install leaves no record, so this cannot "
-            "be cleared",
+            f"no CI run built {exposure.commit[:8]} {period}; a developer machine "
+            "install leaves no record, so this cannot be cleared",
         ),
     )
 

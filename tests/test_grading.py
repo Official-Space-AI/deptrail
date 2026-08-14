@@ -405,11 +405,11 @@ OPEN_WINDOW = WindowQuery(
 
 
 class TestOpenUpperBoundChangesVerdicts:
-    """An unknown removal time must widen the answer, never narrow it (#23).
+    """An unknown removal must preserve rotation without inventing execution (#23).
 
-    The right edge of a window is recorded nowhere, so a closed one is an assertion.
-    These are the places where believing that assertion clears a repository that a
-    responder would have wanted flagged.
+    A missing end cannot prove the artifact was gone, but it also cannot prove the
+    artifact was available. The grade therefore keeps the install implicated and the
+    credentials in scope while stating the uncertainty.
     """
 
     def test_a_run_after_a_closed_window_is_only_likely(self):
@@ -420,23 +420,42 @@ class TestOpenUpperBoundChangesVerdicts:
         assert graded.implicates_install is False
         assert any("no longer served" in e for e in graded.evidence)
 
-    def test_the_same_run_is_confirmed_when_the_window_never_closed(self):
-        after = run(at=datetime(2025, 11, 27, 10, tzinfo=timezone.utc))
-        graded = grade_exposure(exposure(), OPEN_WINDOW, history(after))
-        # Nothing is "after" an end nobody recorded. Downgrading here would rest the
-        # whole conclusion on a number the ecosystem does not publish.
-        assert graded.grade is Grade.CONFIRMED
-        assert graded.implicates_install is True
-        assert not any("no longer served" in e for e in graded.evidence)
+    def test_unknown_removal_caps_the_same_install_at_likely(self):
+        exact = run()
+        closed = grade_exposure(exposure(), WINDOW, history(exact))
+        opened = grade_exposure(exposure(), OPEN_WINDOW, history(exact))
+        assert closed.grade is Grade.CONFIRMED
+        assert opened.grade is Grade.LIKELY
+        assert opened.implicates_install is True
+        joined = " ".join(opened.evidence)
+        assert "removal time is unknown" in joined
+        assert "availability" in joined and "not proven" in joined
+        assert "still served" not in joined and "executed" not in joined
 
-    def test_a_run_years_later_still_counts_under_an_open_window(self):
+    def test_a_run_years_later_stays_likely_under_an_open_window(self):
         graded = grade_exposure(
             exposure(until=None),
             OPEN_WINDOW,
             history(run(at=datetime(2030, 1, 1, tzinfo=timezone.utc)),
                     oldest=datetime(2029, 1, 1, tzinfo=timezone.utc)),
         )
-        assert graded.grade is Grade.CONFIRMED
+        assert graded.grade is Grade.LIKELY
+        assert graded.implicates_install is True
+        assert any("removal time is unknown" in e for e in graded.evidence)
+
+    def test_an_uninspectable_open_window_run_does_not_claim_availability(self):
+        graded = grade_exposure(
+            exposure(), OPEN_WINDOW, history(run(installs=None)),
+        )
+        assert graded.grade is Grade.LIKELY
+        joined = " ".join(graded.evidence)
+        assert "removal time is unknown" in joined
+        assert "still served" not in joined
+
+    def test_no_open_window_run_does_not_claim_a_served_period(self):
+        graded = grade_exposure(exposure(), OPEN_WINDOW, history())
+        assert graded.grade is Grade.POSSIBLE
+        assert "registry removal time unknown" in " ".join(graded.evidence)
 
     def test_the_overlap_starts_at_whichever_began_later(self):
         from deptrail.grading import _overlap_start
@@ -468,16 +487,16 @@ class TestNothingIsAfterAnOpenEnd:
 class TestBoundaryInstants:
     """The edges of the two run filters this feature rewrote."""
 
-    def test_a_run_at_the_exact_window_start_confirms(self):
-        # `during` uses `live_start <= r.at`. Making it strict loses proof that CI
-        # fetched the artifact, and quietly moves the credential from REPO_WIDE to
-        # DEVELOPER scope — the responder is told the Actions secret was not exercised.
+    def test_a_run_at_the_exact_open_window_start_is_likely(self):
+        # `during` uses `live_start <= r.at`. Making it strict would drop evidence that
+        # an install workflow ran and quietly move the credential from REPO_WIDE to
+        # DEVELOPER scope.
         at_start = run(at=OPEN_WINDOW.window_start)
         graded = grade_exposure(
             exposure(since=datetime(2025, 11, 20, tzinfo=timezone.utc), until=None),
             OPEN_WINDOW, history(at_start),
         )
-        assert graded.grade is Grade.CONFIRMED
+        assert graded.grade is Grade.LIKELY
         assert graded.implicates_install is True
 
     def test_a_run_at_the_exact_window_end_confirms(self):
@@ -568,9 +587,9 @@ class TestTruncatedRunListIsNotCoverage:
 
         import deptrail.grading as grading
 
-        # Refusing to certify coverage must not discard what arrived. A run that built the
-        # exposing commit inside the window still proves the install happened; only the
-        # claim about what was *not* seen is withdrawn.
+        # Refusing to certify coverage must not discard what arrived. With no recorded
+        # removal time, the run proves an install workflow ran but not that the artifact
+        # was available.
         runs = [{"id": 1, "head_sha": COMMIT, "event": "push", "name": "CI",
                  "path": ".github/workflows/ci.yml",
                  "run_started_at": "2025-11-25T10:00:00+00:00"},
@@ -590,7 +609,8 @@ class TestTruncatedRunListIsNotCoverage:
                 r if r.run_id != "1" else replace(r, installs_dependencies=True)
                 for r in history.records)),
         )
-        assert graded.grade is Grade.CONFIRMED
+        assert graded.grade is Grade.LIKELY
+        assert graded.implicates_install is True
 
     def test_a_complete_read_still_claims_the_range(self, monkeypatch):
         self._gh(monkeypatch, total=3, returned=3)
