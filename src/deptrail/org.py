@@ -22,6 +22,8 @@ human can overrule the classification; they simply do not produce rotation items
 """
 from __future__ import annotations
 
+import fnmatch
+import json
 import re
 import subprocess
 import textwrap
@@ -86,7 +88,7 @@ def is_probably_installed(lockfile_path: str) -> bool:
 
 
 class Installed(str, Enum):
-    """Whether a workflow installs a tree — and the third answer, which is not "no".
+    """What workflow evidence establishes about installing one non-deployed tree.
 
     Forced into a boolean this was wrong four times, in both directions. A bare substring
     made `"test"` match `ubuntu-latest` and a fixture look installed; requiring an install
@@ -98,11 +100,11 @@ class Installed(str, Enum):
     repository, and a directory name can appear in a step title, a runner label or an
     echoed string.
 
-    So that question is not asked here. What is asked is narrower and answerable: does a
-    workflow at that commit **name** this directory as a path? If it does and a run is
-    implicated, the tree is installed. If it does and no run is implicated, the answer is
-    ``UNKNOWN`` — which is the case that used to be silently "no", and that silence is
-    what deleted a finding when CI evidence weakened.
+    The classifier now makes only claims the text supports: a literal executable install is
+    ``YES``; a mention, delegation, dynamic scope, or read failure is ``UNKNOWN``; and
+    ``NO`` requires reading every workflow and finding none of those. A confirmed run may
+    promote a literal path reference in its own workflow, but losing a run record never
+    turns an install into fixture data.
     """
 
     YES = "YES"
@@ -113,31 +115,157 @@ class Installed(str, Enum):
 def _mentions(text: str, directory: str) -> bool:
     """Whether the text names this directory as a path, rather than inside another word.
 
-    Compared as path segments, not by substring or by a boundary regex. Both of those were
-    wrong on real input: `"test"` matched `ubuntu-latest`, and a regex boundary still
-    matched `vendor/examples/app` and `examples/app.bak` when the tree was `examples/app`.
+    Separators are normalised first because Windows workflows spell a real path with
+    backslashes. The directory itself may contain whitespace, so splitting the workflow
+    into tokens is not sound either. Boundaries exclude a preceding path segment and a
+    longer final component: `vendor/examples/app` and `examples/app.bak` are not this tree.
     """
-    wanted = PurePosixPath(directory)
-    for token in re.findall(r"[\w./-]+", text):
-        candidate = token.strip("'\"").lstrip("./")
-        if not candidate:
-            continue
-        path = PurePosixPath(candidate)
-        if path == wanted or wanted in path.parents:
-            return True
-    return False
-
-
-def _workflow_mentions_dir(repo: Path, sha: str, paths: tuple[str, ...],
-                           directory: str) -> bool:
-    """Whether any of these workflows names this lockfile's directory."""
-    if not directory or directory == ".":
+    wanted = directory.replace("\\", "/").strip("/")
+    if not wanted:
         return False
+    normalised = text.replace("\\", "/")
+    # These two forms explicitly root a path in the checkout. Removing only the known
+    # prefix preserves the distinction from an arbitrary absolute or parent path.
+    normalised = re.sub(r"\$\{\{\s*github\.workspace\s*\}\}/", "", normalised,
+                        flags=re.IGNORECASE)
+    normalised = re.sub(r"\$(?:GITHUB_WORKSPACE|PWD)/", "", normalised)
+    pattern = re.compile(
+        rf"(?<![\w.@+/-])(?:\./)?{re.escape(wanted)}(?=$|/|[^\w.@+/-])"
+    )
+    return pattern.search(normalised) is not None
+
+
+# A positive match is deliberately narrow: it can make a POSSIBLE exposure actionable,
+# so it must be a command line rather than a step title, comment, or prose elsewhere in the
+# workflow. Missing a novel spelling falls through to UNKNOWN, never to a false clearance.
+PACKAGE_INSTALL = re.compile(
+    r"(?:^|&&\s*|\|\|\s*|;\s*)(?:npm|pnpm|yarn|bun)\b[^\n]*"
+    r"(?:\bci\b|\binstall\b|\bi\b|\badd\b)",
+    re.IGNORECASE,
+)
+WORKSPACE_FLAG = re.compile(r"--workspaces\b|--recursive\b|(?:^|\s)-r(?:\s|$)",
+                            re.IGNORECASE)
+# Delegation is evidence that this file cannot clear any non-deployed tree. Keep the
+# patterns specific enough that `make lint` and `./gradlew test` do not taint every fixture.
+DELEGATES_INSTALL = re.compile(
+    r"uses\s*:\s*['\"]?\./"
+    r"|uses\s*:\s*['\"]?[^\s'\"]+\.github/workflows/"
+    r"|(?:^|[\s;&|])(?:bash|sh)\s+[^\n]+"
+    r"|(?:^|[\s;&|])\./(?:(?:scripts?|tools?|bin|ci)/[^\s;&|]+|"
+    r"[^\s;&|]*(?:setup|install|bootstrap|deps)[^\s;&|]*)"
+    r"|(?:^|[\s;&|])(?:make|just|task)\s+(?:install|setup|bootstrap|deps)(?:\s|$)",
+    re.IGNORECASE | re.MULTILINE,
+)
+DYNAMIC_SCOPE = re.compile(
+    r"(?:working-directory\s*:|cache-dependency-path\s*:|--prefix|--workspace(?:s)?|"
+    r"(?:^|[;&|])\s*cd\s+)[^\n]*(?:\$\{\{|\$[A-Za-z_]|\*)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+@dataclass(frozen=True)
+class WorkflowEvidence:
+    """What workflow text establishes without pretending to execute or parse YAML."""
+
+    direct_install: bool = False
+    mentions_directory: bool = False
+    uncertain: bool = False
+
+
+def _line_directly_installs(line: str, directory: str) -> bool:
+    """Whether one executable line literally installs in ``directory``."""
+    command = _command_from_run_line(line)
+    if command is None:
+        return False
+    lower = command.lower()
+    return (_mentions(command, directory)
+            and (any(install in lower for install in INSTALL_COMMANDS)
+                 or PACKAGE_INSTALL.search(command) is not None))
+
+
+def _command_from_run_line(line: str) -> str | None:
+    """The executable portion of one YAML/shell line, without interpreting YAML."""
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return None
+    match = re.search(r"(?:^|[\[{,])\s*(?:-\s*)?run\s*:\s*(.*)", line,
+                      flags=re.IGNORECASE)
+    command = match.group(1) if match else stripped
+    command = command.strip().strip("'\"")
+    # A bare line in a `run: |` block is executable only when the package manager is
+    # actually the command, not text passed to `echo` or another program.
+    return command if PACKAGE_INSTALL.search(command) else None
+
+
+def _workspace_patterns(repo: Path, sha: str) -> tuple[str, ...]:
+    """Workspace globs in the root package manifest at one commit."""
+    raw = _text_at(repo, sha, "package.json")
+    if raw is None:
+        return ()
+    try:
+        workspaces = json.loads(raw).get("workspaces", ())
+    except (json.JSONDecodeError, AttributeError):
+        return ()
+    if isinstance(workspaces, dict):
+        workspaces = workspaces.get("packages", ())
+    if not isinstance(workspaces, list):
+        return ()
+    patterns = []
+    for value in workspaces:
+        if not isinstance(value, str):
+            continue
+        normalised = value.replace("\\", "/")
+        if normalised.startswith("./"):
+            normalised = normalised[2:]
+        normalised = normalised.rstrip("/")
+        if normalised:
+            patterns.append(normalised)
+    return tuple(patterns)
+
+
+def _is_workspace(repo: Path, sha: str, directory: str) -> bool:
+    target = directory.replace("\\", "/")
+    if target.startswith("./"):
+        target = target[2:]
+    target = target.rstrip("/")
+    return any(fnmatch.fnmatchcase(target, pattern) for pattern in _workspace_patterns(repo, sha))
+
+
+def _workflow_evidence(repo: Path, sha: str, paths: tuple[str, ...] | None,
+                       directory: str) -> WorkflowEvidence:
+    """Evidence about one directory across a known set of workflow files.
+
+    ``None`` means even the file list could not be read. A listed blob returning ``None``
+    is likewise uncertainty, not the absence of a reference. Direct literal installs are
+    the only positive result without a run; everything delegated or dynamically scoped
+    withholds a clearance instead of guessing what it executed.
+    """
+    if paths is None:
+        return WorkflowEvidence(uncertain=True)
+    direct, mentioned, uncertain = False, False, False
+    workspace = _is_workspace(repo, sha, directory)
     for path in paths:
         body = _text_at(repo, sha, path)
-        if body is not None and _mentions(body, directory):
-            return True
-    return False
+        if body is None:
+            uncertain = True
+            continue
+        mentioned = mentioned or _mentions(body, directory)
+        direct = direct or any(_line_directly_installs(line, directory)
+                               for line in body.splitlines())
+        workspace_install = any(
+            (command := _command_from_run_line(line)) is not None
+            and WORKSPACE_FLAG.search(command)
+            for line in body.splitlines()
+        )
+        if workspace and workspace_install:
+            direct = True
+        if DELEGATES_INSTALL.search(body) or DYNAMIC_SCOPE.search(body):
+            uncertain = True
+        # `--workspaces` explicitly reaches outside the root, even when a manifest this
+        # version cannot parse prevents identifying which directory it reaches.
+        if workspace_install and not workspace:
+            uncertain = True
+    return WorkflowEvidence(direct, mentioned, uncertain)
 
 
 @lru_cache(maxsize=1024)
@@ -197,27 +325,32 @@ def _classify_tree(repo: Path, graded: GradedExposure) -> Installed:
         return Installed.YES
     directory = str(PurePosixPath(lockfile).parent)
     sha = graded.exposure.commit
-    # Installed only where a run is implicated *and* its own workflow names the directory:
-    # what another workflow does is not evidence about the run that happened.
-    if graded.grade is Grade.CONFIRMED and _workflow_mentions_dir(
-            repo, sha, graded.workflow_paths, directory):
+    implicated = _workflow_evidence(repo, sha, graded.workflow_paths, directory)
+    # A direct literal install is actionable even after the run record expires: POSSIBLE
+    # already means rotate. A confirmed run may use the older, broader reference rule,
+    # because something in that exact workflow demonstrably installed dependencies.
+    if implicated.direct_install or (
+            graded.grade is Grade.CONFIRMED and implicated.mentions_directory):
         return Installed.YES
-    # But any workflow at that commit naming it is enough to withhold a clearance, even one
-    # that did not run here — it could on the next push, and the run records that would
-    # show it are exactly what may be missing. Under stronger CI evidence this tree would
-    # have been kept, so answering "test data" would make the classification a function of
-    # what the runs API happened to return.
-    if _workflow_mentions_dir(repo, sha, _workflows_at(repo, sha), directory):
+    if implicated.mentions_directory or implicated.uncertain:
+        return Installed.UNKNOWN
+    # With no implicated workflow, all workflows at that commit get one conservative pass.
+    # A direct install remains actionable; a mention, delegation, dynamic scope, or read
+    # failure withholds an all-clear. Only a fully read set with none of those says NO.
+    all_evidence = _workflow_evidence(repo, sha, _workflows_at(repo, sha), directory)
+    if all_evidence.direct_install:
+        # A different workflow naming the tree is not evidence about a CONFIRMED run whose
+        # own workflow did not. The retained history says which workflow ran; the other one
+        # stays a future possibility rather than being attributed to this execution.
+        if graded.grade is Grade.CONFIRMED and graded.workflow_paths:
+            return Installed.UNKNOWN
+        return Installed.YES
+    if all_evidence.mentions_directory or all_evidence.uncertain:
         return Installed.UNKNOWN
     return Installed.NO
 
 
-def _is_installed_tree(repo: Path, graded: GradedExposure) -> bool:
-    """Whether this tree is known to be installed. ``UNKNOWN`` is not that."""
-    return _classify_tree(repo, graded) is Installed.YES
-
-
-def _workflows_at(repo: Path, sha: str) -> tuple[str, ...]:
+def _workflows_at(repo: Path, sha: str) -> tuple[str, ...] | None:
     """Workflow files as they stood at one commit.
 
     Read at the commit and not at HEAD: a workflow that installed a directory
@@ -225,16 +358,18 @@ def _workflows_at(repo: Path, sha: str) -> tuple[str, ...]:
     matters, and looking at today's tree loses it.
     """
     listing = _tree_at(str(repo), sha)
+    if listing is None:
+        return None
     return tuple(line for line in listing.splitlines() if line.strip())
 
 
 @lru_cache(maxsize=1024)
-def _tree_at(repo: str, sha: str) -> str:
+def _tree_at(repo: str, sha: str) -> str | None:
     try:
         return _git_text(Path(repo), "ls-tree", "-r", "--name-only", sha,
                          ".github/workflows")
     except GitError:
-        return ""
+        return None
 
 
 def _is_installed_unread_tree(repo: Path, tree: UnreadTree) -> bool:
@@ -251,7 +386,8 @@ def _is_installed_unread_tree(repo: Path, tree: UnreadTree) -> bool:
     if not directory or directory == ".":
         return True
     sha = tree.commit or "HEAD"
-    return _workflow_mentions_dir(repo, sha, _workflows_at(repo, sha), directory)
+    evidence = _workflow_evidence(repo, sha, _workflows_at(repo, sha), directory)
+    return evidence.direct_install or evidence.mentions_directory or evidence.uncertain
 
 
 # Failures that mean the tooling could not answer, as opposed to evidence that says
