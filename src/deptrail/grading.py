@@ -39,8 +39,8 @@ from __future__ import annotations
 
 import json
 import subprocess
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 
@@ -216,11 +216,15 @@ class GradedFinding:
         return self.worst_grade in (Grade.CONFIRMED, Grade.LIKELY, Grade.POSSIBLE)
 
 
-def _overlap(exposure: Exposure, query: WindowQuery) -> tuple[datetime, datetime]:
-    """The instants when the pin and the window coincide — where an install counts."""
-    start = max(exposure.since, query.window_start)
-    end = query.window_end if exposure.until is None else min(exposure.until, query.window_end)
-    return start, end
+def _overlap_start(exposure: Exposure, query: WindowQuery) -> datetime:
+    """The first instant the pin and the window coincide — where an install counts.
+
+    Only the start is returned because only the start is used. This returned the whole
+    interval until review pointed out that no caller ever read the end, so the
+    arithmetic for it was dead and the tests written for it asserted a value no report
+    could show.
+    """
+    return max(exposure.since, query.window_start)
 
 
 # Events whose run checks out the head commit itself. A ``pull_request`` run
@@ -248,7 +252,7 @@ def grade_exposure(exposure: Exposure, query: WindowQuery,
     """
     live_start = max(exposure.since, query.window_start)
     on_commit = [r for r in history.records if r.head_sha == exposure.commit]
-    during = [r for r in on_commit if live_start <= r.at <= query.window_end]
+    during = [r for r in on_commit if live_start <= r.at and query.covers(r.at)]
     confirming = [r for r in during
                   if r.installs_dependencies is True
                   and r.event in HEAD_CHECKOUT_EVENTS]
@@ -292,7 +296,11 @@ def grade_exposure(exposure: Exposure, query: WindowQuery,
             implicates_install=any(r.installs_dependencies is not False for r in during),
         )
 
-    later = [r for r in on_commit if r.at > query.window_end]
+    # Nothing is "after" an open end. Without a recorded removal we cannot say the
+    # artifact was gone by the time a run built the commit, and claiming it would
+    # downgrade a live exposure on an assertion nobody measured.
+    later = ([] if query.window_end is None
+             else [r for r in on_commit if r.at > query.window_end])
     if later:
         run = later[0]
         return GradedExposure(
@@ -342,7 +350,7 @@ def grade_finding(finding: RepoFinding, query: WindowQuery, history: RunHistory,
     graded.graded.extend(grade_exposure(e, query, history) for e in finding.exposures)
 
     if finding.exposures:
-        earliest = min(_overlap(e, query)[0] for e in finding.exposures)
+        earliest = min(_overlap_start(e, query) for e in finding.exposures)
         newest = max((r.at for r in history.records), default=None)
         beyond_retention = newest is not None and earliest < newest - RETENTION
         if not history.covers(earliest) or beyond_retention:
@@ -386,6 +394,60 @@ def parse_run_list(raw: str, *, source: str,
     return RunHistory(records=tuple(records), oldest_available=covered_from, source=note)
 
 
+def _coverage_doubt(pages: list, runs: list, announced: object,
+                    until: datetime | None = None) -> str | None:
+    """Why this read cannot certify the range it asked for, or ``None`` if it can.
+
+    Three signals, because the endpoint gives no direct one. It stops at a fixed number of
+    items, newest first, with HTTP 200 and nothing in the body to say so.
+
+    Counting is necessary and not sufficient. `--paginate` walks offsets, and a run created
+    between two page requests shifts every later page by one: a boundary run arrives twice
+    while the oldest is pushed off the end, and the total collected is unchanged. Measured
+    at 200 collected against 199 distinct, with the oldest run missing and the count still
+    matching — which is why duplicate ids are checked too.
+
+    The third signal is `total_count` disagreeing between pages. Against the live API it is
+    identical on every non-empty page (1045 across ten of them for `expressjs/express`) and
+    0 on the empty page past the cap, so a difference among the non-empty ones means the
+    list moved underfoot. Empty pages are excluded for exactly that reason.
+    """
+    if not pages:
+        return "the API returned no pages at all, so nothing was read"
+    # `type(...) is int` and not `isinstance`: `True` is an instance of `int` in Python, so
+    # a malformed `"total_count": true` passed a fail-closed check as a number.
+    if type(announced) is not int:
+        return f"the API reported no usable total ({announced!r}), so the read cannot be checked"
+    if announced != len(runs):
+        return (f"the API returned {len(runs)} run(s) against a reported total of "
+                f"{announced}, newest first, so the oldest part of the range was not "
+                "delivered")
+    ids = [run.get("id") for run in runs if run.get("id") is not None]
+    if len(ids) != len(set(ids)):
+        return (f"{len(ids) - len(set(ids))} run(s) arrived twice, so the list shifted "
+                "between page requests and an older run was pushed out of it")
+    totals = {page.get("total_count") for page in pages if page.get("workflow_runs")}
+    if len(totals) > 1:
+        return (f"the reported total changed between pages ({sorted(map(str, totals))}), "
+                "so the list shifted while it was being read")
+    # And the three signals above are still only necessary, not sufficient. A run created
+    # between two page requests shifts the offsets while an unrelated deletion restores the
+    # total: same count, same total, no duplicate id, and a run missing from the middle.
+    # Nothing in an offset-paginated response rules that out.
+    #
+    # What does rule it out is the range itself. A run is created with `created_at` of now,
+    # so a range whose upper bound is already past cannot gain one, and a deletion lowers
+    # the count and is caught above. A single page cannot be shifted at all. Anything else
+    # — several pages reaching up to today — is the case that cannot be certified.
+    stable = until and until.astimezone(timezone.utc).date() < datetime.now(
+        timezone.utc).date()
+    if len(pages) > 1 and not stable:
+        return (f"{len(pages)} pages were read over a range that reaches the present, and "
+                "offset pagination gives no snapshot — a run created between two requests "
+                "shifts the rest and can hide one without changing any count")
+    return None
+
+
 def runs_from_github(repo_slug: str, *, since: datetime | None = None,
                      until: datetime | None = None) -> RunHistory:
     """Read run records for a date range through the GitHub API.
@@ -397,8 +459,12 @@ def runs_from_github(repo_slug: str, *, since: datetime | None = None,
     """
     query = "per_page=100"
     if since or until:
-        lo = since.date().isoformat() if since else "*"
-        hi = until.date().isoformat() if until else "*"
+        # Normalised to UTC before the date is taken. `created=` filters by date, and a
+        # bound written in another offset lands on a different day: a window opening at
+        # 2025-11-25T01:00+09:00 is 2025-11-24 in UTC, and asking from the 25th skipped the
+        # first hours of the window it was meant to cover.
+        lo = since.astimezone(timezone.utc).date().isoformat() if since else "*"
+        hi = until.astimezone(timezone.utc).date().isoformat() if until else "*"
         query += f"&created={lo}..{hi}"
     try:
         raw = subprocess.run(
@@ -410,11 +476,34 @@ def runs_from_github(repo_slug: str, *, since: datetime | None = None,
         raise ToolFailure(f"could not read CI runs for {repo_slug}: {e}") from e
     pages = json.loads(raw or "[]")
     runs = [run for page in pages for run in page.get("workflow_runs", [])]
+    source = f"gh api repos/{repo_slug}/actions/runs ({query})"
+    # The endpoint stops at a fixed number of items, newest first, with HTTP 200 and no
+    # marker in the body — the only way to notice is that page 1 announced a larger
+    # `total_count` than the number of runs that arrived. Measured against
+    # `expressjs/express`, an ordinary repository: an eleven-month range reports 1,045
+    # runs and returns the newest thousand, so the runs from the *incident* are exactly
+    # the ones missing. Believing the requested range was covered then reports that
+    # period as quiet rather than as unanswered, which is a false clean.
+    announced = pages[0].get("total_count") if pages else None
+    if doubt := _coverage_doubt(pages, runs, announced, until):
+        unverified = parse_run_list(
+            json.dumps({"workflow_runs": runs}),
+            source=f"{source}: {doubt} — narrow the window, or the range of repositories",
+            covered_from=None,
+        )
+        # No horizon at all, not the oldest record's timestamp. That would claim the range
+        # from there to `until` is contiguous, and none of the signals above says where the
+        # hole is: a read can deliver August and June while July is missing, and
+        # `min(r.at)` then answers "covered" straight across it. The records stay as
+        # positive evidence — a run that confirms still confirms — but they are not
+        # evidence of absence.
+        return unverified
     return parse_run_list(
         json.dumps({"workflow_runs": runs}),
-        source=f"gh api repos/{repo_slug}/actions/runs ({query})",
-        # Coverage is exactly the range requested; an unbounded query establishes
-        # nothing about how far back the platform still keeps runs.
+        source=source,
+        # Everything the filter matched arrived, so the requested range really was
+        # covered — including the case where it matched nothing, which is evidence
+        # that no run happened rather than evidence of a truncated read.
         covered_from=since,
     )
 

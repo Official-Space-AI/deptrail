@@ -20,7 +20,10 @@ from deptrail.grading import (
     parse_run_list,
     grade_finding,
     installs_from_workflows,
+    runs_from_github,
 )
+from dataclasses import replace
+
 from deptrail.history import Exposure, RepoFinding, Verdict, WindowQuery
 
 WINDOW = WindowQuery(
@@ -391,3 +394,400 @@ class TestRunListParsing:
 
     def test_empty_response(self):
         assert parse_run_list("", source="test").records == ()
+
+
+OPEN_WINDOW = WindowQuery(
+    package="chalk",
+    malicious_versions=frozenset({"5.6.1"}),
+    window_start=datetime(2025, 11, 24, tzinfo=timezone.utc),
+    window_end=None,
+)
+
+
+class TestOpenUpperBoundChangesVerdicts:
+    """An unknown removal time must widen the answer, never narrow it (#23).
+
+    The right edge of a window is recorded nowhere, so a closed one is an assertion.
+    These are the places where believing that assertion clears a repository that a
+    responder would have wanted flagged.
+    """
+
+    def test_a_run_after_a_closed_window_is_only_likely(self):
+        after = run(at=datetime(2025, 11, 27, 10, tzinfo=timezone.utc))
+        graded = grade_exposure(exposure(), WINDOW, history(after))
+        # The closed window says the artifact was gone, so the install may have failed.
+        assert graded.grade is Grade.LIKELY
+        assert graded.implicates_install is False
+        assert any("no longer served" in e for e in graded.evidence)
+
+    def test_the_same_run_is_confirmed_when_the_window_never_closed(self):
+        after = run(at=datetime(2025, 11, 27, 10, tzinfo=timezone.utc))
+        graded = grade_exposure(exposure(), OPEN_WINDOW, history(after))
+        # Nothing is "after" an end nobody recorded. Downgrading here would rest the
+        # whole conclusion on a number the ecosystem does not publish.
+        assert graded.grade is Grade.CONFIRMED
+        assert graded.implicates_install is True
+        assert not any("no longer served" in e for e in graded.evidence)
+
+    def test_a_run_years_later_still_counts_under_an_open_window(self):
+        graded = grade_exposure(
+            exposure(until=None),
+            OPEN_WINDOW,
+            history(run(at=datetime(2030, 1, 1, tzinfo=timezone.utc)),
+                    oldest=datetime(2029, 1, 1, tzinfo=timezone.utc)),
+        )
+        assert graded.grade is Grade.CONFIRMED
+
+    def test_the_overlap_starts_at_whichever_began_later(self):
+        from deptrail.grading import _overlap_start
+
+        # The window opens first, so the pin's own start is where an install counts.
+        assert _overlap_start(exposure(until=None), OPEN_WINDOW) == datetime(
+            2025, 11, 25, tzinfo=timezone.utc)
+        # And the reverse: a pin older than the incident counts from the window.
+        early = exposure(since=datetime(2025, 1, 1, tzinfo=timezone.utc))
+        assert _overlap_start(early, OPEN_WINDOW) == OPEN_WINDOW.window_start
+
+
+class TestNothingIsAfterAnOpenEnd:
+    def test_a_run_predating_the_pin_is_not_called_late(self):
+        # `later` exists to say "the artifact was already gone". Under an open end there
+        # is no such moment, and the only runs that fall through to it are ones that
+        # predate the pin — a re-used sha or a skewed clock. Describing those as "after
+        # the window closed" inverts the fact.
+        early = run(at=datetime(2025, 11, 24, 6, tzinfo=timezone.utc))
+        graded = grade_exposure(
+            exposure(since=datetime(2025, 11, 25, tzinfo=timezone.utc)),
+            OPEN_WINDOW, history(early),
+        )
+        assert graded.grade is not Grade.LIKELY
+        assert not any("no longer served" in e for e in graded.evidence)
+        assert graded.implicates_install is False
+
+
+class TestBoundaryInstants:
+    """The edges of the two run filters this feature rewrote."""
+
+    def test_a_run_at_the_exact_window_start_confirms(self):
+        # `during` uses `live_start <= r.at`. Making it strict loses proof that CI
+        # fetched the artifact, and quietly moves the credential from REPO_WIDE to
+        # DEVELOPER scope — the responder is told the Actions secret was not exercised.
+        at_start = run(at=OPEN_WINDOW.window_start)
+        graded = grade_exposure(
+            exposure(since=datetime(2025, 11, 20, tzinfo=timezone.utc), until=None),
+            OPEN_WINDOW, history(at_start),
+        )
+        assert graded.grade is Grade.CONFIRMED
+        assert graded.implicates_install is True
+
+    def test_a_run_at_the_exact_window_end_confirms(self):
+        at_end = run(at=WINDOW.window_end)
+        graded = grade_exposure(
+            exposure(since=datetime(2025, 11, 25, tzinfo=timezone.utc), until=None),
+            WINDOW, history(at_end),
+        )
+        assert graded.grade is Grade.CONFIRMED
+
+    def test_a_run_at_the_exact_window_end_is_not_late(self):
+        # `later` uses `r.at > window_end`. At `>=` the same run is described as having
+        # run "after ... when 5.6.1 was no longer served", which is false at the
+        # inclusive edge.
+        late_side = WindowQuery(
+            package="chalk", malicious_versions=frozenset({"5.6.1"}),
+            window_start=datetime(2025, 11, 24, tzinfo=timezone.utc),
+            window_end=datetime(2025, 11, 26, 23, 59, 59, tzinfo=timezone.utc),
+        )
+        at_end = run(at=late_side.window_end)
+        graded = grade_exposure(
+            exposure(since=datetime(2025, 11, 27, tzinfo=timezone.utc), until=None),
+            late_side, history(at_end),
+        )
+        assert not any("no longer served" in e for e in graded.evidence)
+
+
+class TestTruncatedRunListIsNotCoverage:
+    """The runs endpoint stops at a fixed count, newest first, with HTTP 200.
+
+    Nothing in the body says so — the only signal is that page 1 announced a larger
+    `total_count` than the number of runs that arrived. Believing the requested range
+    was covered reports the incident period as quiet rather than unanswered, and for a
+    lockfile outside the repository root that demotion deletes the finding: measured at
+    exit 0 with `scan_complete: true` for a repository whose CI installed chalk 5.6.1.
+
+    An open-ended window makes the range wide enough to hit the cap on ordinary
+    repositories — `expressjs/express` reports 1,045 runs over eleven months.
+    """
+
+    SINCE = datetime(2025, 9, 7, tzinfo=timezone.utc)
+
+    def _gh(self, monkeypatch, *, total, returned):
+        """Fake `gh api --paginate --slurp`, newest-first and capped like the real one."""
+        import subprocess as sp
+
+        import deptrail.grading as grading
+
+        # The runs that arrive are the newest ones, and they built later commits — the
+        # runs on the exposing commit are exactly the ones the cap dropped.
+        newest = datetime(2026, 8, 1, tzinfo=timezone.utc)
+        runs = [{"id": i, "head_sha": OTHER, "event": "push", "name": "CI",
+                 "run_started_at": (newest - timedelta(hours=i)).isoformat()}
+                for i in range(returned)]
+        page = {"total_count": total, "workflow_runs": runs}
+        monkeypatch.setattr(grading.subprocess, "run", lambda *a, **k: sp.CompletedProcess(
+            a[0] if a else [], 0, stdout=json.dumps([page]), stderr=""))
+        return runs
+
+    def test_a_truncated_read_claims_no_horizon_at_all(self, monkeypatch):
+        self._gh(monkeypatch, total=1045, returned=1000)
+        history = runs_from_github("o/r", since=self.SINCE, until=None)
+        # Not the oldest record's timestamp: that would claim the range from there to the
+        # end is contiguous, and nothing in a paginated response says where the hole is.
+        assert history.oldest_available is None
+        assert not history.covers(self.SINCE)
+        assert "1000 run(s) against a reported total of 1045" in history.source
+
+    def test_a_hole_between_the_records_is_not_covered_over(self, monkeypatch):
+        import subprocess as sp
+
+        import deptrail.grading as grading
+
+        # August and June arrive, July is missing. A horizon taken from the oldest record
+        # answers "covered" straight across it.
+        runs = [{"id": 1, "head_sha": OTHER, "event": "push", "name": "CI",
+                 "run_started_at": "2026-08-01T00:00:00+00:00"},
+                {"id": 3, "head_sha": OTHER, "event": "push", "name": "CI",
+                 "run_started_at": "2026-06-01T00:00:00+00:00"}]
+        monkeypatch.setattr(grading.subprocess, "run", lambda *a, **k: sp.CompletedProcess(
+            [], 0, stdout=json.dumps([{"total_count": 3, "workflow_runs": runs}]), stderr=""))
+        history = runs_from_github("o/r", since=self.SINCE, until=None)
+        assert history.oldest_available is None
+        assert not history.covers(datetime(2026, 7, 1, tzinfo=timezone.utc))
+
+    def test_the_delivered_runs_are_still_positive_evidence(self, monkeypatch):
+        import subprocess as sp
+
+        import deptrail.grading as grading
+
+        # Refusing to certify coverage must not discard what arrived. A run that built the
+        # exposing commit inside the window still proves the install happened; only the
+        # claim about what was *not* seen is withdrawn.
+        runs = [{"id": 1, "head_sha": COMMIT, "event": "push", "name": "CI",
+                 "path": ".github/workflows/ci.yml",
+                 "run_started_at": "2025-11-25T10:00:00+00:00"},
+                {"id": 2, "head_sha": OTHER, "event": "push", "name": "CI",
+                 "run_started_at": "2026-08-01T00:00:00+00:00"}]
+        monkeypatch.setattr(grading.subprocess, "run", lambda *a, **k: sp.CompletedProcess(
+            [], 0, stdout=json.dumps([{"total_count": 99, "workflow_runs": runs}]),
+            stderr=""))
+        history = runs_from_github("o/r", since=self.SINCE, until=None)
+        assert history.oldest_available is None
+        graded = grade_exposure(
+            exposure(until=None),
+            WindowQuery(package="chalk", malicious_versions=frozenset({"5.6.1"}),
+                        window_start=datetime(2025, 11, 24, tzinfo=timezone.utc),
+                        window_end=None),
+            replace(history, records=tuple(
+                r if r.run_id != "1" else replace(r, installs_dependencies=True)
+                for r in history.records)),
+        )
+        assert graded.grade is Grade.CONFIRMED
+
+    def test_a_complete_read_still_claims_the_range(self, monkeypatch):
+        self._gh(monkeypatch, total=3, returned=3)
+        history = runs_from_github("o/r", since=self.SINCE, until=None)
+        assert history.oldest_available == self.SINCE
+        assert history.covers(self.SINCE)
+        assert "reported total" not in history.source
+
+    def test_an_empty_range_is_evidence_not_truncation(self, monkeypatch):
+        self._gh(monkeypatch, total=0, returned=0)
+        history = runs_from_github("o/r", since=self.SINCE, until=None)
+        # Nothing matched the filter, which means no run happened — real evidence. A
+        # truncated read must not be confused with a quiet repository, nor the reverse.
+        assert history.oldest_available == self.SINCE
+        assert history.covers(self.SINCE)
+
+    @pytest.mark.parametrize("odd", [
+        {"id": 9, "head_sha": OTHER, "event": "push", "name": "CI",
+         "run_started_at": "0001-01-01T00:00:00Z"},
+        {"id": 9, "head_sha": OTHER, "event": "push", "name": "CI",
+         "created_at": "2025-11-05T00:00:00+00:00",
+         "run_started_at": "2025-11-20T00:00:00+00:00"},
+        {"id": 9, "head_sha": OTHER, "event": "push", "name": "CI"},
+    ])
+    def test_no_shape_of_run_can_produce_a_horizon_under_doubt(self, monkeypatch, odd):
+        import subprocess as sp
+
+        import deptrail.grading as grading
+
+        # Earlier attempts derived the horizon from the runs, and each shape here broke a
+        # different one: a zero date claimed coverage back to year 1, a re-run's rewritten
+        # start put the horizon after records the history was holding, and a run with no
+        # timestamp at all was dropped after being counted. Deriving nothing retires all
+        # three at once, so the invariant is asserted rather than the arithmetic.
+        runs = [{"id": 1, "head_sha": OTHER, "event": "push", "name": "CI",
+                 "run_started_at": "2026-08-01T00:00:00+00:00"}, odd]
+        monkeypatch.setattr(grading.subprocess, "run", lambda *a, **k: sp.CompletedProcess(
+            [], 0, stdout=json.dumps([{"total_count": 99, "workflow_runs": runs}]),
+            stderr=""))
+        history = runs_from_github("o/r", since=self.SINCE, until=None)
+        assert history.oldest_available is None
+        assert not history.covers(datetime(1970, 1, 1, tzinfo=timezone.utc))
+        assert not history.covers(self.SINCE)
+
+    def test_a_count_that_disagrees_upward_is_not_coverage_either(self, monkeypatch):
+        import subprocess as sp
+
+        import deptrail.grading as grading
+
+        # More runs than announced means the list shifted mid-pagination; the count
+        # cannot certify the read in either direction.
+        runs = [{"id": i, "head_sha": OTHER, "event": "push", "name": "CI",
+                 "run_started_at": f"2026-08-0{i + 1}T00:00:00+00:00"} for i in range(3)]
+        monkeypatch.setattr(grading.subprocess, "run", lambda *a, **k: sp.CompletedProcess(
+            [], 0, stdout=json.dumps([{"total_count": 2, "workflow_runs": runs}]),
+            stderr=""))
+        assert not runs_from_github("o/r", since=self.SINCE, until=None).covers(self.SINCE)
+
+    def test_no_pages_at_all_claims_nothing(self, monkeypatch):
+        import subprocess as sp
+
+        import deptrail.grading as grading
+
+        # `gh` printed nothing. Zero records plus a claim that the whole range was covered
+        # is the shape of a scan that never looked reporting that it looked.
+        monkeypatch.setattr(grading.subprocess, "run", lambda *a, **k: sp.CompletedProcess(
+            [], 0, stdout="[]", stderr=""))
+        history = runs_from_github("o/r", since=self.SINCE, until=None)
+        assert history.records == ()
+        assert history.oldest_available is None
+        assert not history.covers(self.SINCE)
+
+    def test_pagination_drift_is_not_coverage_even_when_the_count_matches(self, monkeypatch):
+        import subprocess as sp
+
+        import deptrail.grading as grading
+
+        # `--paginate` walks offsets. A run created between two page requests shifts every
+        # later page by one: a boundary run arrives twice and the oldest is pushed off the
+        # end, while the total collected is unchanged. Counting alone certifies a read with
+        # a hole in the middle of it.
+        def page(ids, month, total):
+            return {"total_count": total, "workflow_runs": [
+                {"id": i, "head_sha": OTHER, "event": "push", "name": "CI",
+                 "run_started_at": f"2026-{month:02d}-01T00:00:00+00:00"} for i in ids]}
+
+        pages = [page(range(200, 100, -1), 8, 200), page(range(101, 1, -1), 7, 201)]
+        collected = [r["id"] for p in pages for r in p["workflow_runs"]]
+        assert len(collected) == 200 and len(set(collected)) == 199 and 1 not in collected
+        monkeypatch.setattr(grading.subprocess, "run", lambda *a, **k: sp.CompletedProcess(
+            [], 0, stdout=json.dumps(pages), stderr=""))
+        history = runs_from_github("o/r", since=self.SINCE, until=None)
+        assert not history.covers(self.SINCE)
+        assert "arrived twice" in history.source
+
+    def test_a_total_that_changes_between_pages_is_not_coverage(self, monkeypatch):
+        import subprocess as sp
+
+        import deptrail.grading as grading
+
+        # Page 1's count must AGREE with what arrived, and the ids must be distinct, so
+        # that the disagreement between pages is the only thing left to notice. A fixture
+        # that also fails the count check tests the count check twice and this not at all.
+        pages = [
+            {"total_count": 2, "workflow_runs": [
+                {"id": 1, "head_sha": OTHER, "event": "push", "name": "CI",
+                 "run_started_at": "2026-08-01T00:00:00+00:00"}]},
+            {"total_count": 99, "workflow_runs": [
+                {"id": 2, "head_sha": OTHER, "event": "push", "name": "CI",
+                 "run_started_at": "2026-07-01T00:00:00+00:00"}]},
+        ]
+        monkeypatch.setattr(grading.subprocess, "run", lambda *a, **k: sp.CompletedProcess(
+            [], 0, stdout=json.dumps(pages), stderr=""))
+        history = runs_from_github("o/r", since=self.SINCE, until=None)
+        assert not history.covers(self.SINCE)
+        assert "changed between pages" in history.source
+
+    def _pages(self, monkeypatch, pages):
+        import subprocess as sp
+
+        import deptrail.grading as grading
+
+        monkeypatch.setattr(grading.subprocess, "run", lambda *a, **k: sp.CompletedProcess(
+            [], 0, stdout=json.dumps(pages), stderr=""))
+
+    REAL_SHAPE = [
+        {"total_count": 2, "workflow_runs": [
+            {"id": i, "head_sha": OTHER, "event": "push", "name": "CI",
+             "run_started_at": f"2025-09-0{i}T00:00:00+00:00"} for i in (1, 2)]},
+        {"total_count": 0, "workflow_runs": []},
+    ]
+
+    def test_a_closed_past_range_over_several_pages_is_certified(self, monkeypatch):
+        # The live API reports the same total on every non-empty page and 0 on the empty
+        # one past the cap, so empty pages must not count toward the disagreement test. A
+        # range that ended before today cannot gain a run, so paging it is safe.
+        self._pages(monkeypatch, self.REAL_SHAPE)
+        history = runs_from_github(
+            "o/r", since=self.SINCE,
+            until=datetime(2025, 9, 30, tzinfo=timezone.utc))
+        assert history.covers(self.SINCE)
+
+    def test_the_same_pages_over_a_range_reaching_today_are_not(self, monkeypatch):
+        # Offset pagination gives no snapshot. A run created between two requests shifts
+        # the rest and can hide one without changing any count, and a range that reaches
+        # the present is exactly where runs get created.
+        self._pages(monkeypatch, self.REAL_SHAPE)
+        history = runs_from_github("o/r", since=self.SINCE, until=None)
+        assert not history.covers(self.SINCE)
+        assert "no snapshot" in history.source
+
+    def test_a_single_page_reaching_today_is_certified(self, monkeypatch):
+        # One page cannot be shifted by an offset, so there is nothing to doubt.
+        self._pages(monkeypatch, [self.REAL_SHAPE[0]])
+        assert runs_from_github("o/r", since=self.SINCE, until=None).covers(self.SINCE)
+
+    def test_a_balanced_drift_is_refused_by_the_range_rule(self, monkeypatch):
+        # The shape that defeats all three counting signals: one run created and one
+        # already-read run deleted, so the total, the collected count and the distinctness
+        # of the ids are all unchanged while a run is missing from the middle.
+        pages = [
+            {"total_count": 200, "workflow_runs": [
+                {"id": i, "head_sha": OTHER, "event": "push", "name": "CI",
+                 "run_started_at": "2026-08-01T00:00:00+00:00"} for i in range(200, 100, -1)]},
+            {"total_count": 200, "workflow_runs": [
+                {"id": i, "head_sha": OTHER, "event": "push", "name": "CI",
+                 "run_started_at": "2026-07-01T00:00:00+00:00"} for i in range(100, 0, -1)]},
+        ]
+        collected = [r["id"] for p in pages for r in p["workflow_runs"]]
+        assert len(collected) == len(set(collected)) == 200
+        self._pages(monkeypatch, pages)
+        assert not runs_from_github("o/r", since=self.SINCE, until=None).covers(self.SINCE)
+
+    def test_a_boolean_total_is_not_a_number(self, monkeypatch):
+        # `isinstance(True, int)` is true in Python, so a malformed `"total_count": true`
+        # passed a check written to fail closed on anything that is not a number.
+        self._pages(monkeypatch, [{"total_count": True, "workflow_runs": [
+            {"id": 1, "head_sha": OTHER, "event": "push", "name": "CI",
+             "run_started_at": "2026-08-01T00:00:00+00:00"}]}])
+        history = runs_from_github("o/r", since=self.SINCE, until=None)
+        assert not history.covers(self.SINCE)
+        assert "no usable total" in history.source
+
+    def test_a_total_that_is_missing_or_not_a_number_is_not_coverage(self, monkeypatch):
+        import subprocess as sp
+
+        import deptrail.grading as grading
+
+        run = {"id": 1, "head_sha": OTHER, "event": "push", "name": "CI",
+               "run_started_at": "2026-08-01T00:00:00+00:00"}
+        # Without a usable total there is nothing to check the read against, and "we could
+        # not check" is not "we saw everything". Fail closed.
+        for total in ({}, {"total_count": None}, {"total_count": "many"}):
+            monkeypatch.setattr(grading.subprocess, "run",
+                                lambda *a, _t=total, **k: sp.CompletedProcess(
+                                    [], 0, stdout=json.dumps([{**_t, "workflow_runs": [run]}]),
+                                    stderr=""))
+            history = runs_from_github("o/r", since=self.SINCE, until=None)
+            assert not history.covers(self.SINCE), total
+            assert "no usable total" in history.source, total
