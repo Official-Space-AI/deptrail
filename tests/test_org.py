@@ -1456,6 +1456,57 @@ class TestAbsenceIsNeverProvenAlongsideAnExposure:
         assert report.proves_absence is True
 
 
+class TestWorkflowBlobCache:
+    def _repo(self, tmp_path):
+        repo = tmp_path / "moving-ref"
+        repo.mkdir()
+        git(repo, "init", "-q")
+        (repo / "workflow.yml").write_text("first")
+        git(repo, "add", "workflow.yml")
+        git(repo, "commit", "-qm", "first")
+        return repo
+
+    def test_a_moving_ref_reads_the_new_object(self, tmp_path):
+        import deptrail.org as org
+
+        repo = self._repo(tmp_path)
+        git(repo, "branch", "moving")
+        org._text_at_cached.cache_clear()
+        assert org._text_at(repo, "moving", "workflow.yml") == "first"
+
+        (repo / "workflow.yml").write_text("second")
+        git(repo, "add", "workflow.yml")
+        git(repo, "commit", "-qm", "second")
+        git(repo, "branch", "-f", "moving", "HEAD")
+
+        assert org._text_at(repo, "moving", "workflow.yml") == "second"
+
+    def test_a_ref_that_appears_later_is_resolved_again(self, tmp_path):
+        import deptrail.org as org
+
+        repo = self._repo(tmp_path)
+        assert org._object_id(repo, "future") is None
+        git(repo, "branch", "future")
+        assert org._object_id(repo, "future") == head(repo)
+
+    def test_an_immutable_blob_is_read_once(self, tmp_path, monkeypatch):
+        import deptrail.org as org
+
+        repo = self._repo(tmp_path)
+        object_id = head(repo)
+        calls = []
+        original = org._git_text
+        monkeypatch.setattr(
+            org, "_git_text",
+            lambda path, *args: (calls.append(args), original(path, *args))[1],
+        )
+        org._text_at_cached.cache_clear()
+
+        assert org._text_at_object(repo, object_id, "workflow.yml") == "first"
+        assert org._text_at_object(repo, object_id, "workflow.yml") == "first"
+        assert calls == [("show", f"{object_id}:workflow.yml")]
+
+
 class TestWorkflowsAreReadAtTheCommit:
     """Superseded the heuristic install-detection cases; what remains is which *commit's*
     workflows are consulted, and which set of them wins."""
@@ -1756,7 +1807,7 @@ class TestWorkflowReadFailureIsNotNoWorkflow:
         (repo / "examples/app/package-lock.json").write_text(lock("5.6.1"))
         git(repo, "add", "-A")
         git(repo, "commit", "-qm", "deps", date="2025-11-25T10:00:00+00:00")
-        monkeypatch.setattr("deptrail.org._text_at", lambda *args: None)
+        monkeypatch.setattr("deptrail.org._text_at_object", lambda *args: None)
 
         report = scan_organization([("unread-workflow", repo)], plan, runs=no_runs,
                                    secrets=lambda p, n: ("NPM_TOKEN",))
