@@ -22,13 +22,19 @@ human can overrule the classification; they simply do not produce rotation items
 """
 from __future__ import annotations
 
+import fnmatch
+import json
+import re
 import subprocess
 import textwrap
+from enum import Enum
+from functools import lru_cache
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 
 from .grading import (
+    INSTALL_COMMANDS,
     Grade,
     GradedExposure,
     GradedFinding,
@@ -81,49 +87,289 @@ def is_probably_installed(lockfile_path: str) -> bool:
     return not any(part.lower() in NON_DEPLOYED_DIRS for part in directories)
 
 
-def _workflow_mentions_dir(repo: Path, sha: str, paths: tuple[str, ...],
-                           directory: str) -> bool:
-    """Whether an implicated workflow refers to this lockfile's directory.
+class Installed(str, Enum):
+    """What workflow evidence establishes about installing one non-deployed tree.
 
-    A directory name is a guess; a workflow that names the directory is evidence.
-    Without this the two disagree in both directions: an app that really lives in
-    ``examples/production`` would be filed away as a fixture, while a root
-    ``npm ci`` would be credited with installing ``tests/fixtures``.
+    Forced into a boolean this was wrong four times, in both directions. A bare substring
+    made `"test"` match `ubuntu-latest` and a fixture look installed; requiring an install
+    command on the same line made a real ``npm ci --prefix examples/app`` reached through a
+    composite action look like test data. Every attempt to decide *whether a workflow
+    installs a directory* by pattern-matching YAML was wrong somewhere, in both directions
+    at once by the fourth try — an install can arrive through a composite action, a wrapper
+    script, a matrix variable, `npm i`, a bare `yarn`, or a reusable workflow in another
+    repository, and a directory name can appear in a step title, a runner label or an
+    echoed string.
+
+    The classifier now makes only claims the text supports: a literal executable install is
+    ``YES``; a mention, delegation, dynamic scope, or read failure is ``UNKNOWN``; and
+    ``NO`` requires reading every workflow and finding none of those. A confirmed run may
+    promote a literal path reference in its own workflow, but losing a run record never
+    turns an install into fixture data.
     """
-    for path in paths:
-        try:
-            body = _git_text(repo, "show", f"{sha}:{path}")
-        except GitError:
+
+    YES = "YES"
+    NO = "NO"
+    UNKNOWN = "UNKNOWN"
+
+
+def _mentions(text: str, directory: str) -> bool:
+    """Whether the text names this directory as a path, rather than inside another word.
+
+    Separators are normalised first because Windows workflows spell a real path with
+    backslashes. The directory itself may contain whitespace, so splitting the workflow
+    into tokens is not sound either. Boundaries exclude a preceding path segment and a
+    longer final component: `vendor/examples/app` and `examples/app.bak` are not this tree.
+    """
+    wanted = directory.replace("\\", "/").strip("/")
+    if not wanted:
+        return False
+    normalised = text.replace("\\", "/")
+    # These two forms explicitly root a path in the checkout. Removing only the known
+    # prefix preserves the distinction from an arbitrary absolute or parent path.
+    normalised = re.sub(r"\$\{\{\s*github\.workspace\s*\}\}/", "", normalised,
+                        flags=re.IGNORECASE)
+    normalised = re.sub(r"\$(?:GITHUB_WORKSPACE|PWD)/", "", normalised)
+    pattern = re.compile(
+        rf"(?<![\w.@+/-])(?:\./)?{re.escape(wanted)}(?=$|/|[^\w.@+/-])"
+    )
+    return pattern.search(normalised) is not None
+
+
+# A positive match is deliberately narrow: it can make a POSSIBLE exposure actionable,
+# so it must be a command line rather than a step title, comment, or prose elsewhere in the
+# workflow. Missing a novel spelling falls through to UNKNOWN, never to a false clearance.
+PACKAGE_INSTALL = re.compile(
+    r"(?:^|&&\s*|\|\|\s*|;\s*)(?:npm|pnpm|yarn|bun)\b[^\n]*"
+    r"(?:\bci\b|\binstall\b|\bi\b|\badd\b)",
+    re.IGNORECASE,
+)
+WORKSPACE_FLAG = re.compile(r"--workspaces\b|--recursive\b|(?:^|\s)-r(?:\s|$)",
+                            re.IGNORECASE)
+# Delegation is evidence that this file cannot clear any non-deployed tree. Keep the
+# patterns specific enough that `make lint` and `./gradlew test` do not taint every fixture.
+DELEGATES_INSTALL = re.compile(
+    r"uses\s*:\s*['\"]?\./"
+    r"|uses\s*:\s*['\"]?[^\s'\"]+\.github/workflows/"
+    r"|(?:^|[\s;&|])(?:bash|sh)\s+[^\n]+"
+    r"|(?:^|[\s;&|])\./(?:(?:scripts?|tools?|bin|ci)/[^\s;&|]+|"
+    r"[^\s;&|]*(?:setup|install|bootstrap|deps)[^\s;&|]*)"
+    r"|(?:^|[\s;&|])(?:make|just|task)\s+(?:install|setup|bootstrap|deps)(?:\s|$)",
+    re.IGNORECASE | re.MULTILINE,
+)
+DYNAMIC_SCOPE = re.compile(
+    r"(?:working-directory\s*:|cache-dependency-path\s*:|--prefix|--workspace(?:s)?|"
+    r"(?:^|[;&|])\s*cd\s+)[^\n]*(?:\$\{\{|\$[A-Za-z_]|\*)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+@dataclass(frozen=True)
+class WorkflowEvidence:
+    """What workflow text establishes without pretending to execute or parse YAML."""
+
+    direct_install: bool = False
+    mentions_directory: bool = False
+    uncertain: bool = False
+
+
+def _line_directly_installs(line: str, directory: str) -> bool:
+    """Whether one executable line literally installs in ``directory``."""
+    command = _command_from_run_line(line)
+    if command is None:
+        return False
+    lower = command.lower()
+    return (_mentions(command, directory)
+            and (any(install in lower for install in INSTALL_COMMANDS)
+                 or PACKAGE_INSTALL.search(command) is not None))
+
+
+def _command_from_run_line(line: str) -> str | None:
+    """The executable portion of one YAML/shell line, without interpreting YAML."""
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return None
+    match = re.search(r"(?:^|[\[{,])\s*(?:-\s*)?run\s*:\s*(.*)", line,
+                      flags=re.IGNORECASE)
+    command = match.group(1) if match else stripped
+    command = command.strip().strip("'\"")
+    # A bare line in a `run: |` block is executable only when the package manager is
+    # actually the command, not text passed to `echo` or another program.
+    return command if PACKAGE_INSTALL.search(command) else None
+
+
+def _workspace_patterns(repo: Path, sha: str) -> tuple[str, ...]:
+    """Workspace globs in the root package manifest at one commit."""
+    raw = _text_at(repo, sha, "package.json")
+    if raw is None:
+        return ()
+    try:
+        workspaces = json.loads(raw).get("workspaces", ())
+    except (json.JSONDecodeError, AttributeError):
+        return ()
+    if isinstance(workspaces, dict):
+        workspaces = workspaces.get("packages", ())
+    if not isinstance(workspaces, list):
+        return ()
+    patterns = []
+    for value in workspaces:
+        if not isinstance(value, str):
             continue
-        if directory and directory in body:
-            return True
-    return False
+        normalised = value.replace("\\", "/")
+        if normalised.startswith("./"):
+            normalised = normalised[2:]
+        normalised = normalised.rstrip("/")
+        if normalised:
+            patterns.append(normalised)
+    return tuple(patterns)
 
 
-def _is_installed_tree(repo: Path, graded: GradedExposure) -> bool:
-    """Whether this exposure sits in a tree some workflow would have installed."""
+def _is_workspace(repo: Path, sha: str, directory: str) -> bool:
+    target = directory.replace("\\", "/")
+    if target.startswith("./"):
+        target = target[2:]
+    target = target.rstrip("/")
+    return any(fnmatch.fnmatchcase(target, pattern) for pattern in _workspace_patterns(repo, sha))
+
+
+def _workflow_evidence(repo: Path, sha: str, paths: tuple[str, ...] | None,
+                       directory: str) -> WorkflowEvidence:
+    """Evidence about one directory across a known set of workflow files.
+
+    ``None`` means even the file list could not be read. A listed blob returning ``None``
+    is likewise uncertainty, not the absence of a reference. Direct literal installs are
+    the only positive result without a run; everything delegated or dynamically scoped
+    withholds a clearance instead of guessing what it executed.
+    """
+    if paths is None:
+        return WorkflowEvidence(uncertain=True)
+    direct, mentioned, uncertain = False, False, False
+    workspace = _is_workspace(repo, sha, directory)
+    for path in paths:
+        body = _text_at(repo, sha, path)
+        if body is None:
+            uncertain = True
+            continue
+        mentioned = mentioned or _mentions(body, directory)
+        direct = direct or any(_line_directly_installs(line, directory)
+                               for line in body.splitlines())
+        workspace_install = any(
+            (command := _command_from_run_line(line)) is not None
+            and WORKSPACE_FLAG.search(command)
+            for line in body.splitlines()
+        )
+        if workspace and workspace_install:
+            direct = True
+        if DELEGATES_INSTALL.search(body) or DYNAMIC_SCOPE.search(body):
+            uncertain = True
+        # `--workspaces` explicitly reaches outside the root, even when a manifest this
+        # version cannot parse prevents identifying which directory it reaches.
+        if workspace_install and not workspace:
+            uncertain = True
+    return WorkflowEvidence(direct, mentioned, uncertain)
+
+
+@lru_cache(maxsize=1024)
+def _text_at_cached(repo: str, sha: str, path: str) -> str | None:
+    try:
+        return _git_text(Path(repo), "show", f"{sha}:{path}")
+    except GitError:
+        return None
+
+
+def _text_at(repo: Path, sha: str, path: str) -> str | None:
+    """One blob at one commit, read once, keyed on a ref that fixes the content.
+
+    Uncached, classifying one exposure per lockfile per advisory package re-read every
+    workflow every time: 780 git subprocesses and a 12x wall clock on a repository with
+    thirty fixture lockfiles, for a byte-identical answer.
+
+    The ref has to be resolved to an object id first. Judging it by shape does not work —
+    a branch may be named ``deadbeef`` — and caching a name that can move means answering
+    from before it moved.
+    """
+    resolved = _object_id(repo, sha)
+    if resolved is None:
+        try:
+            return _git_text(repo, "show", f"{sha}:{path}")
+        except GitError:
+            return None
+    return _text_at_cached(str(repo), resolved, path)
+
+
+@lru_cache(maxsize=1024)
+def _object_id(repo: Path, ref: str) -> str | None:
+    """The immutable id ``ref`` points at, or ``None`` if it cannot be resolved.
+
+    Cached on the pair, which is safe in the direction that matters: a name that moves
+    would be re-resolved by a fresh process, and within one scan the commit under
+    examination does not change. A ref that does not resolve is not cached as an answer.
+    """
+    try:
+        return _git_text(repo, "rev-parse", f"{ref}^{{commit}}").strip() or None
+    except GitError:
+        return None
+
+
+def _classify_tree(repo: Path, graded: GradedExposure) -> Installed:
+    """Whether this exposure sits in a tree some workflow would have installed.
+
+    ``UNKNOWN`` is the answer that was missing. A workflow naming the directory is
+    evidence about the tree; whether that workflow *ran* is evidence about CI, and the two
+    were conflated. So losing a run record used to turn "installed" into "not installed"
+    and delete the finding — measured at exit 0 with ``scan_complete: true`` for a
+    repository whose CI demonstrably installed the malicious version. Weakened evidence
+    must weaken a grade, never remove a finding.
+    """
     lockfile = graded.exposure.lockfile_path
     if is_probably_installed(lockfile):
-        return True
+        return Installed.YES
     directory = str(PurePosixPath(lockfile).parent)
-    return graded.grade is Grade.CONFIRMED and _workflow_mentions_dir(
-        repo, graded.exposure.commit, graded.workflow_paths, directory
-    )
+    sha = graded.exposure.commit
+    implicated = _workflow_evidence(repo, sha, graded.workflow_paths, directory)
+    # A direct literal install is actionable even after the run record expires: POSSIBLE
+    # already means rotate. A confirmed run may use the older, broader reference rule,
+    # because something in that exact workflow demonstrably installed dependencies.
+    if implicated.direct_install or (
+            graded.grade is Grade.CONFIRMED and implicated.mentions_directory):
+        return Installed.YES
+    if implicated.mentions_directory or implicated.uncertain:
+        return Installed.UNKNOWN
+    # With no implicated workflow, all workflows at that commit get one conservative pass.
+    # A direct install remains actionable; a mention, delegation, dynamic scope, or read
+    # failure withholds an all-clear. Only a fully read set with none of those says NO.
+    all_evidence = _workflow_evidence(repo, sha, _workflows_at(repo, sha), directory)
+    if all_evidence.direct_install:
+        # A different workflow naming the tree is not evidence about a CONFIRMED run whose
+        # own workflow did not. The retained history says which workflow ran; the other one
+        # stays a future possibility rather than being attributed to this execution.
+        if graded.grade is Grade.CONFIRMED and graded.workflow_paths:
+            return Installed.UNKNOWN
+        return Installed.YES
+    if all_evidence.mentions_directory or all_evidence.uncertain:
+        return Installed.UNKNOWN
+    return Installed.NO
 
 
-def _workflows_at(repo: Path, sha: str) -> tuple[str, ...]:
+def _workflows_at(repo: Path, sha: str) -> tuple[str, ...] | None:
     """Workflow files as they stood at one commit.
 
     Read at the commit and not at HEAD: a workflow that installed a directory
     during the window and was deleted afterwards is exactly the evidence that
     matters, and looking at today's tree loses it.
     """
+    listing = _tree_at(str(repo), sha)
+    if listing is None:
+        return None
+    return tuple(line for line in listing.splitlines() if line.strip())
+
+
+@lru_cache(maxsize=1024)
+def _tree_at(repo: str, sha: str) -> str | None:
     try:
-        out = _git_text(repo, "ls-tree", "-r", "--name-only", sha,
-                        ".github/workflows")
+        return _git_text(Path(repo), "ls-tree", "-r", "--name-only", sha,
+                         ".github/workflows")
     except GitError:
-        return ()
-    return tuple(line for line in out.splitlines() if line.strip())
+        return None
 
 
 def _is_installed_unread_tree(repo: Path, tree: UnreadTree) -> bool:
@@ -140,7 +386,8 @@ def _is_installed_unread_tree(repo: Path, tree: UnreadTree) -> bool:
     if not directory or directory == ".":
         return True
     sha = tree.commit or "HEAD"
-    return _workflow_mentions_dir(repo, sha, _workflows_at(repo, sha), directory)
+    evidence = _workflow_evidence(repo, sha, _workflows_at(repo, sha), directory)
+    return evidence.direct_install or evidence.mentions_directory or evidence.uncertain
 
 
 # Failures that mean the tooling could not answer, as opposed to evidence that says
@@ -167,6 +414,11 @@ class TimelineEntry:
     evidence: tuple[str, ...]
     run_ids: tuple[str, ...] = ()
     probably_installed: bool = True
+    # Neither installed nor cleared. Kept apart from ``probably_installed`` being False,
+    # which is a statement that nothing installs this tree — the two were the same flag,
+    # so one exposure appeared under "fixture or example trees, not installed by any
+    # workflow" and under "could not classify" at once, and counted toward neither grade.
+    unresolved: bool = False
 
 
 @dataclass
@@ -191,6 +443,10 @@ class OrgReport:
     # Repositories whose clone held less than the repository does, as
     # "repo: reason". A deeper clone is the remedy, so the report says which.
     incomplete: list[str] = field(default_factory=list)
+    # Exposures in a tree that could not be classified: a workflow might install it
+    # through something unreadable. Kept out of the rotation list — a fixture must not
+    # raise credentials — and out of an all-clear, because "could not tell" is not "no".
+    unresolved: list[str] = field(default_factory=list)
     repos_scanned: int = 0
     partial_coverage: bool = False
 
@@ -201,8 +457,18 @@ class OrgReport:
 
     @property
     def set_aside(self) -> tuple[TimelineEntry, ...]:
-        """Exposures in fixture or example trees, kept visible but not rotated."""
-        return tuple(e for e in self.timeline if not e.probably_installed)
+        """Exposures in fixture or example trees, kept visible but not rotated.
+
+        Only those a workflow demonstrably does not install. One it *might* install is a
+        different statement and has its own section.
+        """
+        return tuple(e for e in self.timeline
+                     if not e.probably_installed and not e.unresolved)
+
+    @property
+    def unclassified(self) -> tuple[TimelineEntry, ...]:
+        """Exposures whose tree could be installed by something unreadable."""
+        return tuple(e for e in self.timeline if e.unresolved)
 
     @property
     def rotation_items(self) -> tuple[RotationItem, ...]:
@@ -308,7 +574,11 @@ class OrgReport:
     def worst_grade(self) -> Grade:
         """The strongest grade anywhere in the report, including repos whose
         history could not be read — those carry POSSIBLE with no timeline entry."""
-        grades = [e.grade for e in self.timeline if e.probably_installed]
+        # An exposure that could not be classified counts too: it was found, and nothing
+        # ruled it out. Excluding it left a report whose worst grade was NO_EVIDENCE while
+        # naming a compromised version it had just declined to clear.
+        grades = [e.grade for e in self.timeline
+                  if e.probably_installed or e.unresolved]
         grades += [f.worst_grade for f in self.findings]
         for grade in (Grade.CONFIRMED, Grade.LIKELY, Grade.POSSIBLE):
             if grade in grades:
@@ -330,8 +600,15 @@ class OrgReport:
         # question open regardless of what the aggregate verdict became.
         readable = all(f.verdict is not Verdict.INDETERMINATE and not f.warnings
                        for f in self.findings)
+        # And nothing may have been *found*. This is the sentence the exit code speaks —
+        # code 0 says "absence of exposure was established" — so an exposure in the
+        # timeline contradicts it outright, however little can be done about it. Without
+        # this, a repository holding a compromised version whose credentials could not be
+        # named exited 0: no rotation item to raise the code to 1, and no unread tree or
+        # truncated clone to lower it to 2.
         return (not self.errors and not self.transient and not self.partial_coverage
-                and readable and not self.unread and not self.incomplete)
+                and readable and not self.unread and not self.incomplete
+                and not self.unresolved and not self.exposed_repos)
 
 
 def scan_organization(repos: Iterable[tuple[str, Path]], plan: QueryPlan, *,
@@ -377,15 +654,31 @@ def scan_organization(repos: Iterable[tuple[str, Path]], plan: QueryPlan, *,
                 finding, query, history,
                 advisory_id=plan.advisory_id, coverage_warning=plan.coverage_warning,
             )
+            classified = [(g, _classify_tree(path, g)) for g in graded.graded]
             report.timeline.extend(
                 TimelineEntry(
                     repo=name, package=query.package, exposure=g.exposure,
                     grade=g.grade, evidence=g.evidence, run_ids=g.run_ids,
-                    probably_installed=_is_installed_tree(path, g),
+                    probably_installed=answer is Installed.YES,
+                    unresolved=answer is Installed.UNKNOWN,
                 )
-                for g in graded.graded
+                for g, answer in classified
             )
-            kept = [g for g in graded.graded if _is_installed_tree(path, g)]
+            for g, answer in classified:
+                if answer is not Installed.UNKNOWN:
+                    continue
+                # Neither acted on nor cleared. Raising credentials here would put a
+                # fixture's secrets on the list every time a repository uses a composite
+                # action anywhere; staying silent would clear a tree a workflow may well
+                # install. So it is named, and the report stops short of proving absence.
+                line = (f"{name}: {g.exposure.lockfile_path} — a workflow at "
+                        f"{g.exposure.commit[:8]} could install this tree through "
+                        "something this tool does not read (a local action, a script, or "
+                        "a directory chosen at run time), so it was neither acted on nor "
+                        "cleared")
+                if line not in report.unresolved:
+                    report.unresolved.append(line)
+            kept = [g for g, answer in classified if answer is Installed.YES]
             # The verdict has to be recomputed for the kept set: a repo whose only
             # exposures are fixtures but whose history was unreadable is still
             # INDETERMINATE, and carrying the original EXPOSED verdict here would
@@ -516,13 +809,24 @@ def _rotate_summary(items: tuple[RotationItem, ...], repos: tuple[str, ...]) -> 
     return ", ".join(parts)
 
 
-def render_report(report: OrgReport) -> str:
-    """A terminal report: the timeline, then the rotation list, then the caveats."""
+def render_report(report: OrgReport, advisory=None) -> str:
+    """A terminal report: the timeline, then the rotation list, then the caveats.
+
+    The advisory is optional but wanted: this is the format the composite action writes
+    to its step summary, and without it the report never showed the window at all — so a
+    reader could not tell a window known to have closed from one still open, which is the
+    difference between "this cannot have been installed since" and "it still can".
+    """
     lines = [
         f"advisory {report.advisory_id} — {report.advisory_name}",
         f"scanned {report.repos_scanned} repo(s); worst grade {report.worst_grade.value}",
-        "",
     ]
+    if advisory is not None:
+        start, end = advisory.window
+        closed = ("still open — no removal time is recorded, so exposure cannot be "
+                  "ruled out after this" if end is None else end.isoformat())
+        lines += _folded(f"installable window {start.isoformat()} → ", closed, " " * 4)
+    lines.append("")
     installed = [e for e in report.timeline if e.probably_installed]
     if installed:
         lines.append("timeline")
@@ -583,6 +887,10 @@ def render_report(report: OrgReport) -> str:
     if report.incomplete:
         lines += ["", "incomplete view (a deeper clone would say more)"]
         lines += [f"  {i}" for i in report.incomplete]
+    if report.unresolved:
+        lines += ["", "could not classify (a workflow may install these trees)"]
+        for entry in report.unresolved:
+            lines += _folded("  ", entry, " " * 4)
     if report.unread:
         lines += ["", "not judged (no lockfile this tool can read)"]
         lines += [f"  {u}" for u in report.unread]
