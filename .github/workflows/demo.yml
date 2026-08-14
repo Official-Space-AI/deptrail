@@ -9,7 +9,14 @@ on:
   workflow_dispatch:
 jobs:
   demo:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
         with:
@@ -19,7 +26,7 @@ jobs:
           fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.13"
       # Installed from the checkout the way the README's git+https line does, so
       # what CI proves is what a reader is told to run.
       - run: pip install .
@@ -119,14 +126,21 @@ jobs:
     # The composite action is the interface most users meet, and its exit-code
     # handling is a contract of its own: a scan that could not prove absence must
     # annotate the check rather than pass in silence.
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.13"
       - name: Commit a tree this version cannot read
         # The action always scans the repository it runs in, so the shape under
         # test has to be in that repository's history.
@@ -158,14 +172,21 @@ jobs:
     # The other half of the contract: a scan that finds credentials must fail the job
     # by default, and must not fail it under `fail-on: never`. Both were broken by the
     # same inherited errexit, so both need a job.
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.13"
       - name: Commit an exposure in a tree a workflow installs
         run: |
           set -euo pipefail
