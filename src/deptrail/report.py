@@ -171,6 +171,13 @@ def render_html(report: OrgReport, advisory=None) -> str:
         out += [f"<li>{escape(i)}</li>" for i in report.incomplete]
         out.append("</ul>")
 
+    if report.unresolved:
+        out.append("<h2>Could not classify</h2><p class='sub'>A workflow at that commit "
+                   "could install these trees through something this tool does not read, "
+                   "so they were neither acted on nor cleared.</p><ul>")
+        out += [f"<li>{escape(u)}</li>" for u in report.unresolved]
+        out.append("</ul>")
+
     if report.unread:
         out.append("<h2>Not judged</h2><p class='sub'>No lockfile this tool can read, "
                    "so these trees were neither cleared nor implicated.</p><ul>")

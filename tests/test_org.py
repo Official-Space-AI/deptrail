@@ -1351,3 +1351,349 @@ class TestRenderersDeriveTheMergeOnce:
          "html": lambda: render_html(report),
          "json": lambda: _as_dict(report, None)}[renderer]()
         assert len(calls) == 1, f"{renderer} derived the rotation merge {len(calls)} times"
+
+
+class TestAbsenceIsNeverProvenAlongsideAnExposure:
+    def test_an_exposed_repo_stops_the_all_clear(self, tmp_path, plan):
+        repo = make_repo(tmp_path, "api", [("2025-11-25T10:00:00+00:00", "5.6.1")])
+        report = scan_organization([("api", repo)], plan, runs=no_runs,
+                                   secrets=lambda p, n: ())
+        # The repository holds no secrets, so there is no rotation item to raise the exit
+        # code and no unread tree to lower it — and the exposure is in the timeline.
+        # `proves_absence` is the sentence exit 0 speaks; it cannot be true here.
+        assert report.exposed_repos == ("api",)
+        assert report.rotation_items == ()
+        assert report.proves_absence is False
+
+    def test_a_clean_repo_still_proves_absence(self, tmp_path, plan):
+        repo = make_repo(tmp_path, "web", [("2025-11-25T10:00:00+00:00", "5.6.0")])
+        report = scan_organization([("web", repo)], plan, runs=no_runs,
+                                   secrets=secrets_provider)
+        assert report.exposed_repos == ()
+        assert report.proves_absence is True
+
+    def test_a_set_aside_fixture_still_proves_absence(self, tmp_path, plan):
+        # A fixture tree raises no credential and is not an exposure of the repository,
+        # so it must not cost every tooling project its all-clear either.
+        repo = tmp_path / "tool"
+        (repo / "tests/fixtures").mkdir(parents=True)
+        git(repo, "init", "-q")
+        (repo / "tests/fixtures/package-lock.json").write_text(lock("5.6.1"))
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "fixtures", date="2025-11-25T10:00:00+00:00")
+        report = scan_organization([("tool", repo)], plan, runs=no_runs,
+                                   secrets=secrets_provider)
+        assert report.exposed_repos == ()
+        assert report.set_aside
+        assert report.proves_absence is True
+
+
+class TestWorkflowsAreReadAtTheCommit:
+    """Superseded the heuristic install-detection cases; what remains is which *commit's*
+    workflows are consulted, and which set of them wins."""
+
+    def test_the_workflows_are_read_at_the_commit_not_at_head(self, tmp_path, plan):
+        # A workflow that installed the directory during the window and was retired
+        # afterwards is exactly the evidence that matters. Reading HEAD instead loses it,
+        # and the repository is cleared — a false clean, with no CI records needed.
+        repo = tmp_path / "retired"
+        (repo / "examples/app").mkdir(parents=True)
+        (repo / ".github/workflows").mkdir(parents=True)
+        git(repo, "init", "-q")
+        (repo / ".github/workflows/deploy.yml").write_text(
+            "name: Deploy\non: [push]\njobs:\n  d:\n    steps:\n"
+            "      - run: npm ci --prefix examples/app\n")
+        (repo / "examples/app/package-lock.json").write_text(lock("5.6.1"))
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "deps", date="2025-11-25T10:00:00+00:00")
+        (repo / ".github/workflows/deploy.yml").unlink()
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "retire the deploy workflow",
+            date="2026-01-10T10:00:00+00:00")
+        report = scan_organization([("retired", repo)], plan, runs=no_runs,
+                                   secrets=lambda p, n: ("NPM_TOKEN",))
+        # The literal install is actionable even after its run record expires. Reading
+        # HEAD instead would find no workflow and file the application as fixture data.
+        assert report.exposed_repos == ("retired",)
+        assert {item.secret for item in report.rotation_items} == {"NPM_TOKEN"}
+        assert report.proves_absence is False
+
+    def test_the_implicated_workflows_are_consulted_before_every_workflow(self, tmp_path,
+                                                                         plan):
+        # The fallback is a fallback. CI ran only ci.yml, which installs at the root and
+        # says nothing about examples/app; an unrelated workflow at the same commit does
+        # install there but never ran. Preferring the second over the first would report
+        # an exposure on a tree the implicated run did not touch.
+        repo = tmp_path / "twoflows"
+        (repo / "examples/app").mkdir(parents=True)
+        (repo / ".github/workflows").mkdir(parents=True)
+        git(repo, "init", "-q")
+        (repo / ".github/workflows/ci.yml").write_text(
+            "name: CI\non: [push]\njobs:\n  b:\n    steps:\n      - run: npm ci\n")
+        (repo / ".github/workflows/examples.yml").write_text(
+            "name: Examples\non: [workflow_dispatch]\njobs:\n  e:\n    steps:\n"
+            "      - run: npm ci --prefix examples/app\n")
+        (repo / "examples/app/package-lock.json").write_text(lock("5.6.1"))
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "deps", date="2025-11-25T10:00:00+00:00")
+        report = scan_organization([("twoflows", repo)], plan,
+                                   runs=runs_with(head(repo)),
+                                   secrets=lambda p, n: ("NPM_TOKEN",))
+        # The implicated workflow does not name it, so the CONFIRMED path does not fire and
+        # the tree is not treated as installed. It is still named by another workflow at
+        # that commit, so it is not cleared either.
+        assert report.exposed_repos == ()
+        assert report.unresolved
+
+
+class TestMentionsComparesPaths:
+    """Path segments, not substrings and not a boundary regex — both were wrong on real
+    input. `"test"` matched `ubuntu-latest`; a regex boundary still matched
+    `vendor/examples/app` and `examples/app.bak` when the tree was `examples/app`."""
+
+    CASES = [
+        ("examples/app", True), ("./examples/app", True), ('"examples/app"', True),
+        ("'examples/app'", True), ("examples/app/", True),
+        ("examples/app/package-lock.json", True),
+        (r".\examples\app", True),
+        ("$GITHUB_WORKSPACE/examples/app", True),
+        ("${{ github.workspace }}/examples/app", True),
+        ("cd examples/app && npm ci", True),
+        ("my-examples/app", False), ("vendor/examples/app", False),
+        ("../examples/app", False),
+        ("examples/app.bak", False), ("examples/application", False),
+        ("examples", False), ("app", False),
+    ]
+
+    @pytest.mark.parametrize("text,expected", CASES)
+    def test_examples_app(self, text, expected):
+        from deptrail.org import _mentions
+
+        assert _mentions(text, "examples/app") is expected, text
+
+    def test_a_word_containing_the_name_is_not_the_directory(self):
+        from deptrail.org import _mentions
+
+        # The case that started this: a `test/` lockfile matched almost every workflow
+        # ever written, because `runs-on: ubuntu-latest` contains the letters.
+        assert _mentions("runs-on: ubuntu-latest", "test") is False
+        assert _mentions("run: python -m pytest", "test") is False
+        assert _mentions("run: npm ci --prefix test", "test") is True
+
+    def test_a_quoted_path_may_contain_whitespace(self):
+        from deptrail.org import _mentions
+
+        assert _mentions("working-directory: 'examples/my app'", "examples/my app")
+
+
+class TestClassifyingATreeHasThreeAnswers:
+    """Only a literal executable install is YES without a run; opaque work is UNKNOWN.
+
+    Deciding the second by pattern-matching YAML was wrong four times, in both directions
+    at once by the fourth attempt: an install arrives through a composite action, a wrapper
+    script, a matrix variable, `npm i`, a bare `yarn` or a reusable workflow in another
+    repository, and a directory name appears in step titles, runner labels and echoed
+    strings. The narrower question is answerable, and the third answer carries the
+    uncertainty instead of a heuristic pretending to resolve it.
+    """
+
+    from deptrail.org import Installed
+
+    DIRECT_INSTALLS = {
+        "a prefixed install": "      - run: npm ci --prefix examples/app\n",
+        "flags before the verb": "      - run: npm --workspace examples/app install\n",
+        "a Windows path": r"      - run: npm ci --prefix .\examples\app" + "\n",
+        "flow-style steps": "      steps: [{run: npm ci --prefix examples/app}]\n",
+    }
+    NAMED = {
+        "a scoped step": "      - working-directory: examples/app\n        run: npm ci\n",
+        "a bare package manager": "      - run: |\n          cd examples/app\n          yarn\n",
+        "a step title": "      - name: build examples/app\n        run: make\n",
+        "a comment": "      # deploys examples/app\n      - run: npm ci\n",
+        "a test command": "      - working-directory: examples/app\n        run: npm test\n",
+        "an echoed command": "      - run: echo 'npm ci --prefix examples/app'\n",
+    }
+    NOT_NAMED = {
+        "a runner label only": "      - runs-on: ubuntu-latest\n        run: npm ci\n",
+        "a longer sibling path":
+            "      - working-directory: examples/application\n        run: npm ci\n",
+        "a path that contains it":
+            "      - run: npm ci --prefix vendor/examples/app\n",
+        "a backup of it": "      - run: cp -r examples/app.bak .\n",
+        "an install at the root": "      - run: npm ci\n",
+    }
+    AMBIGUOUS = {
+        "a local action": "      - uses: ./.github/actions/setup\n",
+        "a wrapper script": "      - run: ./scripts/install-all\n",
+        "a tool wrapper": "      - run: ./tools/build\n",
+        "a shell wrapper": "      - run: bash scripts/setup.sh\n",
+        "a remote reusable workflow":
+            "      uses: owner/repo/.github/workflows/build.yml@main\n",
+        "a dynamic directory":
+            "      - working-directory: ${{ matrix.dir }}\n        run: npm ci\n",
+        "workspace install without a readable member": "      - run: npm ci --workspaces\n",
+    }
+
+    def _classify(self, tmp_path, name, steps, runs=None, *, directory="examples/app",
+                  workspace=False):
+        from deptrail.grading import grade_finding
+        from deptrail.history import scan_repo
+        from deptrail.org import _classify_tree
+
+        repo = tmp_path / name
+        (repo / directory).mkdir(parents=True)
+        (repo / ".github/workflows").mkdir(parents=True)
+        git(repo, "init", "-q")
+        (repo / ".github/workflows/ci.yml").write_text(
+            "name: CI\non: [push]\njobs:\n  b:\n    steps:\n" + steps)
+        if workspace:
+            (repo / "package.json").write_text(json.dumps({
+                "name": "root", "private": True, "workspaces": ["examples/*"],
+            }))
+        (repo / directory / "package-lock.json").write_text(lock("5.6.1"))
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "deps", date="2025-11-25T10:00:00+00:00")
+        query = self.plan.entries[0].query
+        walked = scan_repo(repo, query)
+        provider = runs(repo) if runs else no_runs
+        graded = grade_finding(walked, query, provider(repo, name))
+        assert graded.graded, "the fixture must produce an exposure"
+        return _classify_tree(repo, graded.graded[0]), repo
+
+    @pytest.fixture(autouse=True)
+    def _plan(self, plan):
+        self.plan = plan
+
+    @pytest.mark.parametrize("label", list(DIRECT_INSTALLS))
+    def test_a_literal_install_is_yes_without_a_retained_run(self, tmp_path, label):
+        # POSSIBLE is already an actionable grade. Losing the run record may widen the
+        # credential scope, but it must not delete a literal install from the checklist.
+        answer, _ = self._classify(tmp_path, f"d{abs(hash(label)) % 9999}",
+                                   self.DIRECT_INSTALLS[label])
+        assert answer is self.Installed.YES, label
+
+    @pytest.mark.parametrize("label", list(NAMED))
+    def test_named_without_a_run_is_unknown(self, tmp_path, label):
+        # Named, with no run implicated to say it executed. Under stronger CI evidence this
+        # would have been kept, so calling it test data makes the classification a function
+        # of what the runs API happened to return.
+        answer, _ = self._classify(tmp_path, f"u{abs(hash(label)) % 9999}",
+                                   self.NAMED[label])
+        assert answer is self.Installed.UNKNOWN, label
+
+    @pytest.mark.parametrize("label", list(AMBIGUOUS))
+    def test_delegated_or_dynamic_install_is_unknown(self, tmp_path, label):
+        answer, _ = self._classify(tmp_path, f"a{abs(hash(label)) % 9999}",
+                                   self.AMBIGUOUS[label])
+        assert answer is self.Installed.UNKNOWN, label
+
+    @pytest.mark.parametrize("label", list(NOT_NAMED))
+    def test_not_named_is_no(self, tmp_path, label):
+        answer, _ = self._classify(tmp_path, f"n{abs(hash(label)) % 9999}",
+                                   self.NOT_NAMED[label])
+        assert answer is self.Installed.NO, label
+
+    def test_named_with_a_confirmed_run_is_yes(self, tmp_path):
+        steps = ("      - run: npm ci --prefix examples/app\n"
+                 "      - run: deploy\n        env:\n"
+                 "          T: ${{ secrets.NPM_TOKEN }}\n")
+        answer, _ = self._classify(
+            tmp_path, "confirmed", steps,
+            runs=lambda repo: runs_with(head(repo)))
+        assert answer is self.Installed.YES
+
+    def test_a_root_workspace_install_is_actionable(self, tmp_path):
+        answer, _ = self._classify(
+            tmp_path, "workspace", "      - run: npm ci --workspaces\n", workspace=True)
+        assert answer is self.Installed.YES
+
+    def test_a_literal_install_path_may_contain_whitespace(self, tmp_path):
+        answer, _ = self._classify(
+            tmp_path, "spaces", "      - run: npm ci --prefix 'examples/my app'\n",
+            directory="examples/my app")
+        assert answer is self.Installed.YES
+
+    def test_a_root_lockfile_needs_no_workflow_at_all(self, tmp_path, plan):
+        repo = make_repo(tmp_path, "root", [("2025-11-25T10:00:00+00:00", "5.6.1")])
+        report = scan_organization([("root", repo)], plan, runs=no_runs,
+                                   secrets=lambda p, n: ("NPM_TOKEN",))
+        assert report.exposed_repos == ("root",)
+
+
+class TestUnknownIsNeitherActedOnNorCleared:
+    def _report(self, tmp_path, plan, name="delegated"):
+        repo = tmp_path / name
+        (repo / "examples/app").mkdir(parents=True)
+        (repo / ".github/workflows").mkdir(parents=True)
+        git(repo, "init", "-q")
+        (repo / ".github/workflows/ci.yml").write_text(
+            "name: CI\non: [push]\njobs:\n  b:\n    steps:\n"
+            "      - run: ./scripts/install-all\n")
+        (repo / "examples/app/package-lock.json").write_text(lock("5.6.1"))
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "deps", date="2025-11-25T10:00:00+00:00")
+        return scan_organization([(name, repo)], plan, runs=no_runs,
+                                 secrets=lambda p, n: ("NPM_TOKEN",))
+
+    def test_it_raises_no_credential_and_stops_the_all_clear(self, tmp_path, plan):
+        from deptrail.cli import EXIT_INCOMPLETE, _exit_code
+
+        report = self._report(tmp_path, plan)
+        assert report.rotation_items == ()
+        assert report.exposed_repos == ()
+        assert report.unresolved
+        assert report.proves_absence is False
+        assert _exit_code(report) == EXIT_INCOMPLETE
+
+    def test_it_is_not_also_reported_as_not_installed(self, tmp_path, plan):
+        report = self._report(tmp_path, plan)
+        # One exposure, one statement about it. Both flags came off the same boolean, so it
+        # appeared under "not installed by any workflow" and "could not classify" at once.
+        assert report.set_aside == ()
+        assert len(report.unclassified) == 1
+        text = render_report(report)
+        assert "set aside" not in text
+        assert "could not classify" in text
+
+    def test_it_counts_toward_the_worst_grade(self, tmp_path, plan):
+        report = self._report(tmp_path, plan)
+        # A report that names a compromised version it declined to clear cannot also say
+        # its worst grade is NO_EVIDENCE.
+        assert report.worst_grade is Grade.POSSIBLE
+
+    def test_it_reaches_all_three_renderers(self, tmp_path, plan):
+        from deptrail.cli import _as_dict
+        from deptrail.report import render_html
+
+        report = self._report(tmp_path, plan, name="delegated2")
+        assert "could not classify" in render_report(report)
+        assert "Could not classify" in render_html(report)
+        payload = _as_dict(report, None)
+        assert payload["unclassified"] == list(report.unresolved)
+        assert payload["set_aside"] == []
+
+
+class TestWorkflowReadFailureIsNotNoWorkflow:
+    def test_an_unreadable_listed_blob_cannot_clear_the_tree(self, tmp_path, plan,
+                                                             monkeypatch):
+        from deptrail.cli import EXIT_INCOMPLETE, _exit_code
+
+        repo = tmp_path / "unread-workflow"
+        (repo / "examples/app").mkdir(parents=True)
+        (repo / ".github/workflows").mkdir(parents=True)
+        git(repo, "init", "-q")
+        (repo / ".github/workflows/ci.yml").write_text(
+            "name: CI\non: [push]\njobs:\n  b:\n    steps:\n"
+            "      - run: npm ci --prefix examples/app\n")
+        (repo / "examples/app/package-lock.json").write_text(lock("5.6.1"))
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "deps", date="2025-11-25T10:00:00+00:00")
+        monkeypatch.setattr("deptrail.org._text_at", lambda *args: None)
+
+        report = scan_organization([("unread-workflow", repo)], plan, runs=no_runs,
+                                   secrets=lambda p, n: ("NPM_TOKEN",))
+
+        assert report.set_aside == ()
+        assert report.unresolved
+        assert report.proves_absence is False
+        assert _exit_code(report) == EXIT_INCOMPLETE
