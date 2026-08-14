@@ -21,6 +21,27 @@ from deptrail.cli import (
     main,
 )
 from deptrail.demo import build
+from deptrail.ioc import BoundProvenance, InstallableWindow, WindowProvenance
+
+
+def installable_window(start, end, *, source="https://a.test/x",
+                       start_kind="operator-supplied", end_kind=None):
+    return {
+        "start": start,
+        "end": end,
+        "provenance": {
+            "start": {"kind": start_kind, "source": source},
+            "end": {"kind": end_kind or ("unknown" if end is None else start_kind),
+                    "source": source},
+        },
+    }
+
+
+def window_model(start, end):
+    bound = BoundProvenance("operator-supplied", "https://a.test/x")
+    end_bound = (BoundProvenance("unknown", "https://a.test/x")
+                 if end is None else bound)
+    return InstallableWindow(start, end, WindowProvenance(bound, end_bound))
 
 
 class TestDemo:
@@ -145,7 +166,7 @@ class TestScan:
 
     def test_malformed_advisory_is_rejected_with_the_field(self, tmp_path, capsys):
         bad = tmp_path / "bad.json"
-        bad.write_text('{"schema_version": 1, "id": "x"}')
+        bad.write_text('{"schema_version": 2, "id": "x"}')
         code = main(["scan", "--ioc", str(bad), "--repo", str(tmp_path), "--no-ci"])
         assert code == EXIT_BAD_INPUT
         assert "advisory rejected" in capsys.readouterr().err
@@ -400,7 +421,7 @@ class TestReportEncoding:
         main(["demo", "--workdir", str(tmp_path / "demo"), "--format", "html",
               "--output", str(tmp_path / "r.html")])
         html = (tmp_path / "r.html").read_text(encoding="utf-8")
-        assert "installable window" in html and "2025-11-24" in html
+        assert "Installable window" in html and "2025-11-24" in html
         assert "coverage complete" in html
 
 
@@ -607,11 +628,11 @@ class TestAdvisoryAuthoring:
         out, err = capsys.readouterr()
         assert code == EXIT_CLEAN
         assert "still to fill in" in err
-        assert "sources" in err
+        assert "provenance.start.source" in err
 
     def test_validate_explains_a_broken_advisory_and_names_the_docs(self, tmp_path, capsys):
         broken = tmp_path / "bad.json"
-        broken.write_text('{"schema_version": 1, "id": "X", "summary": "oops"}')
+        broken.write_text('{"schema_version": 2, "id": "X", "summary": "oops"}')
         code = main(["advisory", "validate", str(broken)])
         err = capsys.readouterr().err
         assert code == EXIT_BAD_INPUT
@@ -654,8 +675,9 @@ class TestAdvisoryAuthoring:
             {"name": "chalk", "versions": ["5.6.1"],
              "sources": ["https://example.test/a"]})
         skeleton["sources"] = ["https://example.test/a"]
-        skeleton["window"] = {"start": "2025-11-24T00:00:00+00:00",
-                             "end": "2025-11-26T23:59:59+00:00"}
+        skeleton["window"] = installable_window("2025-11-24T00:00:00+00:00",
+                                                "2025-11-26T23:59:59+00:00",
+                                                source="https://example.test/a")
         half = tmp_path / "half.json"
         half.write_text(json.dumps(skeleton))
         assert main(["advisory", "validate", str(half)]) == EXIT_BAD_INPUT
@@ -740,9 +762,11 @@ class TestOpenWindowReachesEveryOutput:
     """
 
     OPEN = {
-        "schema_version": 1, "id": "GHSA-open", "name": "Open ended",
+        "schema_version": 2, "id": "GHSA-open", "name": "Open ended",
         "ecosystem": "npm", "coverage": "complete",
-        "window": {"start": "2025-09-08T13:13:05+00:00", "end": None},
+        "window": installable_window("2025-09-08T13:13:05+00:00", None,
+                                     source="https://example.test/a",
+                                     start_kind="derived"),
         "packages": [{"name": "chalk", "versions": ["5.6.1"],
                       "sources": ["https://example.test/a"]}],
         "sources": ["https://example.test/a"],
@@ -759,6 +783,8 @@ class TestOpenWindowReachesEveryOutput:
         out = capsys.readouterr().out
         assert "still open" in out
         assert "no removal time is recorded" in out
+        assert "start derived from https://example.test/a" in out
+        assert "end unknown from https://example.test/a" in out
 
     def test_json_carries_null_rather_than_omitting_the_key(self, advisory, tmp_path,
                                                            capsys):
@@ -779,6 +805,11 @@ class TestOpenWindowReachesEveryOutput:
         # field, so the key is present and the value is null.
         assert "end" in payload["advisory"]["window"]
         assert payload["advisory"]["window"]["end"] is None
+        expected = {
+            "start": {"kind": "derived", "source": "https://example.test/a"},
+            "end": {"kind": "unknown", "source": "https://example.test/a"},
+        }
+        assert payload["advisory"]["packages"][0]["window"]["provenance"] == expected
 
     def test_html_says_it_in_words(self, advisory, tmp_path):
         from deptrail.ioc import load_advisory
@@ -789,6 +820,8 @@ class TestOpenWindowReachesEveryOutput:
         html = render_html(report, load_advisory(str(advisory)))
         assert "still open" in html
         assert "no removal time is recorded" in html
+        assert "start derived from https://example.test/a" in html
+        assert "end unknown from https://example.test/a" in html
 
 
 class TestRunCollectionUnderAnOpenWindow:
@@ -808,7 +841,8 @@ class TestRunCollectionUnderAnOpenWindow:
 
         monkeypatch.setattr(cli, "runs_from_github", fake)
         start = datetime(2025, 9, 8, 13, tzinfo=timezone.utc)
-        provider = cli._github_runs(lambda name: "o/r", (start, None), annotate=False)
+        provider = cli._github_runs(lambda name: "o/r", window_model(start, None),
+                                    annotate=False)
         provider(Path("."), "r")
         # Bounding the query at the window's end would collect nothing for the whole
         # period after it — which, for an open window, is everything that matters.
@@ -840,9 +874,9 @@ class TestAnExposureNeverExitsZero:
                             "GIT_COMMITTER_DATE": "2025-11-25T10:00:00+00:00"})
         advisory = tmp_path / "a.json"
         advisory.write_text(json.dumps({
-            "schema_version": 1, "id": "GHSA-x", "name": "n", "ecosystem": "npm",
+            "schema_version": 2, "id": "GHSA-x", "name": "n", "ecosystem": "npm",
             "coverage": "complete",
-            "window": {"start": "2025-11-24T00:00:00+00:00", "end": None},
+            "window": installable_window("2025-11-24T00:00:00+00:00", None),
             "packages": [{"name": "chalk", "versions": ["5.6.1"],
                           "sources": ["https://a.test/x"]}],
             "sources": ["https://a.test/x"]}))
@@ -926,9 +960,9 @@ class TestTheTextReportShowsTheWindow:
                        capture_output=True)
         advisory = tmp_path / "a.json"
         advisory.write_text(json.dumps({
-            "schema_version": 1, "id": "GHSA-x", "name": "n", "ecosystem": "npm",
+            "schema_version": 2, "id": "GHSA-x", "name": "n", "ecosystem": "npm",
             "coverage": "complete",
-            "window": {"start": "2025-09-08T13:13:05+00:00", "end": end},
+            "window": installable_window("2025-09-08T13:13:05+00:00", end),
             "packages": [{"name": "chalk", "versions": ["5.6.1"],
                           "sources": ["https://a.test/x"]}],
             "sources": ["https://a.test/x"]}))
@@ -953,7 +987,7 @@ class TestBoundErrorsNameTheFix:
 
         for spelling in ("null", "None", "unknown", "open", "n/a", "TBD"):
             body = {
-                "schema_version": 1, "id": "GHSA-x", "name": "n", "ecosystem": "npm",
+                "schema_version": 2, "id": "GHSA-x", "name": "n", "ecosystem": "npm",
                 "coverage": "complete",
                 "window": {"start": "2025-09-08T13:13:05+00:00", "end": spelling},
                 "packages": [{"name": "chalk", "versions": ["5.6.1"],
@@ -966,7 +1000,7 @@ class TestBoundErrorsNameTheFix:
         from deptrail.ioc import IocError, parse_advisory
 
         body = {
-            "schema_version": 1, "id": "GHSA-x", "name": "n", "ecosystem": "npm",
+            "schema_version": 2, "id": "GHSA-x", "name": "n", "ecosystem": "npm",
             "coverage": "complete",
             "window": {"start": "2025-09-08T13:13:05+00:00", "end": 0},
             "packages": [{"name": "chalk", "versions": ["5.6.1"],
@@ -979,7 +1013,7 @@ class TestBoundErrorsNameTheFix:
         from deptrail.ioc import IocError, parse_advisory
 
         body = {
-            "schema_version": 1, "id": "GHSA-x", "name": "n", "ecosystem": "npm",
+            "schema_version": 2, "id": "GHSA-x", "name": "n", "ecosystem": "npm",
             "coverage": "complete",
             "window": {"start": "2025-09-08T13:13:05+00:00", "end": "x" * 100_000},
             "packages": [{"name": "chalk", "versions": ["5.6.1"],
@@ -1008,7 +1042,8 @@ class TestRunQueryPadding:
                             lambda slug, *, since, until: seen.update(
                                 since=since, until=until) or RunHistory(source="fake"))
         start = datetime(2025, 9, 8, 13, tzinfo=timezone.utc)
-        cli._github_runs(lambda n: "o/r", (start, end), annotate=False)(Path("."), "r")
+        cli._github_runs(lambda n: "o/r", window_model(start, end),
+                         annotate=False)(Path("."), "r")
         # A day either side, because `created=` filters by date and an uncollected run is
         # a grade lost. The closed branch had no test at all.
         assert seen["since"] == start - timedelta(days=1)

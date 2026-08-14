@@ -54,12 +54,21 @@ jobs:
 """
 
 ADVISORY = {
-    "schema_version": 1,
+    "schema_version": 2,
     "id": "GHSA-demo-0000-0000",
     "name": "Demo incident — chalk compromised",
     "ecosystem": "npm",
     "coverage": "complete",
-    "window": {"start": WINDOW_START.isoformat(), "end": WINDOW_END.isoformat()},
+    "window": {
+        "start": WINDOW_START.isoformat(),
+        "end": WINDOW_END.isoformat(),
+        "provenance": {
+            "start": {"kind": "operator-supplied",
+                      "source": "https://example.test/demo-advisory"},
+            "end": {"kind": "operator-supplied",
+                    "source": "https://example.test/demo-advisory"},
+        },
+    },
     "packages": [{
         "name": "chalk",
         "versions": ["5.6.1"],
