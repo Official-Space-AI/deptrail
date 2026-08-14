@@ -446,15 +446,13 @@ def parse_advisory(text: str, now: datetime | None = None) -> Advisory:
                      and _closes_within(pkg_window.end, window.end),
                      f"{where}.window: {_fmt_window(pkg_window)} is not inside the advisory "
                      f"window {_fmt_window(window)}; widen the advisory window instead")
-        # A package may appear twice only for genuinely different waves, so each
-        # repeat must carry its own window; otherwise it is a paste error.
-        # Provenance explains a window; it does not make identical bounds a second
-        # incident wave. Keep the duplicate rule on the interval itself.
-        key = (name, None if pkg_window is None
-               else (pkg_window.start, pkg_window.end))
+        # A second wave starts at a different instant. End/provenance edits and an
+        # explicit copy of the inherited window do not create another wave.
+        effective_window = pkg_window or window
+        key = (name, effective_window.start)
         _require(key not in seen,
-                 f"{where}.name: duplicate entry for {name!r} with the same window "
-                 "(give each wave its own 'window' if this is intentional)")
+                 f"{where}.name: duplicate entry for {name!r} with the same wave start "
+                 "(combine its versions, or give a later wave a different start)")
         seen.add(key)
         packages.append(CompromisedPackage(
             name=name,
