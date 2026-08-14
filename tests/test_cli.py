@@ -148,6 +148,25 @@ class TestScan:
         assert payload["exposed_repos"] == ["api-server"]
         assert {entry["repo"] for entry in payload["timeline"]} == {"api-server"}
 
+    def test_a_repo_path_that_cannot_resolve_is_reported_not_misread_as_rotate(
+            self, tmp_path, capsys, monkeypatch):
+        target = tmp_path / "loop"
+        original_resolve = Path.resolve
+
+        def resolve(path, *args, **kwargs):
+            if path == target:
+                raise RuntimeError("symlink loop")
+            return original_resolve(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "resolve", resolve)
+        code = main(["scan", "--ioc", "example-demo", "--repo", str(target),
+                     "--no-ci", "--format", "json"])
+        payload = json.loads(capsys.readouterr().out)
+
+        assert code == EXIT_INCOMPLETE
+        assert payload["errors"] and payload["errors"][0].startswith("loop:")
+        assert code != EXIT_ROTATE
+
     def test_local_repos_without_ci(self, tmp_path, capsys):
         repos = dict(build(tmp_path / "demo"))
         advisory = tmp_path / "demo" / "demo-advisory.json"
