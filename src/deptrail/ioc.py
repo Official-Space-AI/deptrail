@@ -448,7 +448,10 @@ def parse_advisory(text: str, now: datetime | None = None) -> Advisory:
                      f"window {_fmt_window(window)}; widen the advisory window instead")
         # A package may appear twice only for genuinely different waves, so each
         # repeat must carry its own window; otherwise it is a paste error.
-        key = (name, pkg_window)
+        # Provenance explains a window; it does not make identical bounds a second
+        # incident wave. Keep the duplicate rule on the interval itself.
+        key = (name, None if pkg_window is None
+               else (pkg_window.start, pkg_window.end))
         _require(key not in seen,
                  f"{where}.name: duplicate entry for {name!r} with the same window "
                  "(give each wave its own 'window' if this is intentional)")

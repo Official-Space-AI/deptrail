@@ -361,6 +361,22 @@ class TestProvenanceAndAmbiguity:
         ]))
         assert len(adv.plan()) == 2
 
+    def test_provenance_alone_does_not_make_a_second_wave(self):
+        first = installable_window("2025-11-24T00:00:00+00:00",
+                                   "2025-11-24T12:00:00+00:00",
+                                   source="https://a.test")
+        second = installable_window("2025-11-24T00:00:00+00:00",
+                                    "2025-11-24T12:00:00+00:00",
+                                    source="https://b.test", start_kind="derived")
+        packages = [
+            {"name": "chalk", "versions": ["5.6.1"], "sources": ["https://a.test"],
+             "window": first},
+            {"name": "chalk", "versions": ["5.6.1"], "sources": ["https://b.test"],
+             "window": second},
+        ]
+        with pytest.raises(IocError, match="duplicate entry"):
+            parse_advisory(advisory_with(packages=packages))
+
     def test_same_package_twice_with_same_window_rejected(self):
         with pytest.raises(IocError, match="duplicate entry"):
             parse_advisory(advisory_with(packages=[MINIMAL["packages"][0]] * 2))
