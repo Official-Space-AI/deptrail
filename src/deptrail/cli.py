@@ -349,7 +349,13 @@ def cmd_scan(args: argparse.Namespace) -> int:
     else:
         repos = []
         for raw_path in args.repo:
-            path = Path(raw_path).resolve()
+            path = Path(raw_path)
+            try:
+                path = path.resolve()
+            except RuntimeError:
+                # A symlink loop is still a named path that the scan can report as
+                # unreadable; it must not escape as exit 1, which means ROTATE.
+                pass
             repos.append((path.name or str(path), path))
         slug_of = (lambda name: args.slug) if args.slug else None
     if not repos and not errors and not transient:
