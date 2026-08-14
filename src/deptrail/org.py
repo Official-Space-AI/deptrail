@@ -197,9 +197,9 @@ def _command_from_run_line(line: str) -> str | None:
     return command if PACKAGE_INSTALL.search(command) else None
 
 
-def _workspace_patterns(repo: Path, sha: str) -> tuple[str, ...]:
+def _workspace_patterns(repo: Path, object_id: str) -> tuple[str, ...]:
     """Workspace globs in the root package manifest at one commit."""
-    raw = _text_at(repo, sha, "package.json")
+    raw = _text_at_object(repo, object_id, "package.json")
     if raw is None:
         return ()
     try:
@@ -223,15 +223,16 @@ def _workspace_patterns(repo: Path, sha: str) -> tuple[str, ...]:
     return tuple(patterns)
 
 
-def _is_workspace(repo: Path, sha: str, directory: str) -> bool:
+def _is_workspace(repo: Path, object_id: str, directory: str) -> bool:
     target = directory.replace("\\", "/")
     if target.startswith("./"):
         target = target[2:]
     target = target.rstrip("/")
-    return any(fnmatch.fnmatchcase(target, pattern) for pattern in _workspace_patterns(repo, sha))
+    return any(fnmatch.fnmatchcase(target, pattern)
+               for pattern in _workspace_patterns(repo, object_id))
 
 
-def _workflow_evidence(repo: Path, sha: str, paths: tuple[str, ...] | None,
+def _workflow_evidence(repo: Path, object_id: str, paths: tuple[str, ...] | None,
                        directory: str) -> WorkflowEvidence:
     """Evidence about one directory across a known set of workflow files.
 
@@ -243,9 +244,9 @@ def _workflow_evidence(repo: Path, sha: str, paths: tuple[str, ...] | None,
     if paths is None:
         return WorkflowEvidence(uncertain=True)
     direct, mentioned, uncertain = False, False, False
-    workspace = _is_workspace(repo, sha, directory)
+    workspace = _is_workspace(repo, object_id, directory)
     for path in paths:
-        body = _text_at(repo, sha, path)
+        body = _text_at_object(repo, object_id, path)
         if body is None:
             uncertain = True
             continue
@@ -276,34 +277,34 @@ def _text_at_cached(repo: str, sha: str, path: str) -> str | None:
         return None
 
 
-def _text_at(repo: Path, sha: str, path: str) -> str | None:
-    """One blob at one commit, read once, keyed on a ref that fixes the content.
+def _text_at_object(repo: Path, object_id: str, path: str) -> str | None:
+    """One blob at an immutable object id, shared across repeated classifications."""
+    return _text_at_cached(str(repo), object_id, path)
+
+
+def _text_at(repo: Path, ref: str, path: str) -> str | None:
+    """One blob at a ref, resolving movable names on every call.
 
     Uncached, classifying one exposure per lockfile per advisory package re-read every
     workflow every time: 780 git subprocesses and a 12x wall clock on a repository with
-    thirty fixture lockfiles, for a byte-identical answer.
+    thirty fixture lockfiles, for a byte-identical answer. Production callers already
+    hold immutable commit ids and use ``_text_at_object`` directly.
 
     The ref has to be resolved to an object id first. Judging it by shape does not work —
     a branch may be named ``deadbeef`` — and caching a name that can move means answering
     from before it moved.
     """
-    resolved = _object_id(repo, sha)
+    resolved = _object_id(repo, ref)
     if resolved is None:
         try:
-            return _git_text(repo, "show", f"{sha}:{path}")
+            return _git_text(repo, "show", f"{ref}:{path}")
         except GitError:
             return None
-    return _text_at_cached(str(repo), resolved, path)
+    return _text_at_object(repo, resolved, path)
 
 
-@lru_cache(maxsize=1024)
 def _object_id(repo: Path, ref: str) -> str | None:
-    """The immutable id ``ref`` points at, or ``None`` if it cannot be resolved.
-
-    Cached on the pair, which is safe in the direction that matters: a name that moves
-    would be re-resolved by a fresh process, and within one scan the commit under
-    examination does not change. A ref that does not resolve is not cached as an answer.
-    """
+    """Resolve ``ref`` now; names can move and failed resolutions can later succeed."""
     try:
         return _git_text(repo, "rev-parse", f"{ref}^{{commit}}").strip() or None
     except GitError:
@@ -351,23 +352,24 @@ def _classify_tree(repo: Path, graded: GradedExposure) -> Installed:
     return Installed.NO
 
 
-def _workflows_at(repo: Path, sha: str) -> tuple[str, ...] | None:
+def _workflows_at(repo: Path, object_id: str) -> tuple[str, ...] | None:
     """Workflow files as they stood at one commit.
 
     Read at the commit and not at HEAD: a workflow that installed a directory
     during the window and was deleted afterwards is exactly the evidence that
     matters, and looking at today's tree loses it.
     """
-    listing = _tree_at(str(repo), sha)
+    listing = _tree_at(str(repo), object_id)
     if listing is None:
         return None
     return tuple(line for line in listing.splitlines() if line.strip())
 
 
 @lru_cache(maxsize=1024)
-def _tree_at(repo: str, sha: str) -> str | None:
+def _tree_at(repo: str, object_id: str) -> str | None:
+    """Workflow paths cached only against an immutable tree identity."""
     try:
-        return _git_text(Path(repo), "ls-tree", "-r", "--name-only", sha,
+        return _git_text(Path(repo), "ls-tree", "-r", "--name-only", object_id,
                          ".github/workflows")
     except GitError:
         return None
@@ -386,8 +388,12 @@ def _is_installed_unread_tree(repo: Path, tree: UnreadTree) -> bool:
     directory = str(PurePosixPath(tree.path).parent)
     if not directory or directory == ".":
         return True
-    sha = tree.commit or "HEAD"
-    evidence = _workflow_evidence(repo, sha, _workflows_at(repo, sha), directory)
+    object_id = tree.commit or _object_id(repo, "HEAD")
+    if object_id is None:
+        return True
+    evidence = _workflow_evidence(
+        repo, object_id, _workflows_at(repo, object_id), directory,
+    )
     return evidence.direct_install or evidence.mentions_directory or evidence.uncertain
 
 
