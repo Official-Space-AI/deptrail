@@ -133,6 +133,21 @@ def _looks_like_sha(word: str) -> bool:
 
 
 class TestScan:
+    def test_dot_repo_path_keeps_the_resolved_repository_name(
+            self, tmp_path, capsys, monkeypatch):
+        repos = dict(build(tmp_path / "demo"))
+        from deptrail.demo import advisory_path
+        advisory = advisory_path(tmp_path / "demo")
+        monkeypatch.chdir(repos["api-server"])
+
+        code = main(["scan", "--ioc", str(advisory), "--repo", ".", "--no-ci",
+                     "--format", "json"])
+        payload = json.loads(capsys.readouterr().out)
+
+        assert code == EXIT_ROTATE
+        assert payload["exposed_repos"] == ["api-server"]
+        assert {entry["repo"] for entry in payload["timeline"]} == {"api-server"}
+
     def test_local_repos_without_ci(self, tmp_path, capsys):
         repos = dict(build(tmp_path / "demo"))
         advisory = tmp_path / "demo" / "demo-advisory.json"
