@@ -173,11 +173,21 @@ def _parse_bound(value: object, *, where: str) -> datetime:
     the person transcribing it decides which instants the day covers, and that
     decision belongs in the feed where a reader can see it.
     """
-    _require(isinstance(value, str) and str(value).strip() != "",
-             f"{where}: must be a full timestamp such as 2025-09-08T13:13:05+00:00"
-             + (", or unquoted null if the removal time is unknown"
-                if where.endswith(".end") else ""))
-    text = str(value).strip().replace("Z", "+00:00")
+    required = (
+        f"{where}: must be a full timestamp such as 2025-09-08T13:13:05+00:00"
+        + (", or unquoted null if the removal time is unknown"
+           if where.endswith(".end") else "")
+    )
+    _require(isinstance(value, str), required)
+    raw = str(value)
+    control = next((char for char in raw
+                    if ord(char) < 0x20 or 0x7F <= ord(char) <= 0x9F), None)
+    if control is not None:
+        raise IocError(
+            f"{where}: {_clip(value)} contains control character U+{ord(control):04X}"
+        )
+    _require(raw.strip() != "", required)
+    text = raw.strip().replace("Z", "+00:00")
     # Before any shape test. The spellings without a `T` in them — `null`, `unknown`,
     # `n/a`, `-` — fall into the time-of-day branch, and a check ordered after it would
     # answer them with a hint built by slicing the junk: "write nullT00:00:00+00:00".
