@@ -377,6 +377,23 @@ class TestProvenanceAndAmbiguity:
         with pytest.raises(IocError, match="duplicate entry"):
             parse_advisory(advisory_with(packages=packages))
 
+    def test_open_and_closed_edits_with_the_same_start_are_one_wave(self):
+        packages = [
+            {"name": "chalk", "versions": ["5.6.1"], "sources": ["https://a.test"],
+             "window": installable_window("2025-11-25T00:00:00+00:00", None)},
+            {"name": "chalk", "versions": ["5.6.2"], "sources": ["https://a.test"],
+             "window": installable_window("2025-11-25T00:00:00+00:00",
+                                           "2025-11-25T12:00:00+00:00")},
+        ]
+        with pytest.raises(IocError, match="same wave start"):
+            parse_advisory(advisory_with(window=installable_window(
+                "2025-11-24T00:00:00+00:00", None), packages=packages))
+
+    def test_an_explicit_copy_of_the_inherited_window_is_not_a_second_wave(self):
+        explicit = {**MINIMAL["packages"][0], "window": MINIMAL["window"]}
+        with pytest.raises(IocError, match="same wave start"):
+            parse_advisory(advisory_with(packages=[MINIMAL["packages"][0], explicit]))
+
     def test_same_package_twice_with_same_window_rejected(self):
         with pytest.raises(IocError, match="duplicate entry"):
             parse_advisory(advisory_with(packages=[MINIMAL["packages"][0]] * 2))
