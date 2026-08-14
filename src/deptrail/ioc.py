@@ -50,8 +50,9 @@ from pathlib import Path
 from .history import WindowQuery
 
 FEEDS_DIR = Path(__file__).parent / "feeds"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 COVERAGE_VALUES = ("complete", "partial")
+PROVENANCE_VALUES = ("operator-supplied", "derived", "unknown")
 
 # npm's own name rule (lowercase since 2014) and strict ASCII SemVer, which is
 # what a lockfile records. Everything is ASCII-anchored on purpose: a full-width
@@ -77,7 +78,9 @@ _ADVISORY_KEYS = {
     "packages", "sources", "notes",
 }
 _PACKAGE_KEYS = {"name", "versions", "window", "sources", "notes"}
-_WINDOW_KEYS = {"start", "end"}
+_WINDOW_KEYS = {"start", "end", "provenance"}
+_PROVENANCE_KEYS = {"start", "end"}
+_BOUND_PROVENANCE_KEYS = {"kind", "source"}
 
 
 # The marker ``advisory init`` writes into every field it was not given. The *loader*
@@ -96,6 +99,31 @@ _CLOCK_SLACK = timedelta(days=1)
 
 class IocError(ValueError):
     """The advisory input is malformed. Never raised for merely surprising data."""
+
+
+@dataclass(frozen=True)
+class BoundProvenance:
+    """How one edge entered the advisory snapshot, and the exact source used."""
+
+    kind: str
+    source: str
+
+
+@dataclass(frozen=True)
+class WindowProvenance:
+    """Independent provenance for the start and end of one window."""
+
+    start: BoundProvenance
+    end: BoundProvenance
+
+
+@dataclass(frozen=True)
+class InstallableWindow:
+    """One installable interval and the provenance of both bounds."""
+
+    start: datetime
+    end: datetime | None
+    provenance: WindowProvenance
 
 
 def _require(condition: bool, message: str) -> None:
@@ -186,13 +214,44 @@ def _parse_bound(value: object, *, where: str) -> datetime:
     return stamp
 
 
+def _parse_bound_provenance(raw: object, where: str) -> BoundProvenance:
+    _require(isinstance(raw, dict), f"{where}: must be an object")
+    value = dict(raw)  # type: ignore[arg-type]
+    _reject_unknown(value, _BOUND_PROVENANCE_KEYS, where)
+    for key in ("kind", "source"):
+        _require(key in value, f"{where}: missing {key!r}")
+    _require(value["kind"] in PROVENANCE_VALUES,
+             f"{where}.kind: must be one of {list(PROVENANCE_VALUES)}")
+    _reject_placeholder(value["source"], f"{where}.source")
+    _require(isinstance(value["source"], str) and _URL.fullmatch(value["source"]),
+             f"{where}.source: must be one http(s) URL")
+    return BoundProvenance(kind=value["kind"], source=value["source"])
+
+
+def _parse_provenance(raw: object, where: str,
+                      end: datetime | None) -> WindowProvenance:
+    """Parse provenance and keep an unknown end coupled to a null bound."""
+    _require(isinstance(raw, dict), f"{where}: must be an object")
+    value = dict(raw)  # type: ignore[arg-type]
+    _reject_unknown(value, _PROVENANCE_KEYS, where)
+    for key in ("start", "end"):
+        _require(key in value, f"{where}: missing {key!r}")
+    start = _parse_bound_provenance(value["start"], f"{where}.start")
+    end_origin = _parse_bound_provenance(value["end"], f"{where}.end")
+    _require(start.kind != "unknown",
+             f"{where}.start: a definite start cannot have unknown provenance")
+    _require((end is None) == (end_origin.kind == "unknown"),
+             f"{where}.end: use 'unknown' exactly when window.end is null")
+    return WindowProvenance(start=start, end=end_origin)
+
+
 def _parse_window(raw: object, where: str, now: datetime | None = None,
-                  ) -> tuple[datetime, datetime | None]:
+                  ) -> InstallableWindow:
     """One window. ``end: null`` means "not known to have stopped being installable"."""
     _require(isinstance(raw, dict), f"{where}: must be an object")
     window = dict(raw)  # type: ignore[arg-type]
     _reject_unknown(window, _WINDOW_KEYS, where)
-    for key in _WINDOW_KEYS:
+    for key in ("start", "end"):
         _require(key in window, f"{where}: missing {key!r}")
     start = _parse_bound(window["start"], where=f"{where}.start")
     # Present but null: the feed says the right edge is unknown. Absent is still an
@@ -210,7 +269,9 @@ def _parse_window(raw: object, where: str, now: datetime | None = None,
              f"{where}.start: {start.isoformat()} is in the future — this host's clock "
              f"reads {now.isoformat()}. An advisory describes an incident that already "
              "happened, so check the year; if the date is right, check the clock")
-    return start, end
+    _require("provenance" in window, f"{where}: missing 'provenance'")
+    provenance = _parse_provenance(window["provenance"], f"{where}.provenance", end)
+    return InstallableWindow(start=start, end=end, provenance=provenance)
 
 
 @dataclass(frozen=True)
@@ -219,7 +280,7 @@ class CompromisedPackage:
 
     name: str
     versions: tuple[str, ...]
-    window: tuple[datetime, datetime | None] | None  # overrides the advisory window
+    window: InstallableWindow | None  # overrides the advisory window
     sources: tuple[str, ...]
     notes: str | None = None
 
@@ -231,7 +292,7 @@ class Advisory:
     id: str
     name: str
     ecosystem: str
-    window: tuple[datetime, datetime | None]
+    window: InstallableWindow
     coverage: str
     packages: tuple[CompromisedPackage, ...]
     sources: tuple[str, ...]
@@ -251,6 +312,12 @@ class Advisory:
             "is not evidence of safety for packages this feed does not list"
         )
 
+    def window_for(self, package: CompromisedPackage) -> InstallableWindow:
+        """The effective window for one package entry."""
+        if package.window is not None:
+            return package.window
+        return self.window
+
     def plan(self) -> QueryPlan:
         """The walker's work, with the coverage caveat and provenance attached.
 
@@ -259,24 +326,26 @@ class Advisory:
         report: a list of queries would let "no exposure found" read as CLEAN
         for packages the feed never listed.
         """
+        entries = []
+        for pkg in self.packages:
+            window = self.window_for(pkg)
+            entries.append(PlannedQuery(
+                query=WindowQuery(
+                    package=pkg.name,
+                    malicious_versions=frozenset(pkg.versions),
+                    window_start=window.start,
+                    window_end=window.end,
+                ),
+                package=pkg,
+                window=window,
+            ))
         return QueryPlan(
             advisory_id=self.id,
             advisory_name=self.name,
             coverage=self.coverage,
             coverage_warning=self.coverage_warning,
             sources=self.sources,
-            entries=tuple(
-                PlannedQuery(
-                    query=WindowQuery(
-                        package=pkg.name,
-                        malicious_versions=frozenset(pkg.versions),
-                        window_start=(pkg.window or self.window)[0],
-                        window_end=(pkg.window or self.window)[1],
-                    ),
-                    package=pkg,
-                )
-                for pkg in self.packages
-            ),
+            entries=tuple(entries),
         )
 
 
@@ -286,6 +355,7 @@ class PlannedQuery:
 
     query: WindowQuery
     package: CompromisedPackage
+    window: InstallableWindow
 
     @property
     def sources(self) -> tuple[str, ...]:
@@ -372,7 +442,8 @@ def parse_advisory(text: str, now: datetime | None = None) -> Advisory:
         pkg_window = (_parse_window(raw["window"], f"{where}.window", now)
                       if "window" in raw else None)
         if pkg_window is not None:
-            _require(window[0] <= pkg_window[0] and _closes_within(pkg_window[1], window[1]),
+            _require(window.start <= pkg_window.start
+                     and _closes_within(pkg_window.end, window.end),
                      f"{where}.window: {_fmt_window(pkg_window)} is not inside the advisory "
                      f"window {_fmt_window(window)}; widen the advisory window instead")
         # A package may appear twice only for genuinely different waves, so each
@@ -410,9 +481,9 @@ def _closes_within(inner: datetime | None, outer: datetime | None) -> bool:
     return inner is not None and inner <= outer
 
 
-def _fmt_window(window: tuple[datetime, datetime | None]) -> str:
-    end = "open" if window[1] is None else window[1].isoformat()
-    return f"[{window[0].isoformat()} .. {end}]"
+def _fmt_window(window: InstallableWindow) -> str:
+    end = "open" if window.end is None else window.end.isoformat()
+    return f"[{window.start.isoformat()} .. {end}]"
 
 
 def _package_name(raw: object, where: str) -> str:
@@ -581,6 +652,16 @@ def advisory_template(*, package: str | None = None, versions: tuple[str, ...] =
             # a window that never closes. Without either, the blank stands and the
             # template fails validation by name, as every other blank does.
             "end": None if end_unknown else (end or f"{PLACEHOLDER}: {TEMPLATE_HINTS['end']}"),
+            "provenance": {
+                "start": {
+                    "kind": "operator-supplied",
+                    "source": source or f"{PLACEHOLDER}: https://...",
+                },
+                "end": {
+                    "kind": "unknown" if end_unknown else "operator-supplied",
+                    "source": source or f"{PLACEHOLDER}: https://...",
+                },
+            },
         },
         "packages": [{
             "name": package or PLACEHOLDER,

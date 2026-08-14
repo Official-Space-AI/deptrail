@@ -1,12 +1,22 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "id": "DEPTRAIL-EXAMPLE-0001",
   "name": "Example advisory for the bundled demo (not a real incident)",
   "ecosystem": "npm",
   "coverage": "complete",
   "window": {
     "start": "2025-11-24T00:00:00+09:00",
-    "end": "2025-11-26T23:59:59+09:00"
+    "end": "2025-11-26T23:59:59+09:00",
+    "provenance": {
+      "start": {
+        "kind": "operator-supplied",
+        "source": "https://github.com/Official-Space-AI/deptrail/tree/main/poc"
+      },
+      "end": {
+        "kind": "operator-supplied",
+        "source": "https://github.com/Official-Space-AI/deptrail/tree/main/poc"
+      }
+    }
   },
   "packages": [
     {

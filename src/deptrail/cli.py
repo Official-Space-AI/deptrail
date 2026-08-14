@@ -40,6 +40,7 @@ from .demo import advisory_path, build, runs_provider, secrets_provider
 from .grading import RunHistory, annotate_installs, runs_from_github
 from .ioc import (
     Advisory,
+    InstallableWindow,
     IocError,
     advisory_template,
     bundled_feeds,
@@ -177,16 +178,29 @@ def _as_dict(report: OrgReport, advisory: Advisory | None) -> dict:
         "caveats": list(report.caveats),
     }
     if advisory is not None:
+        def window_dict(window: InstallableWindow) -> dict:
+            return {
+                "start": window.start.isoformat(),
+                "end": None if window.end is None else window.end.isoformat(),
+                "provenance": {
+                    "start": {"kind": window.provenance.start.kind,
+                              "source": window.provenance.start.source},
+                    "end": {"kind": window.provenance.end.kind,
+                            "source": window.provenance.end.source},
+                },
+            }
+
         payload["advisory"].update({
             # `null` is the value, not a missing key: a consumer must be able to tell
             # "not known to have closed" from "we forgot to say".
-            "window": {"start": advisory.window[0].isoformat(),
-                       "end": (None if advisory.window[1] is None
-                               else advisory.window[1].isoformat())},
+            "window": window_dict(advisory.window),
             "coverage": advisory.coverage,
             "sources": list(advisory.sources),
-            "packages": [{"name": p.name, "versions": list(p.versions)}
-                         for p in advisory.packages],
+            "packages": [
+                {"name": p.name, "versions": list(p.versions),
+                 "window": window_dict(advisory.window_for(p))}
+                for p in advisory.packages
+            ],
         })
     return payload
 
@@ -257,14 +271,14 @@ def _clone_org(org: str, workdir: Path, *, limit: int,
     return repos, errors, transient
 
 
-def _github_runs(slug_of, window: tuple[datetime, datetime | None], *, annotate: bool):
+def _github_runs(slug_of, window: InstallableWindow, *, annotate: bool):
     """CI history for a repository, restricted to the advisory's window.
 
     An open upper bound means the artifact is not known to have stopped being
     installable, so the runs that matter run up to now: bounding the query at the
     window's end would collect nothing for the whole period after it.
     """
-    since, until = window
+    since, until = window.start, window.end
     if until is None:
         until = datetime.now(timezone.utc)
 
@@ -412,7 +426,7 @@ def cmd_advisory_validate(args: argparse.Namespace) -> int:
         print(f"not usable: {e}", file=sys.stderr)
         print(f"the format is documented in {FORMAT_DOCS}", file=sys.stderr)
         return EXIT_BAD_INPUT
-    start, end = advisory.window
+    start, end = advisory.window.start, advisory.window.end
     print(f"{advisory.id} — {advisory.name}")
     if end is None:
         print(f"  window     {start.isoformat()} → still open"
@@ -425,8 +439,12 @@ def cmd_advisory_validate(args: argparse.Namespace) -> int:
           + ("" if advisory.coverage == "complete"
              else " — absence of exposure will not be provable"))
     for package in advisory.packages:
-        window = "" if package.window is None else "  (own window)"
-        print(f"  package    {package.name} {', '.join(package.versions)}{window}")
+        own = "" if package.window is None else "  (own window)"
+        window = advisory.window_for(package)
+        print(f"  package    {package.name} {', '.join(package.versions)}{own}")
+        print(f"              window start {window.provenance.start.kind} from "
+              f"{window.provenance.start.source}; end {window.provenance.end.kind} "
+              f"from {window.provenance.end.source}")
     print(f"  sources    {', '.join(advisory.sources)}")
     return EXIT_CLEAN
 

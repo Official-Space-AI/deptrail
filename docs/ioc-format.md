@@ -9,14 +9,24 @@ An advisory is the question DepTrail answers: *which package versions were malic
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "id": "GHSA-0000-0000-0000",
   "name": "EXAMPLE — replace every value below",
   "ecosystem": "npm",
   "coverage": "partial",
   "window": {
     "start": "2026-01-02T19:20:42+00:00",
-    "end": null
+    "end": null,
+    "provenance": {
+      "start": {
+        "kind": "derived",
+        "source": "https://registry.npmjs.org/example-package"
+      },
+      "end": {
+        "kind": "unknown",
+        "source": "https://registry.npmjs.org/example-package"
+      }
+    }
   },
   "packages": [
     {
@@ -26,7 +36,10 @@ An advisory is the question DepTrail answers: *which package versions were malic
       "notes": "start = time['1.2.3'] from the registry packument. end = null: no registry records when a version stopped being served, so it is not known to have closed."
     }
   ],
-  "sources": ["https://example.test/advisory"]
+  "sources": [
+    "https://example.test/advisory",
+    "https://registry.npmjs.org/example-package"
+  ]
 }
 ```
 
@@ -39,12 +52,13 @@ first.
 
 | Field | Required | Meaning |
 |---|:---:|---|
-| `schema_version` | ✅ | Must be `1`. Bumped only on a breaking change. |
+| `schema_version` | ✅ | Must be `2`. Bumped only on a breaking change. |
 | `id` | ✅ | Stable identifier — prefer the GHSA/CVE id, else a vendor tracking id. |
 | `name` | ✅ | Human-readable incident name, shown in reports. |
 | `ecosystem` | ✅ | `npm` (the only value the MVP judges). |
 | `coverage` | ✅ | `complete` or `partial` — see below. |
 | `window.start` / `.end` | ✅ | Interval in which the malicious artifact was **installable** (first malicious publish → registry removal), **inclusive on both ends**. `end` may be `null`, meaning "not known to have closed" — usually the honest answer, since no registry records a removal. See below; this is not the vendor's "attacker activity" window. |
+| `window.provenance.start` / `.end` | ✅ | Each has a `kind` and exact `source` URL. Start is `operator-supplied` or `derived`; end is `operator-supplied`, `derived`, or `unknown`. `unknown` is required exactly when `end` is `null`. Reports repeat these values for every package judgment. |
 | `packages[]` | ✅ | At least one compromised package. |
 | `packages[].name` | ✅ | Exact npm name, scope included. |
 | `packages[].versions[]` | ✅ | **Exact** versions. No ranges — a range would judge versions the advisory never named. |
@@ -126,6 +140,12 @@ incident. A `partial` feed can prove exposure but never its absence, so
 `Advisory.coverage_warning` carries that caveat into the report — a CLEAN result
 under a partial feed means "nothing found among the packages this feed lists".
 
+**Window provenance is part of every judgment.** A timestamp copied by an operator and
+one derived by an importer may have the same value but not the same evidentiary weight.
+The report therefore names, for each package, how both bounds entered the snapshot and
+the exact URL used. A package-level window carries its own provenance; a package without
+one inherits the advisory window and its provenance.
+
 ## Bundled feeds
 
 `deptrail` ships feeds under `src/deptrail/feeds/`, loadable by name:
@@ -152,7 +172,7 @@ under a `partial` feed as "not found among the packages this feed lists".
 ## Writing a feed on incident day
 
 1. Copy the block at the top of this page.
-2. Set `id`, `name`, and the `window`. Read the start from `https://registry.npmjs.org/<package>` → `time[<version>]`; leave `end` as `null` unless somebody recorded a removal. Do not use the attacker-activity times the advisory leads with (see above).
+2. Set `id`, `name`, and the `window`. Read the start from `https://registry.npmjs.org/<package>` → `time[<version>]`; leave `end` as `null` unless somebody recorded a removal. Record `derived` plus the packument URL for that start, and `unknown` plus the source you checked for the open end. Do not use the attacker-activity times the advisory leads with (see above).
 3. For each named package, add `name`, exact `versions`, and the URL you read it from.
 4. Leave `coverage` as `partial` until you have the vendor's final list.
 5. Run it — a malformed feed fails immediately with the offending field path.

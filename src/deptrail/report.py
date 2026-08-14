@@ -81,18 +81,29 @@ def render_html(report: OrgReport, advisory=None) -> str:
     ]
 
     if advisory is not None:
-        closed = advisory.window[1]
-        window = (f"{advisory.window[0]:%Y-%m-%d %H:%M %Z} → "
-                  + (f"{closed:%Y-%m-%d %H:%M %Z}" if closed is not None
-                     else "still open (no removal time is recorded)"))
         sources = " · ".join(escape(s) for s in advisory.sources)
         out.append(
-            "<h2>Advisory</h2><p class='sub'>installable window "
-            f"<strong>{escape(window)}</strong> · coverage "
-            f"{escape(advisory.coverage)} · packages "
-            + ", ".join(f"<code>{escape(p.name)}</code>" for p in advisory.packages)
-            + f"<br>{sources}</p>"
+            f"<h2>Advisory</h2><p class='sub'>coverage {escape(advisory.coverage)}"
+            f"<br>{sources}</p><h2>Installable windows (one per judgment)</h2>"
+            "<table><tr><th>Package</th><th>Installable window</th>"
+            "<th>Provenance</th></tr>"
         )
+        for package in advisory.packages:
+            window = advisory.window_for(package)
+            closed = (f"{window.end:%Y-%m-%d %H:%M %Z}" if window.end is not None
+                      else "still open (no removal time is recorded)")
+            versions = ", ".join(f"{package.name}@{version}"
+                                 for version in package.versions)
+            provenance = (f"start {window.provenance.start.kind} from "
+                          f"{window.provenance.start.source}; end "
+                          f"{window.provenance.end.kind} from "
+                          f"{window.provenance.end.source}")
+            out.append(
+                f"<tr><td><code>{escape(versions)}</code></td>"
+                f"<td>{window.start:%Y-%m-%d %H:%M %Z} → {escape(closed)}</td>"
+                f"<td>{escape(provenance)}</td></tr>"
+            )
+        out.append("</table>")
 
     out.append("<h2>Rotate</h2>")
     if items:

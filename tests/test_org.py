@@ -20,9 +20,16 @@ from deptrail.ioc import parse_advisory
 from deptrail.org import render_report, scan_organization
 from deptrail.rotation import Scope, secrets_in_workflow
 
-WINDOW = {"start": "2025-11-24T00:00:00+00:00", "end": "2025-11-26T23:59:59+00:00"}
+WINDOW = {
+    "start": "2025-11-24T00:00:00+00:00",
+    "end": "2025-11-26T23:59:59+00:00",
+    "provenance": {
+        "start": {"kind": "operator-supplied", "source": "https://example.test/a"},
+        "end": {"kind": "operator-supplied", "source": "https://example.test/a"},
+    },
+}
 ADVISORY = {
-    "schema_version": 1, "id": "GHSA-test", "name": "Test incident",
+    "schema_version": 2, "id": "GHSA-test", "name": "Test incident",
     "ecosystem": "npm", "coverage": "complete", "window": WINDOW,
     "packages": [{"name": "chalk", "versions": ["5.6.1"],
                   "sources": ["https://example.test/a"]}],

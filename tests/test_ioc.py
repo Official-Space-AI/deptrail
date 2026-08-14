@@ -19,13 +19,29 @@ from deptrail.ioc import (
     parse_advisory,
 )
 
+
+def installable_window(start, end, *, source="https://example.test/advisory",
+                       start_kind="operator-supplied", end_kind=None):
+    """Schema-v2 window fixture; an open end has unknown provenance by definition."""
+    return {
+        "start": start,
+        "end": end,
+        "provenance": {
+            "start": {"kind": start_kind, "source": source},
+            "end": {"kind": end_kind or ("unknown" if end is None else start_kind),
+                    "source": source},
+        },
+    }
+
+
 MINIMAL = {
     "schema_version": SCHEMA_VERSION,
     "id": "GHSA-test",
     "name": "Test incident",
     "ecosystem": "npm",
     "coverage": "complete",
-    "window": {"start": "2025-11-24T00:00:00+00:00", "end": "2025-11-26T23:59:59+00:00"},
+    "window": installable_window("2025-11-24T00:00:00+00:00",
+                                 "2025-11-26T23:59:59+00:00"),
     "packages": [
         {"name": "chalk", "versions": ["5.6.1"], "sources": ["https://example.test/advisory"]}
     ],
@@ -57,15 +73,21 @@ class TestHappyPath:
         queries = adv.plan().queries
         assert [q.package for q in queries] == ["chalk", "debug"]
         assert queries[1].malicious_versions == frozenset({"4.4.2", "4.4.3"})
-        assert all(q.window_start == adv.window[0] for q in queries)
+        assert all(q.window_start == adv.window.start for q in queries)
 
     def test_package_window_narrows_within_advisory_window(self):
         adv = parse_advisory(package_with(
-            window={"start": "2025-11-25T00:00:00+00:00", "end": "2025-11-25T12:00:00+00:00"}
+            window=installable_window("2025-11-25T00:00:00+00:00",
+                                      "2025-11-25T12:00:00+00:00",
+                                      source="https://registry.npmjs.org/chalk",
+                                      start_kind="derived")
         ))
-        query = adv.plan().queries[0]
+        entry = adv.plan().entries[0]
+        query = entry.query
         assert query.window_start == datetime(2025, 11, 25, tzinfo=timezone.utc)
-        assert query.window_start != adv.window[0]
+        assert query.window_start != adv.window.start
+        assert entry.window.provenance.start.kind == "derived"
+        assert entry.window.provenance.start.source == "https://registry.npmjs.org/chalk"
 
     def test_partial_coverage_carries_a_warning(self):
         adv = parse_advisory(advisory_with(coverage="partial"))
@@ -73,16 +95,14 @@ class TestHappyPath:
         assert "absence of exposure is not evidence" in adv.coverage_warning
 
     def test_non_utc_offset_preserved(self):
-        adv = parse_advisory(advisory_with(window={
-            "start": "2025-11-24T09:00:00+09:00", "end": "2025-11-24T18:00:00+09:00",
-        }))
-        assert adv.window[0].utcoffset() == timedelta(hours=9)
+        adv = parse_advisory(advisory_with(window=installable_window(
+            "2025-11-24T09:00:00+09:00", "2025-11-24T18:00:00+09:00")))
+        assert adv.window.start.utcoffset() == timedelta(hours=9)
 
     def test_z_suffix_accepted(self):
-        adv = parse_advisory(advisory_with(window={
-            "start": "2025-11-24T00:00:00Z", "end": "2025-11-26T23:59:59Z",
-        }))
-        assert adv.window[0] == datetime(2025, 11, 24, tzinfo=timezone.utc)
+        adv = parse_advisory(advisory_with(window=installable_window(
+            "2025-11-24T00:00:00Z", "2025-11-26T23:59:59Z")))
+        assert adv.window.start == datetime(2025, 11, 24, tzinfo=timezone.utc)
 
 
 class TestWindowBounds:
@@ -130,7 +150,7 @@ class TestFailLoud:
 
     def test_wrong_schema_version(self):
         with pytest.raises(IocError, match="schema_version"):
-            parse_advisory(advisory_with(schema_version=2))
+            parse_advisory(advisory_with(schema_version=1))
 
     def test_missing_required_field(self):
         payload = {k: v for k, v in MINIMAL.items() if k != "coverage"}
@@ -267,13 +287,45 @@ class TestNameAndVersionShape:
 
 
 class TestProvenanceAndAmbiguity:
+    def test_bound_provenance_reaches_each_planned_judgment(self):
+        body = json.loads(advisory_with())
+        body["window"]["provenance"]["start"] = {
+            "kind": "derived", "source": "https://registry.npmjs.org/chalk",
+        }
+        entry = parse_advisory(json.dumps(body)).plan().entries[0]
+        assert entry.window.provenance.start.kind == "derived"
+        assert entry.window.provenance.start.source == "https://registry.npmjs.org/chalk"
+
+    def test_window_without_provenance_is_rejected(self):
+        body = json.loads(advisory_with())
+        del body["window"]["provenance"]
+        with pytest.raises(IocError, match="missing 'provenance'"):
+            parse_advisory(json.dumps(body))
+
+    def test_a_definite_start_cannot_be_unknown(self):
+        body = json.loads(advisory_with())
+        body["window"]["provenance"]["start"]["kind"] = "unknown"
+        with pytest.raises(IocError, match="definite start"):
+            parse_advisory(json.dumps(body))
+
+    @pytest.mark.parametrize("end,end_kind", [
+        (None, "operator-supplied"),
+        ("2025-11-26T23:59:59+00:00", "unknown"),
+    ])
+    def test_unknown_provenance_means_exactly_a_null_end(self, end, end_kind):
+        body = json.loads(advisory_with())
+        body["window"]["end"] = end
+        body["window"]["provenance"]["end"]["kind"] = end_kind
+        with pytest.raises(IocError, match="exactly when window.end is null"):
+            parse_advisory(json.dumps(body))
+
     def test_non_url_source_rejected(self):
         with pytest.raises(IocError, match="not an http"):
             parse_advisory(package_with(sources=["vendor blog"]))
 
     def test_duplicate_json_key_rejected(self):
         payload = (
-            '{"schema_version": 1, "id": "x", "name": "x", "ecosystem": "npm",'
+            '{"schema_version": 2, "id": "x", "name": "x", "ecosystem": "npm",'
             ' "coverage": "complete",'
             ' "window": {"start": "2025-11-24T00:00:00+00:00", "end": "2025-11-25T00:00:00+00:00"},'
             ' "window": {"start": "2020-01-01T00:00:00+00:00", "end": "2020-01-02T00:00:00+00:00"},'
@@ -289,20 +341,23 @@ class TestProvenanceAndAmbiguity:
 
     def test_schema_version_float_rejected(self):
         with pytest.raises(IocError, match="integer"):
-            parse_advisory(advisory_with(schema_version=1.0))
+            parse_advisory(advisory_with(schema_version=2.0))
 
     def test_package_window_outside_advisory_window_rejected(self):
         with pytest.raises(IocError, match="not inside the advisory window"):
             parse_advisory(package_with(
-                window={"start": "2020-01-01T00:00:00+00:00", "end": "2020-01-02T00:00:00+00:00"}
+                window=installable_window("2020-01-01T00:00:00+00:00",
+                                          "2020-01-02T00:00:00+00:00")
             ))
 
     def test_two_waves_of_one_package_are_expressible(self):
         adv = parse_advisory(advisory_with(packages=[
             {"name": "chalk", "versions": ["5.6.1"], "sources": ["https://a.test"],
-             "window": {"start": "2025-11-24T00:00:00+00:00", "end": "2025-11-24T12:00:00+00:00"}},
+             "window": installable_window("2025-11-24T00:00:00+00:00",
+                                           "2025-11-24T12:00:00+00:00")},
             {"name": "chalk", "versions": ["5.6.3"], "sources": ["https://a.test"],
-             "window": {"start": "2025-11-26T00:00:00+00:00", "end": "2025-11-26T12:00:00+00:00"}},
+             "window": installable_window("2025-11-26T00:00:00+00:00",
+                                           "2025-11-26T12:00:00+00:00")},
         ]))
         assert len(adv.plan()) == 2
 
@@ -378,9 +433,9 @@ class TestOpenUpperBound:
 
     def _advisory(self, end, **over):
         body = {
-            "schema_version": 1, "id": "GHSA-open", "name": "Open ended",
+            "schema_version": SCHEMA_VERSION, "id": "GHSA-open", "name": "Open ended",
             "ecosystem": "npm", "coverage": "complete",
-            "window": {"start": "2025-09-08T13:13:05+00:00", "end": end},
+            "window": installable_window("2025-09-08T13:13:05+00:00", end),
             "packages": [{"name": "chalk", "versions": ["5.6.1"],
                           "sources": ["https://example.test/a"]}],
             "sources": ["https://example.test/a"],
@@ -390,7 +445,7 @@ class TestOpenUpperBound:
 
     def test_a_null_end_parses_as_open(self):
         advisory = parse_advisory(self._advisory(None))
-        assert advisory.window[1] is None
+        assert advisory.window.end is None
         query = advisory.plan().entries[0].query
         assert query.window_end is None
 
@@ -416,20 +471,23 @@ class TestOpenUpperBound:
 
     def test_a_package_window_may_not_outlive_a_closed_advisory_window(self):
         body = json.loads(self._advisory("2025-09-08T14:47:54+00:00"))
-        body["packages"][0]["window"] = {"start": "2025-09-08T13:13:05+00:00", "end": None}
+        body["packages"][0]["window"] = installable_window(
+            "2025-09-08T13:13:05+00:00", None)
         # An open end is the latest possible end, so it cannot sit inside one that closes.
         with pytest.raises(IocError, match="not inside the advisory window"):
             parse_advisory(json.dumps(body))
 
     def test_an_open_package_window_fits_an_open_advisory_window(self):
         body = json.loads(self._advisory(None))
-        body["packages"][0]["window"] = {"start": "2025-09-09T00:00:00+00:00", "end": None}
+        body["packages"][0]["window"] = installable_window(
+            "2025-09-09T00:00:00+00:00", None)
         advisory = parse_advisory(json.dumps(body))
         assert advisory.plan().entries[0].query.window_end is None
 
     def test_the_error_message_names_an_open_window_as_open(self):
         body = json.loads(self._advisory(None))
-        body["packages"][0]["window"] = {"start": "2025-09-01T00:00:00+00:00", "end": None}
+        body["packages"][0]["window"] = installable_window(
+            "2025-09-01T00:00:00+00:00", None)
         with pytest.raises(IocError, match=r"\.\. open\]"):
             parse_advisory(json.dumps(body))
 
@@ -472,10 +530,10 @@ class TestWindowBoundariesAreInclusive:
 
     def _query(self, end):
         body = {
-            "schema_version": 1, "id": "GHSA-edge", "name": "Edges",
+            "schema_version": SCHEMA_VERSION, "id": "GHSA-edge", "name": "Edges",
             "ecosystem": "npm", "coverage": "complete",
-            "window": {"start": self.START.isoformat(),
-                       "end": None if end is None else end.isoformat()},
+            "window": installable_window(
+                self.START.isoformat(), None if end is None else end.isoformat()),
             "packages": [{"name": "chalk", "versions": ["5.6.1"],
                           "sources": ["https://example.test/a"]}],
             "sources": ["https://example.test/a"],
@@ -505,12 +563,12 @@ class TestWindowBoundariesAreInclusive:
 
     def test_a_package_window_may_end_exactly_when_the_advisory_does(self):
         body = {
-            "schema_version": 1, "id": "GHSA-edge", "name": "Edges",
+            "schema_version": SCHEMA_VERSION, "id": "GHSA-edge", "name": "Edges",
             "ecosystem": "npm", "coverage": "complete",
-            "window": {"start": self.START.isoformat(), "end": self.END.isoformat()},
+            "window": installable_window(self.START.isoformat(), self.END.isoformat()),
             "packages": [{"name": "chalk", "versions": ["5.6.1"],
-                          "window": {"start": self.START.isoformat(),
-                                     "end": self.END.isoformat()},
+                          "window": installable_window(self.START.isoformat(),
+                                                       self.END.isoformat()),
                           "sources": ["https://example.test/a"]}],
             "sources": ["https://example.test/a"],
         }
@@ -522,12 +580,12 @@ class TestWindowBoundariesAreInclusive:
     def test_a_package_window_end_reaches_the_query(self):
         narrow = self.START + timedelta(minutes=30)
         body = {
-            "schema_version": 1, "id": "GHSA-edge", "name": "Edges",
+            "schema_version": SCHEMA_VERSION, "id": "GHSA-edge", "name": "Edges",
             "ecosystem": "npm", "coverage": "complete",
-            "window": {"start": self.START.isoformat(), "end": None},
+            "window": installable_window(self.START.isoformat(), None),
             "packages": [{"name": "chalk", "versions": ["5.6.1"],
-                          "window": {"start": self.START.isoformat(),
-                                     "end": narrow.isoformat()},
+                          "window": installable_window(self.START.isoformat(),
+                                                       narrow.isoformat()),
                           "sources": ["https://example.test/a"]}],
             "sources": ["https://example.test/a"],
         }
@@ -541,9 +599,9 @@ class TestWindowBoundariesAreInclusive:
     def test_a_start_in_the_future_is_refused_with_an_open_end(self):
         future = datetime.now(timezone.utc) + timedelta(days=365)
         body = {
-            "schema_version": 1, "id": "GHSA-typo", "name": "Mistyped year",
+            "schema_version": SCHEMA_VERSION, "id": "GHSA-typo", "name": "Mistyped year",
             "ecosystem": "npm", "coverage": "complete",
-            "window": {"start": future.isoformat(), "end": None},
+            "window": installable_window(future.isoformat(), None),
             "packages": [{"name": "chalk", "versions": ["5.6.1"],
                           "sources": ["https://example.test/a"]}],
             "sources": ["https://example.test/a"],
@@ -557,9 +615,9 @@ class TestWindowBoundariesAreInclusive:
 
 class TestTheFutureStartCheckTakesAClock:
     BODY = {
-        "schema_version": 1, "id": "GHSA-clock", "name": "n", "ecosystem": "npm",
+        "schema_version": SCHEMA_VERSION, "id": "GHSA-clock", "name": "n", "ecosystem": "npm",
         "coverage": "complete",
-        "window": {"start": "2025-09-08T13:13:05+00:00", "end": None},
+        "window": installable_window("2025-09-08T13:13:05+00:00", None),
         "packages": [{"name": "chalk", "versions": ["5.6.1"],
                       "sources": ["https://a.test/x"]}],
         "sources": ["https://a.test/x"],
@@ -573,7 +631,7 @@ class TestTheFutureStartCheckTakesAClock:
         with pytest.raises(IocError, match="is in the future"):
             parse_advisory(json.dumps(self.BODY), now=before)
         after = datetime(2026, 1, 1, tzinfo=timezone.utc)
-        assert parse_advisory(json.dumps(self.BODY), now=after).window[1] is None
+        assert parse_advisory(json.dumps(self.BODY), now=after).window.end is None
 
     SLACK = timedelta(days=1)  # duplicated on purpose: see below
 
@@ -590,7 +648,7 @@ class TestTheFutureStartCheckTakesAClock:
         # Clock skew on the scanner host is ordinary; the error this exists to catch is off
         # by a year. Both edges are pinned so neither can drift silently.
         assert parse_advisory(json.dumps(self.BODY),
-                              now=start - timedelta(hours=23)).window[0] == start
+                              now=start - timedelta(hours=23)).window.start == start
         with pytest.raises(IocError, match="is in the future"):
             parse_advisory(json.dumps(self.BODY),
                            now=start - timedelta(days=2))
@@ -602,7 +660,8 @@ class TestTheFutureStartCheckTakesAClock:
 
     def test_a_package_window_start_is_checked_too(self):
         body = json.loads(json.dumps(self.BODY))
-        body["packages"][0]["window"] = {"start": "2026-09-08T00:00:00+00:00", "end": None}
+        body["packages"][0]["window"] = installable_window(
+            "2026-09-08T00:00:00+00:00", None)
         with pytest.raises(IocError, match=r"packages\[0\]\.window\.start"):
             parse_advisory(json.dumps(body),
                            now=datetime(2025, 10, 1, tzinfo=timezone.utc))

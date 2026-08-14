@@ -822,10 +822,19 @@ def render_report(report: OrgReport, advisory=None) -> str:
         f"scanned {report.repos_scanned} repo(s); worst grade {report.worst_grade.value}",
     ]
     if advisory is not None:
-        start, end = advisory.window
-        closed = ("still open — no removal time is recorded, so exposure cannot be "
-                  "ruled out after this" if end is None else end.isoformat())
-        lines += _folded(f"installable window {start.isoformat()} → ", closed, " " * 4)
+        lines.append("installable windows (one per judgment)")
+        for package in advisory.packages:
+            window = advisory.window_for(package)
+            closed = ("still open" if window.end is None else window.end.isoformat())
+            versions = ", ".join(f"{package.name}@{version}"
+                                 for version in package.versions)
+            lines += _folded(f"  {versions}: ",
+                             f"{window.start.isoformat()} → {closed}", " " * 4)
+            provenance = (f"start {window.provenance.start.kind} from "
+                          f"{window.provenance.start.source}; end "
+                          f"{window.provenance.end.kind} from "
+                          f"{window.provenance.end.source}")
+            lines += _folded("    provenance: ", provenance, " " * 8)
     lines.append("")
     installed = [e for e in report.timeline if e.probably_installed]
     if installed:
