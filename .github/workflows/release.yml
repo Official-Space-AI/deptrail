@@ -30,6 +30,8 @@ jobs:
           python -m pip install --quiet -e ".[dev]"
           pytest -q
 
+      # `build` makes the sdist first and then builds the wheel *from* it, so a wheel
+      # that works is also proof the sdist is complete — nobody has to check it twice.
       - name: Build the distributions
         run: |
           python -m pip install --quiet build twine
@@ -55,9 +57,14 @@ jobs:
       - name: The bundled feeds must be in the wheel
         run: |
           set -euo pipefail
-          feeds=$(python -m zipfile -l dist/*.whl | grep -c 'deptrail/feeds/.*\.json') || feeds=0
-          echo "bundled feeds in wheel: $feeds"
-          [ "$feeds" -ge 1 ] || { echo "::error::the wheel carries no feeds"; exit 1; }
+          # Counted against the source tree rather than against 1: "at least one feed"
+          # would go on passing after a second feed is added and only the first ships.
+          expected=$(ls src/deptrail/feeds/*.json | wc -l | tr -d ' ')
+          shipped=$(python -m zipfile -l dist/*.whl | grep -c 'deptrail/feeds/.*\.json') || shipped=0
+          echo "feeds: $shipped shipped, $expected in the tree"
+          [ "$expected" -ge 1 ] || { echo "::error::no feeds in the source tree"; exit 1; }
+          [ "$shipped" = "$expected" ] || {
+            echo "::error::the wheel carries $shipped of $expected feeds"; exit 1; }
 
       - name: The metadata must render on PyPI
         run: twine check --strict dist/*
