@@ -1,15 +1,22 @@
 # Publishing is the one action this repository cannot take back: a version number
-# on PyPI is spent whether or not the artifact was any good. So the tag only starts
-# the run — every claim the release makes is checked here first, and the upload is
-# a separate job that cannot begin until those checks pass.
+# on PyPI is spent whether or not the artifact was any good, and the filename is
+# reserved against re-upload even after a delete. So the tag only starts the run —
+# every claim the release makes is checked here first, and the upload is a separate
+# job that cannot begin until those checks pass.
 name: Release
 
 on:
   push:
     tags: ["v*"]
 
-# Least privilege by default; the two jobs that need more ask for it themselves.
+# Least privilege by default; each job asks for exactly what it needs.
 permissions: {}
+
+# Deleting and re-pushing a tag is the documented way to retry a failed release,
+# and without this the second run can overtake the first at the upload.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -22,16 +29,19 @@ jobs:
         with:
           python-version: "3.13"
 
-      # CI proves main; a tag can be placed on any commit, including one that never
-      # passed. Publishing is the step that cannot be undone, so the suite runs again
-      # against exactly what is about to be packaged.
+      # ci.yml and demo.yml both trigger only on branches and pull requests, so at
+      # tag time nothing else runs at all — this workflow is the only validator. A
+      # tag can be placed on any commit, including one that never passed. Note this
+      # covers one interpreter on one OS, while the wheel's metadata claims 3.10
+      # through 3.13 on any OS; closing that gap is #54.
       - name: The tagged commit must pass its own tests
         run: |
           python -m pip install --quiet -e ".[dev]"
           pytest -q
 
       # `build` makes the sdist first and then builds the wheel *from* it, so a wheel
-      # that works is also proof the sdist is complete — nobody has to check it twice.
+      # that works is proof the sdist carries everything the wheel needs. It says
+      # nothing about anything only the sdist ships, such as the tests.
       - name: Build the distributions
         run: |
           python -m pip install --quiet build twine
@@ -40,6 +50,13 @@ jobs:
       # A tag says what was released and the metadata says what was built. Nothing
       # reconciles the two on its own, and a v0.1.1 tag carrying 0.1.0 is unfixable
       # once uploaded, so the mismatch has to stop the run rather than be noticed later.
+      #
+      # This compares the tag to the *normalized* wheel filename, so it is wrong in
+      # both directions on its own: it rejects a self-consistent `v0.1.0-rc1` (whose
+      # wheel is `0.1.0rc1`), and it accepts `__version__ = "0.1.0.rc1"` under tag
+      # `v0.1.0rc1`. The fresh-venv step below compares the tag to the un-normalized
+      # constant and is wrong in the opposite direction. The *pair* is sound — do not
+      # drop or "simplify" either half. Tags should be written in PEP 440 normal form.
       - name: The tag and the packaged version must agree
         run: |
           set -euo pipefail
@@ -47,61 +64,95 @@ jobs:
           built=$(ls dist/*.whl | sed -E 's|.*/deptrail-(.+)-py3-none-any\.whl|\1|')
           echo "tag=$tag built=$built"
           [ "$tag" = "$built" ] || {
-            echo "::error::tag ${GITHUB_REF_NAME} does not match the packaged version ${built}"
+            echo "::error::tag ${GITHUB_REF_NAME} does not match the packaged version ${built} (PEP 440 normalizes the filename; write the tag in normal form)"
             exit 1
           }
 
-      # `deptrail demo` is the first command the README gives a reader, and it reads a
-      # bundled feed. A wheel that omits the feeds installs cleanly and then fails on
-      # that first command, which is the worst way to meet a tool.
       - name: The bundled feeds must be in the wheel
         run: |
           set -euo pipefail
-          # Counted against the source tree rather than against 1: "at least one feed"
-          # would go on passing after a second feed is added and only the first ships.
-          expected=$(ls src/deptrail/feeds/*.json | wc -l | tr -d ' ')
+          # `find`, not `ls src/.../*.json`: the glob makes this step die on an empty
+          # feeds directory before the check below can report why, and it counts only
+          # the top level while the wheel side matches subdirectories too.
+          expected=$(find src/deptrail/feeds -name '*.json' | wc -l | tr -d ' ')
           shipped=$(python -m zipfile -l dist/*.whl | grep -c 'deptrail/feeds/.*\.json') || shipped=0
           echo "feeds: $shipped shipped, $expected in the tree"
           [ "$expected" -ge 1 ] || { echo "::error::no feeds in the source tree"; exit 1; }
+          # Counted against the tree rather than against 1: "at least one feed" would
+          # go on passing after a second feed is added and only the first ships.
           [ "$shipped" = "$expected" ] || {
             echo "::error::the wheel carries $shipped of $expected feeds"; exit 1; }
+          echo "EXPECTED_FEEDS=$expected" >> "$GITHUB_ENV"
 
       - name: The metadata must render on PyPI
+        # Renders the README and validates the metadata. It does not ask PyPI whether
+        # the version is acceptable — a local version like 0.1.0+x passes here and is
+        # rejected at upload.
         run: twine check --strict dist/*
 
       # Installed from the wheel, in an environment with nothing else in it — the same
       # position a judge or a responder is in. Testing the source tree instead would
-      # pass on a wheel that was packaged wrong.
+      # pass on a wheel that was packaged wrong, which is the failure this catches.
       - name: The wheel must run where nothing else is installed
         run: |
           set -euo pipefail
           python -m venv /tmp/fresh
-          /tmp/fresh/bin/pip install --quiet dist/*.whl
+          # --no-deps --no-index: "nothing else installed" is the claim, and today it
+          # holds only because this package happens to have no dependencies.
+          /tmp/fresh/bin/pip install --quiet --no-deps --no-index dist/*.whl
+
           reported=$(/tmp/fresh/bin/deptrail --version)
           echo "$reported"
           [ "$reported" = "deptrail ${GITHUB_REF_NAME#v}" ] || {
             echo "::error::installed tool reports '$reported'"; exit 1; }
-          mkdir -p /tmp/demo && cd /tmp/demo
-          set +e
-          /tmp/fresh/bin/deptrail demo > demo.txt
-          code=$?
-          set -e
+
+          # Opens every bundled feed. The step above compares filenames, and a filename
+          # cannot tell a feed from a truncated file: a wheel whose feed was cut mid-JSON
+          # passed every other gate here while `deptrail feeds` raised for every user.
+          listed=$(/tmp/fresh/bin/deptrail feeds | wc -l | tr -d ' ')
+          [ "$listed" = "$EXPECTED_FEEDS" ] || {
+            echo "::error::deptrail feeds listed $listed of $EXPECTED_FEEDS"; exit 1; }
+
+          cd "$RUNNER_TEMP"
+          code=0
+          /tmp/fresh/bin/deptrail demo > demo.txt || code=$?
           cat demo.txt
-          # The demo builds a mock infection that must end in a rotation list. Exit 0
-          # here would mean the release ships a tool that finds nothing in a repository
-          # it was built to catch, and only the exit code says so without reading prose.
+          # The demo builds a mock infection that must end in a rotation list, and 1 is
+          # this tool's "credentials to rotate".
           [ "$code" -eq 1 ] || { echo "::error::demo exited $code, expected 1 (rotate)"; exit 1; }
+          # But the exit code alone is not proof of anything: Python also exits 1 for an
+          # uncaught exception, so a demo that crashed before printing a byte used to
+          # pass this gate green. These are the assertions demo.yml already makes on
+          # every push — and demo.yml does not trigger on tags, so at release time
+          # nothing else makes them.
+          grep -q "CONFIRMED  ] api-server" demo.txt
+          grep -q "LIKELY     ] docs-site" demo.txt
+          grep -q "rotate (3 credential(s))" demo.txt
+          grep -q "NPM_TOKEN" demo.txt
+          # An unread tree is named as unread, not cleared and not turned into a
+          # rotation item.
+          grep -q "not judged" demo.txt
+          grep -q "mobile-app" demo.txt
+          if grep -q "AWS_ACCESS_KEY" demo.txt; then
+            echo "::error::a credential the workflow never reads must not be listed"; exit 1
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
           name: dist
           path: dist/
+          # Without these an empty dist/ is a green step and a baffling failure in the
+          # next job, and a re-run after a failed publish collides with its own artifact.
+          if-no-files-found: error
+          overwrite: true
 
   publish:
     needs: build
     runs-on: ubuntu-latest
-    # A deployment environment, so the upload waits on whatever review is configured
-    # on it rather than on the tag alone.
+    # Referencing an environment creates it with *no* protection rules, so on its own
+    # this gates nothing: the real precondition is "someone with push access pushed a
+    # v* tag". Configure required reviewers and a `v*` deployment tag rule on the
+    # `pypi` environment to make it a control.
     environment:
       name: pypi
       url: https://pypi.org/p/deptrail
@@ -118,10 +169,17 @@ jobs:
       # Pinned to the commit behind v1.14.2. A moving ref would mean the code that
       # handles this release is not the code that was reviewed for it.
       - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33
+        with:
+          # dist/ holds two files and they upload one at a time. If the sdist lands and
+          # the wheel then fails, the default (false) makes every retry die on "File
+          # already exists" before it reaches the wheel — and PyPI reserves that
+          # filename even if the file is deleted, so 0.1.0 could never be completed.
+          # With this, a retry uploads only what is missing.
+          skip-existing: true
 
   release-notes:
     # Last, and deliberately: PyPI is the artifact that matters, and a failure to
-    # draft notes must not look like a failed publish. If this job is the red one,
+    # publish notes must not look like a failed publish. If this job is the red one,
     # the release is out and only the notes need doing by hand.
     needs: publish
     runs-on: ubuntu-latest
