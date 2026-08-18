@@ -14,6 +14,9 @@ from pathlib import Path
 
 import pytest
 
+import deptrail
+import deptrail.cli as cli_module
+from importlib import metadata
 from deptrail.cli import (
     EXIT_BAD_INPUT,
     EXIT_CLEAN,
@@ -1106,3 +1109,36 @@ class TestRunQueryPadding:
             assert abs((seen["until"] - expected).total_seconds()) < 120
         else:
             assert seen["until"] == end + timedelta(days=1)
+
+
+class TestVersion:
+    """`--version` is the first thing asked of an installed tool, and the answer
+    has to be the code that actually ran — a version read from one place and
+    packaged from another is a report nobody can reproduce."""
+
+    def test_version_prints_and_exits_zero(self, capsys):
+        # Not exit 3: asking a tool what it is, is not a malformed request.
+        with pytest.raises(SystemExit) as caught:
+            main(["--version"])
+        assert caught.value.code == 0
+        assert capsys.readouterr().out.strip() == f"deptrail {deptrail.__version__}"
+
+    def test_packaged_version_matches_the_module(self):
+        """The build reads `__version__`; this fails the moment someone restates it.
+
+        Skipped only in a source tree that was never installed, which CI is not.
+        """
+        try:
+            packaged = metadata.version("deptrail")
+        except metadata.PackageNotFoundError:
+            pytest.skip("deptrail is not installed as a distribution here")
+        assert packaged == deptrail.__version__
+
+    def test_uninstalled_source_tree_still_answers(self, monkeypatch):
+        # Running from a clone with no distribution installed must not crash the
+        # parser, which builds this string before it looks at any argument.
+        def absent(name):
+            raise metadata.PackageNotFoundError(name)
+
+        monkeypatch.setattr(metadata, "version", absent)
+        assert cli_module._installed_version() == deptrail.__version__

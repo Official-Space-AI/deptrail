@@ -4,18 +4,31 @@ build-backend = "hatchling.build"
 
 [project]
 name = "deptrail"
-version = "0.0.1.dev0"
+# Read from src/deptrail/__init__.py by [tool.hatch.version] below: one source, so
+# a tag, a wheel, and `deptrail --version` cannot disagree about what code ran.
+dynamic = ["version"]
 description = "Time-axis forensics for npm supply-chain incidents: did we install it, did it run, what must be rotated"
 readme = "README.md"
 license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 authors = [{ name = "Official-Space-AI" }]
 keywords = ["security", "supply-chain", "npm", "forensics", "incident-response", "lockfile", "ioc"]
 classifiers = [
-  "Development Status :: 2 - Pre-Alpha",
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
   "Intended Audience :: Developers",
-  "Topic :: Security",
+  "Intended Audience :: System Administrators",
+  # Earned rather than assumed: CI runs the suite on Linux, macOS and Windows.
+  "Operating System :: OS Independent",
   "Programming Language :: Python :: 3",
+  # CI tests the ends of the supported range, 3.10 and 3.13.
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Security",
+  "Topic :: Software Development :: Quality Assurance",
 ]
 
 [project.scripts]
@@ -25,7 +38,14 @@ deptrail = "deptrail.cli:main"
 dev = ["pytest"]
 
 [project.urls]
+Homepage = "https://github.com/Official-Space-AI/deptrail"
 Repository = "https://github.com/Official-Space-AI/deptrail"
+Documentation = "https://github.com/Official-Space-AI/deptrail#readme"
+Issues = "https://github.com/Official-Space-AI/deptrail/issues"
+Changelog = "https://github.com/Official-Space-AI/deptrail/releases"
+
+[tool.hatch.version]
+path = "src/deptrail/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/deptrail"]

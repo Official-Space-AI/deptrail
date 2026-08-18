@@ -34,8 +34,10 @@ import json
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
+from importlib import metadata
 from pathlib import Path
 
+from . import __version__
 from .demo import advisory_path, build, runs_provider, secrets_provider
 from .grading import RunHistory, annotate_installs, runs_from_github
 from .ioc import (
@@ -61,6 +63,20 @@ EXIT_ROTATE = 1       # credentials to rotate
 EXIT_INCOMPLETE = 2   # looked, and could not prove absence
 EXIT_BAD_INPUT = 3    # the request was malformed; fixing it is the caller's move
 EXIT_TRANSIENT = 4    # the tool could not run; retrying may help
+
+
+def _installed_version() -> str:
+    """The version pip resolved, not the one the working tree claims.
+
+    Acting on a report means being able to install the same code and get the same
+    answer, so what this reports is the installed distribution. A source tree that
+    was never installed has no distribution to ask, and there the module constant
+    is the only answer there is.
+    """
+    try:
+        return metadata.version("deptrail")
+    except metadata.PackageNotFoundError:
+        return __version__
 
 
 def _configure_utf8_stdio() -> None:
@@ -484,6 +500,10 @@ def build_parser() -> argparse.ArgumentParser:
         prog="deptrail",
         description="Judge which repositories installed a compromised package, "
                     "and which credentials that puts at risk.",
+    )
+    parser.add_argument(
+        "--version", action="version", version=f"deptrail {_installed_version()}",
+        help="print the installed version and exit",
     )
     parser.set_defaults(func=None)
     subs = parser.add_subparsers(dest="command")
