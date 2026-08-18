@@ -14,11 +14,21 @@ permissions: {}
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+
+      # CI proves main; a tag can be placed on any commit, including one that never
+      # passed. Publishing is the step that cannot be undone, so the suite runs again
+      # against exactly what is about to be packaged.
+      - name: The tagged commit must pass its own tests
+        run: |
+          python -m pip install --quiet -e ".[dev]"
+          pytest -q
 
       - name: Build the distributions
         run: |
