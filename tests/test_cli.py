@@ -7,6 +7,7 @@ way a script can act on, without anyone reading prose.
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -16,7 +17,6 @@ import pytest
 
 import deptrail
 import deptrail.cli as cli_module
-from importlib import metadata
 from deptrail.cli import (
     EXIT_BAD_INPUT,
     EXIT_CLEAN,
@@ -1111,6 +1111,31 @@ class TestRunQueryPadding:
             assert seen["until"] == end + timedelta(days=1)
 
 
+class TestUsageErrorsAreNotVerdicts:
+    """A mistyped invocation must not look like a scan result.
+
+    Argparse exits 2 on a usage error, and 2 is this tool's "looked and could not
+    prove absence". `Parser` remaps it to 3 — and nothing tested that, so replacing
+    `Parser` with a plain ArgumentParser, or returning 0 from its `error`, left all
+    495 tests green while a typo reported "absence of exposure was established".
+    """
+
+    @pytest.mark.parametrize("argv", [
+        ["--nope"],                     # unknown top-level flag
+        ["scan"],                       # --ioc is required
+        ["demo", "--format", "xml"],     # not one of the choices
+    ])
+    def test_a_malformed_invocation_exits_bad_input(self, argv, capsys):
+        with pytest.raises(SystemExit) as caught:
+            main(argv)
+        assert caught.value.code == EXIT_BAD_INPUT
+        out, err = capsys.readouterr()
+        # Usage goes to stderr, so a caller redirecting the report to a file gets a
+        # report or nothing — never a usage message parsed as one.
+        assert err
+        assert out == ""
+
+
 class TestVersion:
     """`--version` is the first thing asked of an installed tool, and the answer
     has to be the code that actually ran — a version read from one place and
@@ -1121,7 +1146,11 @@ class TestVersion:
         with pytest.raises(SystemExit) as caught:
             main(["--version"])
         assert caught.value.code == 0
-        assert capsys.readouterr().out.strip() == f"deptrail {deptrail.__version__}"
+        # Exact rather than stripped, because this line is the only place the format
+        # is pinned. Trailing whitespace in the format string is unobservable either
+        # way — argparse runs it through HelpFormatter, which re-wraps and strips —
+        # so that particular mutation is a no-op, not a gap.
+        assert capsys.readouterr().out == f"deptrail {deptrail.__version__}\n"
 
     def test_the_flag_reads_the_constant_rather_than_restating_it(self, monkeypatch, capsys):
         # A literal here would agree with the constant on the day it was written and
@@ -1131,28 +1160,64 @@ class TestVersion:
             main(["--version"])
         assert capsys.readouterr().out.strip() == "deptrail 1.2.3-sentinel"
 
-    def test_packaged_version_matches_the_module(self):
-        """The build reads `__version__`; this fails the moment someone restates it.
+    def test_the_build_does_not_restate_the_version(self):
+        """Kills a static `version = ...` in pyproject.toml, and a constant PEP 440
+        cannot express.
 
-        Skipped only in a source tree that was never installed, which CI is not.
+        It does *not* catch the constant drifting: reinstalling regenerates the
+        metadata from the same constant, so both sides of this move together. What it
+        pins is that the build reads the module rather than carrying its own copy.
         """
+        from importlib import metadata
+
         try:
             packaged = metadata.version("deptrail")
         except metadata.PackageNotFoundError:
+            # A bare source tree has nothing to compare against — but CI installs the
+            # package before running this, so a skip there means the install step was
+            # changed and this guard silently stopped running.
+            if os.environ.get("CI"):
+                pytest.fail("no deptrail distribution in CI: the install step changed")
             pytest.skip("deptrail is not installed as a distribution here")
         assert packaged == deptrail.__version__
 
-    def test_no_distribution_is_needed_to_answer(self, monkeypatch):
-        """A clone that was never pip-installed still reports its version.
+    def test_a_clone_that_was_never_installed_still_answers(self, tmp_path):
+        """`--version` must not need a distribution to answer, because the parser
+        builds that string before it looks at any argument — so a metadata lookup
+        there breaks every command, not just this flag.
 
-        The parser builds this string before it looks at any argument, so reaching
-        for installed metadata here would make `--version` — and every other
-        command — fail in the one place the constant is always available.
+        Built rather than simulated. Monkeypatching `metadata.version` only reaches
+        callers that go through the module attribute, so it misses the
+        `from importlib.metadata import version` spelling entirely — and an earlier
+        version of this test kept passing with the patch deleted outright, because
+        nothing on the path called it at all.
+
+        The subprocess proves its own premise before testing anything: if a
+        distribution turns out to be visible, the scenario was not built and this
+        fails instead of passing for free.
         """
-        def absent(name):
-            raise metadata.PackageNotFoundError(name)
-
-        monkeypatch.setattr(metadata, "version", absent)
-        with pytest.raises(SystemExit) as caught:
-            main(["--version"])
-        assert caught.value.code == 0
+        shutil.copytree(Path(deptrail.__file__).parent, tmp_path / "deptrail",
+                        ignore=shutil.ignore_patterns("__pycache__"))
+        script = (
+            "import sys\n"
+            "from importlib import metadata\n"
+            "try:\n"
+            "    found = metadata.version('deptrail')\n"
+            "except metadata.PackageNotFoundError:\n"
+            "    pass\n"
+            "else:\n"
+            "    sys.exit('premise broken, a distribution is visible: ' + found)\n"
+            "from deptrail.cli import main\n"
+            "main(['--version'])\n"
+        )
+        # -S keeps site-packages, and any editable install's .pth, off sys.path, so
+        # the copy on PYTHONPATH is the only deptrail there is — and it has no
+        # dist-info beside it.
+        result = subprocess.run(
+            [sys.executable, "-S", "-c", script],
+            env={**os.environ, "PYTHONPATH": str(tmp_path),
+                 "PYTHONDONTWRITEBYTECODE": "1"},
+            capture_output=True, text=True, cwd=tmp_path,
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == f"deptrail {deptrail.__version__}"
