@@ -1,11 +1,17 @@
 [build-system]
-requires = ["hatchling"]
+# Floor, not decoration: 1.26.x builds without error and silently emits the legacy
+# free-text `License:` field instead of `License-Expression`, and loses the
+# `License-File` field although the file itself still ships — measured. An
+# Apache-2.0 security tool whose license metadata quietly degrades is exactly the
+# artifact an SPDX-aware scanner then reads wrong.
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
 name = "deptrail"
-# Read from src/deptrail/__init__.py by [tool.hatch.version] below: one source, so
-# a tag, a wheel, and `deptrail --version` cannot disagree about what code ran.
+# Read from src/deptrail/__init__.py by [tool.hatch.version] below, so the wheel and
+# the running tool cannot disagree about what code produced a report. The *tag* is a
+# separate claim, reconciled by a gate in .github/workflows/release.yml, not here.
 dynamic = ["version"]
 description = "Time-axis forensics for npm supply-chain incidents: did we install it, did it run, what must be rotated"
 readme = "README.md"

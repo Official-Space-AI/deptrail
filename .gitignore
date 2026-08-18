@@ -219,4 +219,3 @@ __marimo__/
 
 # Scratch organization written by `deptrail demo` when no --workdir is given
 .deptrail-demo/
-*-generated.json
