@@ -23,8 +23,11 @@ say no verdict was reached, and they are kept apart because the next move differ
 - ``4`` — the tool could not run: an absent ``git``/``gh``, a failed call, a
   directory it could not write. Retrying may help; for ``2`` it will not.
 
-Every path returns one of these — a traceback escaping as exit 1 would read as
-"rotate now".
+Every path that runs a scan returns one of these — a traceback escaping as exit 1
+would read as "rotate now". ``--version`` and ``--help`` are the exceptions: they
+print and exit 0 without reaching a verdict, so a caller must not read their 0 as
+"absence of exposure was established". Nothing in `action.yml` can reach them,
+because it builds the scan's argument list itself rather than forwarding a user's.
 """
 from __future__ import annotations
 
