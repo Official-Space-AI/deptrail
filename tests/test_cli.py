@@ -1123,6 +1123,14 @@ class TestVersion:
         assert caught.value.code == 0
         assert capsys.readouterr().out.strip() == f"deptrail {deptrail.__version__}"
 
+    def test_the_flag_reads_the_constant_rather_than_restating_it(self, monkeypatch, capsys):
+        # A literal here would agree with the constant on the day it was written and
+        # disagree at the next bump, which is the whole failure this class exists for.
+        monkeypatch.setattr(cli_module, "__version__", "1.2.3-sentinel")
+        with pytest.raises(SystemExit):
+            main(["--version"])
+        assert capsys.readouterr().out.strip() == "deptrail 1.2.3-sentinel"
+
     def test_packaged_version_matches_the_module(self):
         """The build reads `__version__`; this fails the moment someone restates it.
 
@@ -1134,11 +1142,17 @@ class TestVersion:
             pytest.skip("deptrail is not installed as a distribution here")
         assert packaged == deptrail.__version__
 
-    def test_uninstalled_source_tree_still_answers(self, monkeypatch):
-        # Running from a clone with no distribution installed must not crash the
-        # parser, which builds this string before it looks at any argument.
+    def test_no_distribution_is_needed_to_answer(self, monkeypatch):
+        """A clone that was never pip-installed still reports its version.
+
+        The parser builds this string before it looks at any argument, so reaching
+        for installed metadata here would make `--version` — and every other
+        command — fail in the one place the constant is always available.
+        """
         def absent(name):
             raise metadata.PackageNotFoundError(name)
 
         monkeypatch.setattr(metadata, "version", absent)
-        assert cli_module._installed_version() == deptrail.__version__
+        with pytest.raises(SystemExit) as caught:
+            main(["--version"])
+        assert caught.value.code == 0
