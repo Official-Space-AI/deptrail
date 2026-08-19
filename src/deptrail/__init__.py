@@ -9,4 +9,4 @@ version that wrote it, so a responder holding a report still cannot tell. That i
 #53, not something this constant fixes on its own.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"

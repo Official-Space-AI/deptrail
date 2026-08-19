@@ -141,7 +141,7 @@ As a GitHub Action:
 
 ```yaml
 - uses: actions/checkout@v4
-- uses: Official-Space-AI/deptrail@main
+- uses: Official-Space-AI/deptrail@v0.1.1
   with:
     ioc: advisories/shai-hulud.json
     report: deptrail-report.html
@@ -201,8 +201,10 @@ read as a scan that found nothing.
 
 🏗 Built for the **2026 Korea Open Source Developer Contest** (submitted Aug 27,
 2026), and still under active development. Released on PyPI as
-[`deptrail`](https://pypi.org/project/deptrail/); `deptrail --version` reports
-which version wrote a given answer.
+[`deptrail`](https://pypi.org/project/deptrail/). `deptrail --version` names the
+version that is installed, so an answer can be reproduced with
+`pip install deptrail==<version>` — reports do not yet carry the version that
+wrote them ([#53](https://github.com/Official-Space-AI/deptrail/issues/53)).
 
 Releases are published straight from a tag by
 [`release.yml`](https://github.com/Official-Space-AI/deptrail/blob/main/.github/workflows/release.yml) over OIDC trusted publishing —
