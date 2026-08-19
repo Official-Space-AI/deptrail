@@ -2,6 +2,10 @@
 
 > **Time-axis forensics for npm supply-chain incidents** — did we install it, did it actually run, and what must be rotated?
 
+[![PyPI](https://img.shields.io/pypi/v/deptrail)](https://pypi.org/project/deptrail/)
+[![Python](https://img.shields.io/pypi/pyversions/deptrail)](https://pypi.org/project/deptrail/)
+[![License](https://img.shields.io/pypi/l/deptrail)](LICENSE)
+
 When a supply-chain attack hits npm (Shai-Hulud, chalk/debug, TanStack, Keyv, ...), every organization asks the same three questions the morning after the IOC drops:
 
 1. Did any of our repos install the compromised version **during the attack window**?
@@ -32,7 +36,7 @@ No token, no network, no waiting — the bundled demo builds a mock infection an
 judges it with the production code path:
 
 ```bash
-pip install git+https://github.com/Official-Space-AI/deptrail
+pip install deptrail
 deptrail demo
 ```
 
@@ -189,7 +193,16 @@ read as a scan that found nothing.
 ## Status
 
 🏗 Under active development for the **2026 Korea Open Source Developer Contest**
-(submission: Aug 27, 2026). Install from git until the first PyPI release.
+(submission: Aug 27, 2026). Released on PyPI as
+[`deptrail`](https://pypi.org/project/deptrail/); `deptrail --version` reports
+which version wrote a given answer.
+
+Releases are published straight from a tag by
+[`release.yml`](.github/workflows/release.yml) over OIDC trusted publishing —
+no API token exists to leak, and every artifact carries a PEP 740 attestation
+tying it to the commit and workflow that built it. Nothing is uploaded until the
+build proves the wheel installs into an empty environment, opens every bundled
+feed, and produces the demo's rotation list.
 
 ## 한국어 요약
 
