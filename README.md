@@ -94,7 +94,7 @@ retry, or to fix something:
 | Secrets rotation scope & checklist | ✖ | ✖ | ✅ |
 | Evidence grading | ✖ | ✖ | ✅ |
 
-Upstream IOC feeds (OSV malicious-packages, vendor advisories, wormsign.io) are **inputs**, not competitors. They are not yet *readable* inputs: DepTrail accepts advisories in its own schema and rejects anything else outright, so today you transcribe one with `deptrail advisory init`. An importer is [#10](https://github.com/Official-Space-AI/deptrail/issues/10).
+Upstream IOC feeds (OSV malicious-packages, vendor advisories, wormsign.io) are **inputs**, not competitors. They are not yet *readable* inputs: DepTrail accepts advisories in its own schema and rejects anything else outright, so its package and version list is yours to supply. An importer for those feeds is [#10](https://github.com/Official-Space-AI/deptrail/issues/10).
 
 ## Real use
 
@@ -116,7 +116,8 @@ the one command that touches the network, and it is not a scan — it writes a f
 you then pass to `scan`, so a verdict never depends on a registry the incident may
 itself have taken down.
 
-Writing one by hand instead:
+Or write one by hand — the alternative to the above, not a step after it, when you
+have no version list to derive from:
 
 `--id` is the advisory's own id, never one you invent, and `--end-unknown` records
 that no registry publishes a removal time — see below.

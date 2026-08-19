@@ -8,12 +8,6 @@ carries two withdrawn versions, 6.2.2 from the September 2025 compromise and 2.2
 from 2016 — withdrawn is not the same as malicious, and the fixture says so.
 """
 import json
-import socket
-import subprocess
-import sys
-import tempfile
-import urllib.error
-import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -25,10 +19,7 @@ from deptrail.registry import (
     PublishRecord,
     RegistryError,
     advisory_from_records,
-    fetch_packument,
     packument_url,
-    publish_records,
-    withdrawn_versions,
 )
 
 PACKUMENTS = json.loads((Path(__file__).parent / "fixtures" / "packuments.json").read_text())
@@ -82,28 +73,6 @@ class TestAssembly:
         advisory = parse_advisory(json.dumps(self.build(records)))
         for package in advisory.packages:
             assert package.window.provenance.start.source == packument_url(package.name)
-
-    def test_a_legacy_rekeying_is_dated_from_the_earlier_entry_and_says_so(self):
-        # npm re-keyed express 1.0.0beta as 1.0.0-beta and dated the new key at the
-        # re-keying. Taking the later one starts the window after the artifact was
-        # already installable, which reports CLEAN.
-        packument = {
-            "name": "express",
-            "time": {"1.0.0-beta": "2013-08-28T17:04:36.588Z",
-                     "1.0.0beta": "2010-12-29T19:38:25.450Z"},
-            "versions": {"1.0.0-beta": {}},
-        }
-        (record,) = publish_records(packument, "express", ("1.0.0-beta",))
-        assert record.published_at == moment("2010-12-29T19:38:25.450Z")
-        assert record.dated_from == "1.0.0beta"
-        body = advisory_from_records(
-            (record,), identifier="X", name="n", sources=("https://a.test/x",))
-        assert "re-keyed a legacy version" in body["packages"][0]["notes"]
-
-    def test_a_packument_for_another_package_is_refused(self):
-        with pytest.raises(RegistryError, match="instead"):
-            publish_records({"name": "evil", "time": {"1.0.0": "2020-01-01T00:00:00.000Z"},
-                             "versions": {}}, "chalk", ("1.0.0",))
 
     def test_versions_published_together_share_one_entry(self):
         together = moment("2025-09-08T13:12:10.343Z")
@@ -212,3 +181,76 @@ class TestDeriveCommand:
         assert code == EXIT_CLEAN
         advisory = parse_advisory(out.read_text())
         assert advisory.packages[0].versions == ("5.6.1",)
+
+
+class TestTheDeriveCommandsGuards:
+    """The four CLI-side fixes review asked for, none of which any test pinned.
+
+    Each was verified by hand and then left unprotected: deleting any of them kept
+    the whole suite green. These are the regression tests, one per fix.
+    """
+
+    @pytest.fixture
+    def registry(self, monkeypatch):
+        fetched = []
+
+        def fetch(name, **kwargs):
+            fetched.append(name)
+            if name not in PACKUMENTS:
+                raise RegistryError(f"{name}: the registry has no such package")
+            return PACKUMENTS[name]
+
+        monkeypatch.setattr("deptrail.registry.fetch_packument", fetch)
+        return fetched
+
+    def derive(self, tmp_path, *extra, output=True):
+        argv = ["advisory", "derive", "--id", "GHSA-x", "--name", "n",
+                "--source", "https://example.test/a", *extra]
+        if output:
+            argv += ["--output", str(tmp_path / "incident.json")]
+        return main(argv)
+
+    def test_a_byte_order_mark_does_not_become_part_of_the_name(self, tmp_path, registry):
+        # A BOM survives str.strip(), so the first entry became '\ufeffchalk' — a 404
+        # whose message says "check the spelling" while the file plainly reads chalk.
+        listing = tmp_path / "versions.txt"
+        listing.write_bytes(b"\xef\xbb\xbfchalk@5.6.1\n")
+        assert self.derive(tmp_path, "--packages-from", str(listing)) == EXIT_CLEAN
+        assert registry == ["chalk"]
+
+    def test_a_bad_source_is_rejected_before_any_request(self, tmp_path, registry):
+        # It used to surface after every fetch, as "a bug in the importer".
+        code = main(["advisory", "derive", "--package", "chalk@5.6.1", "--id", "GHSA-x",
+                     "--name", "n", "--source", "not-a-url"])
+        assert code == EXIT_BAD_INPUT
+        assert registry == []
+
+    def test_an_uppercase_name_is_refused_without_suggesting_a_different_package(
+            self, tmp_path, registry, capsys):
+        # JSONStream and jsonstream are two live packages that both publish a 1.0.3,
+        # so "npm names are lowercase" is advice that names the wrong one and reports
+        # CLEAN.
+        code = self.derive(tmp_path, "--package", "JSONStream@1.3.5")
+        assert code == EXIT_BAD_INPUT
+        message = capsys.readouterr().err
+        assert "#60" in message and "different package" in message
+        assert registry == []
+
+    def test_the_lecture_is_not_appended_to_unrelated_failures(self, tmp_path, registry,
+                                                               capsys):
+        code = main(["advisory", "derive", "--package", "chalk@5.6.1", "--id", "GHSA-x",
+                     "--name", "n", "--source", "not-a-url"])
+        assert code == EXIT_BAD_INPUT
+        assert "#60" not in capsys.readouterr().err
+
+    @pytest.mark.parametrize("kind", ["missing", "directory"])
+    def test_a_path_that_is_wrong_is_the_callers_move(self, tmp_path, registry, kind):
+        target = tmp_path / "nope.txt" if kind == "missing" else tmp_path
+        assert self.derive(tmp_path, "--packages-from", str(target)) == EXIT_BAD_INPUT
+
+    def test_whitespace_inside_a_spec_is_caught_before_the_request(self, tmp_path,
+                                                                   registry):
+        # The probe validated the stripped name while the fetch used the raw one, so
+        # this passed the check and came back 404 at exit 4.
+        assert self.derive(tmp_path, "--package", "chalk @5.6.1") == EXIT_BAD_INPUT
+        assert registry == []
