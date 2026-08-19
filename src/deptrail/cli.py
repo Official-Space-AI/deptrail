@@ -43,6 +43,8 @@ from . import __version__
 from .demo import advisory_path, build, runs_provider, secrets_provider
 from .grading import RunHistory, annotate_installs, runs_from_github
 from .ioc import (
+    COVERAGE_VALUES,
+    SCHEMA_VERSION,
     Advisory,
     InstallableWindow,
     IocError,
@@ -445,6 +447,163 @@ def cmd_advisory_init(args: argparse.Namespace) -> int:
     return EXIT_CLEAN
 
 
+def _package_specs(args: argparse.Namespace) -> dict[str, tuple[str, ...]]:
+    """Read `name@version` specs from flags and from a file, into one map.
+
+    A scoped name contains an `@` of its own, so the split is on the last one:
+    `@babel/core@7.0.0` is `@babel/core` at `7.0.0`.
+    """
+    lines = list(args.package or ())
+    if args.packages_from:
+        # utf-8-sig: a BOM survives `strip()` and turns the first entry into
+        # "\ufeffchalk", which the registry answers 404 for while the operator's file
+        # plainly reads chalk@5.6.1.
+        text = Path(args.packages_from).read_text(encoding="utf-8-sig")
+        lines += [line.split("#", 1)[0].strip() for line in text.splitlines()]
+
+    wanted: dict[str, list[str]] = {}
+    for line in lines:
+        spec = line.strip()
+        if not spec:
+            continue
+        name, sep, version = spec.rpartition("@")
+        if not sep or not name or not version:
+            raise ValueError(f"{spec!r}: expected name@version, e.g. chalk@5.6.1")
+        wanted.setdefault(name, [])
+        # The same version twice is a transcription artefact, not a second wave.
+        if version not in wanted[name]:
+            wanted[name].append(version)
+    if not wanted:
+        raise ValueError("no packages given; pass --package name@version "
+                         "or --packages-from FILE")
+    return {name: tuple(versions) for name, versions in wanted.items()}
+
+
+# Stands in for the packument URLs the real advisory will carry. A literal keeps
+# registry.py — and urllib with it — out of every import path but derive's own.
+_PROBE_URL = "https://registry.example.invalid/probe"
+
+
+def _check_derive_inputs(wanted: dict[str, tuple[str, ...]],
+                         args: argparse.Namespace) -> None:
+    """Reject what the schema will reject, before any request is made.
+
+    Raises `IocError`, which the caller turns into exit 3 — this is the caller's move.
+    Doing it after the fetch reported a schema limit as "a bug in the importer", and
+    the advice that came with one of those messages was actively dangerous: npm names
+    must be lowercase, but `JSONStream` and `jsonstream` are two different live
+    packages that both publish a 1.0.3, so lowercasing names the wrong one and the
+    scan then reports CLEAN.
+    """
+    probe = {
+        "schema_version": SCHEMA_VERSION, "id": args.id, "name": args.name,
+        "ecosystem": "npm", "coverage": args.coverage,
+        "window": {
+            "start": "2000-01-01T00:00:00+00:00", "end": None,
+            "provenance": {"start": {"kind": "derived", "source": _PROBE_URL},
+                           "end": {"kind": "unknown", "source": _PROBE_URL}},
+        },
+        "packages": [{"name": name, "versions": list(versions),
+                      "sources": [_PROBE_URL]} for name, versions in wanted.items()],
+        "sources": list(args.source),
+    }
+    try:
+        parse_advisory(json.dumps(probe))
+    except IocError as e:
+        hint = ""
+        if any(name != name.lower() for name in wanted):
+            hint = (" This advisory schema accepts only lowercase npm names, and "
+                    "some published packages are not lowercase. Do not lowercase the "
+                    "name to get past this: a lowercase spelling can be a different "
+                    "package on the registry, and a scan against it reports CLEAN. "
+                    "See issue #60.")
+        raise IocError(f"{e}{hint}") from e
+
+
+def cmd_advisory_derive(args: argparse.Namespace) -> int:
+    """Build an advisory whose window starts come from the registry, not a keyboard.
+
+    This is the only command in the tool that touches the network, and it is
+    deliberately not a scan: the derived advisory is written to a file a human reads
+    and then passes to `scan`. A verdict must not depend on a registry the incident
+    may itself have taken down, and a window that differs between two runs of the
+    same scan is not evidence.
+    """
+    # Imported here rather than at module scope: nothing on the scan path should be
+    # able to reach the network, and keeping urllib out of the import graph of every
+    # other command is what makes that checkable instead of merely intended.
+    from .registry import (
+        PublishRecord,
+        RegistryError,
+        advisory_from_records,
+        fetch_packument,
+        publish_records,
+    )
+
+    try:
+        wanted = _package_specs(args)
+    except ValueError as e:
+        print(e, file=sys.stderr)
+        return EXIT_BAD_INPUT
+    except OSError as e:
+        # A path that is wrong is the caller's move, not a retry — the same split
+        # `_write_failure` already makes twelve lines up.
+        print(f"could not read {args.packages_from}: {e}", file=sys.stderr)
+        return EXIT_BAD_INPUT if e.errno in _PATH_IS_WRONG else EXIT_TRANSIENT
+
+    # Everything the caller typed is checked before a single request goes out. A
+    # rejected --source used to surface after 180 fetches, as "a bug in the importer".
+    try:
+        _check_derive_inputs(wanted, args)
+    except IocError as e:
+        print(f"{e}", file=sys.stderr)
+        return EXIT_BAD_INPUT
+
+    records: tuple[PublishRecord, ...] = ()
+    for name, versions in wanted.items():
+        try:
+            records += publish_records(fetch_packument(name), name, versions)
+        except RegistryError as e:
+            # 4, not 3: by here the caller's input has already been checked against
+            # the schema, so what is left is the registry being unable to answer —
+            # unreachable, throttled, or holding no such package. Retrying can help.
+            print(f"{e}", file=sys.stderr)
+            return EXIT_TRANSIENT
+
+    body = advisory_from_records(
+        records, identifier=args.id, name=args.name,
+        sources=tuple(args.source), coverage=args.coverage, notes=args.notes,
+    )
+    text = json.dumps(body, indent=2, ensure_ascii=False) + "\n"
+
+    # Written only after it validates. A file that exists but cannot be loaded is
+    # worse than none: it invites a retry of the scan rather than of the import.
+    try:
+        parse_advisory(text)
+    except IocError as e:
+        print(f"the derived advisory does not validate. Every caller-supplied field "
+              f"was checked before fetching, so this is a bug in the importer: {e}",
+              file=sys.stderr)
+        return EXIT_TRANSIENT
+
+    if args.output:
+        try:
+            Path(args.output).write_text(text, encoding="utf-8")
+        except OSError as e:
+            return _write_failure(args.output, e)
+        print(f"wrote {args.output}", file=sys.stderr)
+    else:
+        print(text, end="")
+
+    for record in records:
+        state = "still served" if record.still_served else "withdrawn"
+        print(f"  {record.name}@{record.version} published "
+              f"{record.published_at.isoformat()} ({state})", file=sys.stderr)
+    print("every window start is a registry publish time; every end is null, "
+          "because no registry records a removal time", file=sys.stderr)
+    return EXIT_CLEAN
+
+
 def cmd_advisory_validate(args: argparse.Namespace) -> int:
     """Say whether an advisory is usable, before a scan depends on it."""
     try:
@@ -534,6 +693,26 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--source", help="URL the claim comes from")
     init.add_argument("--output", help="write here instead of stdout")
     init.set_defaults(func=cmd_advisory_init)
+
+    derive = advisory_subs.add_parser(
+        "derive", help="build an advisory from registry publish times (needs network)")
+    derive.add_argument("--package", action="append", metavar="NAME@VERSION",
+                        help="a compromised package and exact version; repeat for several")
+    derive.add_argument("--packages-from", metavar="FILE",
+                        help="read NAME@VERSION lines from a file; '#' starts a comment")
+    derive.add_argument("--id", required=True,
+                        help="the advisory's own identifier, e.g. GHSA-xxxx")
+    derive.add_argument("--name", required=True,
+                        help="one line a responder will recognise months later")
+    derive.add_argument("--source", action="append", required=True,
+                        help="URL the version list comes from; repeat for several")
+    derive.add_argument("--coverage", choices=COVERAGE_VALUES, default="partial",
+                        help="'partial' unless this advisory names every compromised "
+                             "package, because only 'complete' can prove absence")
+    derive.add_argument("--notes", help="anything a responder needs that the fields "
+                                        "do not carry")
+    derive.add_argument("--output", help="write here instead of stdout")
+    derive.set_defaults(func=cmd_advisory_derive)
 
     check = advisory_subs.add_parser(
         "validate", help="check an advisory before a scan depends on it")
