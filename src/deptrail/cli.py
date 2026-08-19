@@ -447,6 +447,19 @@ def cmd_advisory_init(args: argparse.Namespace) -> int:
     return EXIT_CLEAN
 
 
+def _osv_names(args: argparse.Namespace) -> list[str]:
+    """Package names to ask OSV about, from flags and from a file."""
+    names = list(args.osv_package or ())
+    if args.osv_packages_from:
+        text = Path(args.osv_packages_from).read_text(encoding="utf-8-sig")
+        names += [line.split("#", 1)[0].strip() for line in text.splitlines()]
+    seen: list[str] = []
+    for name in names:
+        if name and name not in seen:
+            seen.append(name)
+    return seen
+
+
 def _package_specs(args: argparse.Namespace) -> dict[str, tuple[str, ...]]:
     """Read `name@version` specs from flags and from a file, into one map.
 
@@ -480,15 +493,56 @@ def _package_specs(args: argparse.Namespace) -> dict[str, tuple[str, ...]]:
         # The same version twice is a transcription artefact, not a second wave.
         if version not in wanted[name]:
             wanted[name].append(version)
-    if not wanted:
-        raise ValueError("no packages given; pass --package name@version "
-                         "or --packages-from FILE")
+    if not wanted and not (args.osv_package or args.osv_packages_from):
+        raise ValueError("no packages given; pass --package name@version, "
+                         "--packages-from FILE, or --osv-package NAME")
     return {name: tuple(versions) for name, versions in wanted.items()}
 
 
 # Stands in for the packument URLs the real advisory will carry. A literal keeps
 # registry.py — and urllib with it — out of every import path but derive's own.
 _PROBE_URL = "https://registry.example.invalid/probe"
+
+
+def _versions_from_osv(names: list[str], *, sources: list[str]) -> dict[str, tuple[str, ...]]:
+    """Ask OSV which versions of each named package were malicious.
+
+    The names are the operator's, cited to whatever writeup listed them — OSV has no
+    notion of an incident, so there is no query that returns "everything compromised
+    that day". What OSV does own is the version list, and taking it from there rather
+    than from a keyboard is the point: a version typed slightly wrong matches no
+    lockfile entry, which reads as CLEAN.
+
+    A name OSV holds no malicious record for stops the import. It is tempting to skip
+    it — the operator may have listed a package that turned out to be fine — but
+    "silently contributed nothing" and "confirmed clean" are indistinguishable in the
+    output, and this tool exists because that difference matters.
+    """
+    from .osv import OsvError, malicious_releases
+
+    wanted: dict[str, tuple[str, ...]] = {}
+    for name in names:
+        records = malicious_releases(name)
+        if not records:
+            raise OsvError(
+                f"{name}: OSV holds no malicious-package record for this name. Either "
+                "it was not compromised, or it is spelled differently there — check "
+                "https://osv.dev before dropping it, because a package missing from an "
+                "advisory is a repository that gets cleared."
+            )
+        if len(records) > 1:
+            listed = ", ".join(f"{r.advisory_id} {list(r.versions)}" for r in records)
+            raise OsvError(
+                f"{name}: OSV holds {len(records)} malicious records for it ({listed}). "
+                "Which incident this advisory is about is your call, not a guess this "
+                "importer should make — name the versions with --package instead."
+            )
+        record = records[0]
+        wanted[name] = record.versions
+        for url in (record.source, *record.references):
+            if url not in sources:
+                sources.append(url)
+    return wanted
 
 
 def _check_derive_inputs(wanted: dict[str, tuple[str, ...]],
@@ -539,6 +593,7 @@ def cmd_advisory_derive(args: argparse.Namespace) -> int:
     # Imported here rather than at module scope: nothing on the scan path should be
     # able to reach the network, and keeping urllib out of the import graph of every
     # other command is what makes that checkable instead of merely intended.
+    from .osv import OsvError
     from .registry import (
         PublishRecord,
         RegistryError,
@@ -547,8 +602,20 @@ def cmd_advisory_derive(args: argparse.Namespace) -> int:
         publish_records,
     )
 
+    sources = list(args.source)
     try:
         wanted = _package_specs(args)
+        if args.osv_package or args.osv_packages_from:
+            osv_names = _osv_names(args)
+            # Merged rather than exclusive: an incident can have one package OSV has
+            # not caught up with, and that one is named by hand alongside the rest.
+            for name, versions in _versions_from_osv(osv_names, sources=sources).items():
+                merged = list(wanted.get(name, ()))
+                merged += [v for v in versions if v not in merged]
+                wanted[name] = tuple(merged)
+    except OsvError as e:
+        print(f"{e}", file=sys.stderr)
+        return EXIT_TRANSIENT
     except ValueError as e:
         print(e, file=sys.stderr)
         return EXIT_BAD_INPUT
@@ -581,7 +648,7 @@ def cmd_advisory_derive(args: argparse.Namespace) -> int:
 
     body = advisory_from_records(
         records, identifier=args.id, name=args.name,
-        sources=tuple(args.source), coverage=args.coverage, notes=args.notes,
+        sources=tuple(sources), coverage=args.coverage, notes=args.notes,
     )
     text = json.dumps(body, indent=2, ensure_ascii=False) + "\n"
 
@@ -709,6 +776,12 @@ def build_parser() -> argparse.ArgumentParser:
                         help="a compromised package and exact version; repeat for several")
     derive.add_argument("--packages-from", metavar="FILE",
                         help="read NAME@VERSION lines from a file; '#' starts a comment")
+    derive.add_argument("--osv-package", action="append", metavar="NAME",
+                        help="take this package's malicious versions from OSV rather "
+                             "than typing them; repeat for several")
+    derive.add_argument("--osv-packages-from", metavar="FILE",
+                        help="read package names to look up in OSV from a file; "
+                             "'#' starts a comment")
     derive.add_argument("--id", required=True,
                         help="the advisory's own identifier, e.g. GHSA-xxxx")
     derive.add_argument("--name", required=True,

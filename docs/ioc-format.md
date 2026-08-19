@@ -190,6 +190,37 @@ deptrail advisory derive \
 For a wave naming many packages, put one `name@version` per line in a file and
 pass `--packages-from`; `#` starts a comment.
 
+### Taking the version list from OSV too
+
+`--package name@version` still asks you to type the versions, and a version typed
+slightly wrong matches no lockfile entry — which reads as CLEAN. OSV publishes one
+`MAL-` record per compromised package with the exact versions in it, so name the
+package and let it supply them:
+
+```bash
+deptrail advisory derive \
+  --osv-package chalk --osv-package debug --osv-package ansi-styles \
+  --id GHSA-2v46-p5h4-248w \
+  --name "September 2025 npm maintainer phishing" \
+  --source https://www.aikido.dev/blog/npm-debug-and-chalk-packages-compromised \
+  --output incident.json
+```
+
+Each record's own URL is added to the advisory's `sources` beside the writeup you
+cited, so the resulting feed says where every part of it came from: the names from
+you, the versions from OSV, the window starts from the registry.
+
+Two things it refuses rather than guesses. **A name OSV holds no malicious record
+for stops the import** — "silently contributed nothing" and "confirmed clean" look
+identical in a report, and only one of them is safe. **A package with two malicious
+records stops it too**, because which incident you are responding to is your call;
+name those versions with `--package`.
+
+OSV has no notion of an incident — there is no query that returns everything
+compromised on a given day — so the set of names is still yours, and citing the
+writeup it came from is what makes it checkable. `--osv-packages-from FILE` reads
+one name per line for a wave.
+
 Every `window.start` it writes is a `time[version]` entry read from that package's
 packument, cited by URL and marked `derived`. Every `end` is `null` and marked
 `unknown`, because no registry records a removal time. Versions published at different instants become separate waves, whether they belong
