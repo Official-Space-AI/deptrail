@@ -371,17 +371,22 @@ class TestBoundedRead:
         with pytest.raises(RegistryError, match="stopped early"):
             fetch_packument("chalk", opener=self.opener(response))
 
-    @pytest.mark.parametrize("body,expected", [
-        (gzip.compress(b'{"time":{}}'), "could not be read as JSON"),
-        (b'{"time":' + bytes([0xff, 0xfe]) + b"}", "could not be read as JSON"),
-        (b"[" * 100000 + b"]" * 100000, "could not be read as JSON"),
-    ])
-    def test_a_body_python_cannot_decode_is_not_a_traceback(self, body, expected):
+    # Built inside the test rather than passed as a parameter: pytest puts a
+    # parameter into the test id, and a 200,000-byte id overflowed Windows' 32,767
+    # character environment-variable limit, taking the whole job down with
+    # "previous item was not torn down properly".
+    @pytest.mark.parametrize("shape", ["gzip", "not-utf-8", "deeply-nested"])
+    def test_a_body_python_cannot_decode_is_not_a_traceback(self, shape):
         # gzip and non-UTF-8 raise UnicodeDecodeError, which is a ValueError but not a
-        # JSONDecodeError; deep nesting raises RecursionError. All three escaped.
-        response = self.Response(body)
-        with pytest.raises(RegistryError, match=expected):
-            fetch_packument("chalk", opener=self.opener(response))
+        # JSONDecodeError; deep nesting raises RecursionError. All three escaped as a
+        # traceback, and this contract reads a traceback as exit 1 — "rotate".
+        body = {
+            "gzip": lambda: gzip.compress(b'{"time":{}}'),
+            "not-utf-8": lambda: b'{"time":' + bytes([0xff, 0xfe]) + b"}",
+            "deeply-nested": lambda: b"[" * 100_000 + b"]" * 100_000,
+        }[shape]()
+        with pytest.raises(RegistryError, match="could not be read as JSON"):
+            fetch_packument("chalk", opener=self.opener(self.Response(body)))
 
 
 class TestPackumentUrl:
