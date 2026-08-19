@@ -279,10 +279,37 @@ class TestBoundedRead:
         response = self.Response(b'{"na', b'me": "ch', b'alk"}')
         assert fetch_packument("chalk", opener=self.opener(response)) == {"name": "chalk"}
 
+    @pytest.mark.parametrize("shape,expected", [
+        ("oversized", "the registry sent more than"),
+        ("truncated", "the registry declared"),
+        ("dropped", "the registry stopped sending early"),
+    ])
+    def test_a_body_failure_names_the_registry_not_the_module(self, shape, expected,
+                                                              monkeypatch):
+        """Every message the transport emits has to name the caller's own system.
+
+        `fetch.py` serves OSV as well, and these strings were carried over from when
+        it did not: an OSV outage reported that npm was at fault and handed the
+        responder a packument size budget with nothing to do with the failure.
+        """
+        class Truncated(self.Response):
+            headers = {"Content-Length": "99"}
+
+        if shape == "oversized":
+            # Only here: a 4-byte cap would trip before the truncation check.
+            monkeypatch.setattr(fetch, "MAX_BYTES", 4)
+        response = {
+            "oversized": lambda: self.Response(b"x" * 16),
+            "truncated": lambda: Truncated(b"short"),
+            "dropped": lambda: self.Response(error=TimeoutError("timed out")),
+        }[shape]()
+        with pytest.raises(RegistryError, match=expected):
+            fetch_packument("chalk", opener=self.opener(response))
+
     def test_a_body_over_the_cap_is_refused(self, monkeypatch):
         monkeypatch.setattr(fetch, "MAX_BYTES", 8)
         response = self.Response(b"x" * 6, b"x" * 6)
-        with pytest.raises(RegistryError, match="exceeded"):
+        with pytest.raises(RegistryError, match="more than the"):
             fetch_packument("chalk", opener=self.opener(response))
 
     def test_the_cap_is_the_largest_body_still_accepted(self, monkeypatch):
@@ -291,7 +318,7 @@ class TestBoundedRead:
         exact = self.Response(b'{"name": "chalk"}')
         assert fetch_packument("chalk", opener=self.opener(exact)) == {"name": "chalk"}
         monkeypatch.setattr(fetch, "MAX_BYTES", 16)
-        with pytest.raises(RegistryError, match="exceeded"):
+        with pytest.raises(RegistryError, match="more than the"):
             fetch_packument("chalk", opener=self.opener(self.Response(b'{"name": "chalk"}')))
 
     def test_a_response_that_never_ends_is_given_up_on(self, monkeypatch):
@@ -332,7 +359,7 @@ class TestBoundedRead:
             def __exit__(self, *exc):
                 return False
 
-        with pytest.raises(RegistryError, match="exceeded"):
+        with pytest.raises(RegistryError, match="more than the"):
             fetch_packument("chalk", opener=lambda *a, **k: OnlyRead())
         # Bounded at the call, not merely rejected afterwards: an unbounded read pulls
         # the whole body into memory first, which is the thing the cap exists to stop.
@@ -347,7 +374,7 @@ class TestBoundedRead:
         and every chunk resets it — so this is the path that actually runs.
         """
         response = self.Response(error=TimeoutError("timed out"))
-        with pytest.raises(RegistryError, match="stopped early"):
+        with pytest.raises(RegistryError, match="stopped sending early"):
             fetch_packument("chalk", opener=self.opener(response))
 
     def test_the_socket_timeout_is_resolved_when_called(self, monkeypatch):
@@ -369,7 +396,7 @@ class TestBoundedRead:
         # IncompleteRead is an HTTPException, so it is caught by neither `main()` nor
         # the JSON handler, and used to leave as exit 1 — "rotate these credentials".
         response = self.Response(error=http.client.IncompleteRead(b"partial", 99992))
-        with pytest.raises(RegistryError, match="stopped early"):
+        with pytest.raises(RegistryError, match="stopped sending early"):
             fetch_packument("chalk", opener=self.opener(response))
 
     # Built inside the test rather than passed as a parameter: pytest puts a
@@ -406,6 +433,25 @@ class TestFetchFailures:
             raise error
         return opener
 
+    def test_the_status_survives_the_re_raise(self):
+        """The discriminator `FetchError` exists to carry.
+
+        `RegistryError(str(e))` dropped it, so `.status` was always None and the
+        `e.status == 404` branch one frame up could never have fired for any other
+        caller — silently, with no test failing.
+        """
+        error = urllib.error.HTTPError("u", 503, "Service Unavailable", {}, None)
+        with pytest.raises(RegistryError) as caught:
+            fetch_packument("chalk", opener=self._opener(error))
+        assert caught.value.status == 503
+
+    def test_a_failure_names_the_registry_rather_than_the_module(self):
+        # `fetch.py` serves OSV too, so its messages take the source from the caller.
+        # Carried over verbatim, they told an OSV outage that npm was at fault.
+        error = urllib.error.HTTPError("u", 500, "Server Error", {}, None)
+        with pytest.raises(RegistryError, match="the registry answered HTTP 500"):
+            fetch_packument("chalk", opener=self._opener(error))
+
     def test_an_absent_package_says_so(self):
         error = urllib.error.HTTPError("u", 404, "Not Found", {}, None)
         with pytest.raises(RegistryError) as caught:
@@ -414,7 +460,7 @@ class TestFetchFailures:
 
     def test_a_missing_ca_bundle_is_not_reported_as_an_outage(self):
         # Python installed from python.org ships no CA bundle until its own
-        # Install Certificates step is run, and "could not reach the registry" sends
+        # Install Certificates step is run, and "could not reach it" sends
         # the reader to look at a firewall that is fine.
         import ssl
 
