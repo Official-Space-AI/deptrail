@@ -13,7 +13,9 @@ on:
 permissions: {}
 
 # Deleting and re-pushing a tag is the documented way to retry a failed release,
-# and without this the second run can overtake the first at the upload.
+# and without this the second run can overtake the first at the upload. Note the
+# corollary: a run parked at the approval gate holds the slot, so cancel it
+# (`gh run cancel <id>`) before re-pushing the same tag or the retry just queues.
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
@@ -84,6 +86,24 @@ jobs:
             echo "::error::the wheel carries $shipped of $expected feeds"; exit 1; }
           echo "EXPECTED_FEEDS=$expected" >> "$GITHUB_ENV"
 
+      # `skip-existing` on the publish job lets a half-finished upload be retried.
+      # The cost is that re-tagging a version already on PyPI would upload nothing and
+      # still go green — the dangerous outcome and the benign one would look identical.
+      - name: The version must not already be on PyPI
+        run: |
+          set -uo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          published=$(curl -sf https://pypi.org/pypi/deptrail/json |
+            python3 -c 'import json,sys; print("\n".join(json.load(sys.stdin)["releases"]))') || {
+              echo "::warning::could not ask PyPI which versions exist (the project may not exist yet); skip-existing keeps the upload itself safe"
+              exit 0
+            }
+          if printf '%s\n' "$published" | grep -qxF "$version"; then
+            echo "::error::$version is already on PyPI — bump the version instead of re-tagging"
+            exit 1
+          fi
+          echo "$version is not on PyPI yet"
+
       - name: The metadata must be well formed
         # Validates the metadata. It does *not* ask PyPI whether the version is
         # acceptable — a local version like 0.1.0+x passes here and is rejected at
@@ -103,12 +123,17 @@ jobs:
           set -euo pipefail
           python -m pip install --quiet "readme_renderer[md]"
           python - <<'PY'
-          import email, glob, re, sys, zipfile
+          import email, glob, sys, zipfile
+          from html.parser import HTMLParser
           import readme_renderer.markdown as md
 
           with zipfile.ZipFile(glob.glob("dist/*.whl")[0]) as z:
               name = next(n for n in z.namelist() if n.endswith(".dist-info/METADATA"))
-              meta = email.message_from_bytes(z.read(name))
+              # Decoded by hand. METADATA carries no charset, so email's compat32
+              # parser falls back to ASCII with errors="replace" — 634 U+FFFD on this
+              # project, swallowing every em dash, both check marks, and the entire
+              # Korean section. The gate was proving that mojibake renders.
+              meta = email.message_from_string(z.read(name).decode("utf-8"))
 
           ctype = meta.get("Description-Content-Type", "")
           if "markdown" not in ctype:
@@ -118,13 +143,37 @@ jobs:
           if not html:
               sys.exit("::error::the description does not render as markdown")
 
-          # Relative links resolve against pypi.org, where these paths do not exist.
-          # They look correct on GitHub, which is the only place an author sees them.
-          dead = sorted(set(re.findall(r'href="(?!https?://|mailto:|#)([^"]+)"', html)))
-          if dead:
-              sys.exit("::error::links dead on PyPI: " + ", ".join(dead))
 
-          print(f"description renders: {len(html)} chars, no relative links")
+          class Targets(HTMLParser):
+              """Parsed rather than pattern-matched.
+
+              A regex over the rendered HTML flags an `href` written inside an inline
+              code span, which is text and not a link, and misses `src` on an image
+              entirely — so a local screenshot would freeze onto the page permanently
+              broken, which is the exact failure this step exists to prevent.
+              """
+
+              ABSOLUTE = ("http://", "https://", "mailto:", "//", "#", "data:")
+
+              def __init__(self):
+                  super().__init__()
+                  self.dead = set()
+
+              def handle_starttag(self, tag, attrs):
+                  for key, value in attrs:
+                      if key in ("href", "src") and value:
+                          if not value.lower().startswith(self.ABSOLUTE):
+                              self.dead.add(value)
+
+
+          # Relative targets resolve against pypi.org, where these paths do not exist.
+          # They look correct on GitHub, which is the only place an author sees them.
+          found = Targets()
+          found.feed(html)
+          if found.dead:
+              sys.exit("::error::targets dead on PyPI: " + ", ".join(sorted(found.dead)))
+
+          print(f"description renders: {len(html)} chars, no relative targets")
           PY
 
       # Installed from the wheel, in an environment with nothing else in it — the same

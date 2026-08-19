@@ -23,10 +23,11 @@ judges it with the production code path:
 
 ```bash
 pip install deptrail          # Python 3.10+, no dependencies
-deptrail demo
+deptrail demo                 # writes .deptrail-demo/ here; --workdir puts it elsewhere
 ```
 
 ```
+built 4 synthetic demo repositories in .deptrail-demo (not a real incident)
 advisory GHSA-demo-0000-0000 — Demo incident — chalk compromised
 scanned 4 repo(s); worst grade CONFIRMED
 installable windows (one per judgment)
@@ -65,9 +66,10 @@ version while the registry served it, so it is absent from the report entirely.
 as unread rather than cleared, and it raises no credentials, because nothing about
 it suggests one.
 
-Each line ends with the versions it `covers`, and that is how one repository stays
-one line: an advisory naming 180 packages — the September 2025 Shai-Hulud wave named
-roughly that many — would otherwise print the same paragraph 180 times.
+Each line of the rotation list ends with the versions it `covers`, which is how one
+credential stays one line: an advisory naming 180 packages — the September 2025
+Shai-Hulud wave named roughly that many — would otherwise repeat the same entry 180
+times, once per package.
 
 Exit codes split verdicts from non-verdicts, so a caller knows whether to act, to
 retry, or to fix something:
@@ -85,22 +87,25 @@ retry, or to fix something:
 | Capability | Dependabot | worm-sign | **DepTrail** |
 |---|:---:|:---:|:---:|
 | Current lockfile malware check | ✅ | ✅ | byproduct |
-| Heuristic / payload detection | ✅ | ✅ | ✖ (their domain) |
+| Heuristic / payload detection | ✖ | ✅ | ✖ (their domain) |
 | Attack-window exposure from **lockfile git history** | ✖ | ✖ | ✅ core |
 | **CI run correlation** ("did it actually execute?") | ✖ | ✖ | ✅ core |
 | Org-wide incident timeline | current only | ✖ | ✅ |
 | Secrets rotation scope & checklist | ✖ | ✖ | ✅ |
 | Evidence grading | ✖ | ✖ | ✅ |
 
-Upstream IOC feeds (OSV malicious-packages, vendor advisories, wormsign.io) are **inputs**, not competitors — DepTrail consumes them.
+Upstream IOC feeds (OSV malicious-packages, vendor advisories, wormsign.io) are **inputs**, not competitors. They are not yet *readable* inputs: DepTrail accepts advisories in its own schema and rejects anything else outright, so today you transcribe one with `deptrail advisory init`. An importer is [#10](https://github.com/Official-Space-AI/deptrail/issues/10).
 
 ## Real use
 
 On incident day, start from the advisory — it is the only thing you have to write:
 
+`--id` is the advisory's own id, never one you invent, and `--end-unknown` records
+that no registry publishes a removal time — see below.
+
 ```bash
 deptrail advisory init \
-  --id GHSA-....                            # the advisory's own id, never guessed \
+  --id GHSA-... \
   --name "chalk compromised" \
   --package chalk --version 5.6.1 \
   --start 2025-11-24T00:00:00+00:00 \
@@ -108,7 +113,8 @@ deptrail advisory init \
   --source https://github.com/advisories/GHSA-... \
   --output incident.json
 
-deptrail advisory validate incident.json    # before a verdict depends on it
+# Check it before a verdict depends on it.
+deptrail advisory validate incident.json
 ```
 
 `init` fills exactly what you give it and leaves the rest as `REPLACE-ME`, which the
@@ -199,8 +205,8 @@ read as a scan that found nothing.
 
 ## Status
 
-🏗 Built for the **2026 Korea Open Source Developer Contest** (submitted Aug 27,
-2026), and still under active development. Released on PyPI as
+🏗 Built for the **2026 Korea Open Source Developer Contest**, and under active
+development. Released on PyPI as
 [`deptrail`](https://pypi.org/project/deptrail/). `deptrail --version` names the
 version that is installed, so an answer can be reproduced with
 `pip install deptrail==<version>` — reports do not yet carry the version that
