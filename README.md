@@ -218,30 +218,46 @@ read as a scan that found nothing.
   days; older incidents can reach `LIKELY` but not `CONFIRMED`.
 - **Secret values are never visible**, only names — so the report tells you what to
   rotate, not what leaked.
-- **Advisories are an input, not a feature.** One example feed ships with the
-  package; an importer that derives windows from registry publish times is
-  [#10](https://github.com/Official-Space-AI/deptrail/issues/10).
+- **Advisories are an input, not a feature.** Two feeds ship with the package: a
+  synthetic example for the demo, and the September 2025 incident above. Deriving a
+  window from registry publish times is `deptrail advisory derive`; importing whole
+  upstream feeds is still [#10](https://github.com/Official-Space-AI/deptrail/issues/10).
 
 ## Validated against a real incident
 
-One bundled feed is the September 2025 npm maintainer phishing (`chalk` 5.6.1,
-`debug` 4.4.2, `ansi-styles` 6.2.2). Nothing in it was transcribed: the package
-names come from the public writeup it cites, the malicious versions from OSV's
-`MAL-` records, and the window starts from the registry's own publish times.
+A bundled feed covers the September 2025 npm maintainer phishing — 20 packages,
+from `chalk` 5.6.1 and `debug` 4.4.2 to `color` 5.0.1. Nothing in it was
+transcribed. The names are OSV's contiguous malicious-package block
+`MAL-2025-46966..46985`, every record published 2025-09-08 and bounded below by
+RubyGems records from 2025-09-01 and above by unrelated npm records from 2025-09-09.
+The malicious versions come from those records, and each window start is that
+package's own publish time read from the registry.
 
 ```bash
 deptrail scan --ioc npm-2025-09-08-chalk-debug --repo /path/to/clone
 ```
 
-It has been run end to end against a real affected repository whose lockfile held
-both versions on the day, and against one that never did. The tool's timeline
-matched a hand check of the git history to the commit, and reported one package the
-hand check had not thought to look for. Method and results are in the project's
-experiment log (E21), including the two things it did **not** establish: the
-`CONFIRMED` path has still never been exercised against a real incident's CI history
-([#66](https://github.com/Official-Space-AI/deptrail/issues/66)), and most npm
-projects have moved to lockfiles this version cannot parse
-([#65](https://github.com/Official-Space-AI/deptrail/issues/65)).
+It has been run against a real affected repository and a real unaffected one, with
+the ground truth established from the git history and the registry **before** the
+tool was run. On the affected repository the tool reported eight compromised
+packages pinned at `2025-09-08T14:31:48Z`; a hand count of that lockfile finds the
+same eight. On the unaffected one — 2,175 commits, 193 touching the lockfile — it
+found nothing, and the lockfile provably held the safe `debug` 4.4.1 at every commit
+spanning that package's five-day window.
+
+Three things this does **not** establish, in this section's own spirit:
+
+- The feed stays `partial`, so a CLEAN result under it means "not found among these
+  20". A contiguous id block is strong evidence of one incident and not proof of
+  exhaustiveness — a first attempt at this feed stopped at 18 packages and missed
+  two.
+- The `CONFIRMED` path has never been exercised against a real incident's CI
+  history ([#66](https://github.com/Official-Space-AI/deptrail/issues/66)): the
+  affected repository's Actions runs aged out at 90 days, so every verdict in that
+  run was `POSSIBLE`.
+- Most npm projects have moved to lockfiles this version cannot parse
+  ([#65](https://github.com/Official-Space-AI/deptrail/issues/65)); of twelve
+  well-known ones, one still ships a `package-lock.json`.
 
 ## Status
 
