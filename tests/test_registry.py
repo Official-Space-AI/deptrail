@@ -6,11 +6,14 @@ registry's own rather than something convenient. `ansi-styles` is kept because i
 carries two withdrawn versions, 6.2.2 from the September 2025 compromise and 2.2.0
 from 2016 — withdrawn is not the same as malicious, and the fixture says so.
 """
+import gzip
+import http.client
 import json
 import socket
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -18,6 +21,7 @@ from pathlib import Path
 
 import pytest
 
+import deptrail.registry as registry
 from deptrail.cli import main
 from deptrail.registry import (
     RegistryError,
@@ -172,10 +176,212 @@ class TestPublishTimes:
         with pytest.raises(RegistryError):
             publish_records(packument, "chalk", ("1.0.0",))
 
+    def test_a_legacy_rekeying_is_dated_from_the_earlier_entry(self):
+        # npm re-keyed express 1.0.0beta as 1.0.0-beta and dated the new key at the
+        # re-keying. Taking the later one starts the window two and a half years after
+        # the artifact was installable, so an install in between reports CLEAN.
+        packument = {
+            "name": "express",
+            "time": {"1.0.0-beta": "2013-08-28T17:04:36.588Z",
+                     "1.0.0beta": "2010-12-29T19:38:25.450Z"},
+            "versions": {"1.0.0-beta": {}},
+        }
+        (record,) = publish_records(packument, "express", ("1.0.0-beta",))
+        assert record.published_at == moment("2010-12-29T19:38:25.450Z")
+        assert record.dated_from == "1.0.0beta"
+
+    def test_a_hyphen_collision_between_two_real_releases_is_not_a_rekeying(self):
+        """The rule that makes the previous test safe.
+
+        Folding hyphens away also conflates `X.Y.Z-N` with `X.Y.ZN`, and `x.y.z-0` is
+        what `npm version prerelease` emits — so this collides on live data.
+        `phantomjs` publishes both `1.9.20` and `1.9.2-0`, 934 days apart, with
+        different shasums. Treating the older as a re-keying would open the window
+        two and a half years early and print a re-keying claim about a package npm
+        never re-keyed. Both being in `versions` is what tells them apart.
+        """
+        packument = {
+            "name": "phantomjs",
+            "time": {"1.9.20": "2016-03-31T00:00:00.000Z",
+                     "1.9.2-0": "2013-09-09T00:00:00.000Z"},
+            "versions": {"1.9.20": {}, "1.9.2-0": {}},
+        }
+        (record,) = publish_records(packument, "phantomjs", ("1.9.20",))
+        assert record.published_at == moment("2016-03-31T00:00:00.000Z")
+        assert record.dated_from == "1.9.20"
+
+    def test_a_packument_for_another_package_is_refused(self):
+        # A mirror alias, a redirect or a poisoned cache would otherwise date one
+        # package's versions from another's document.
+        with pytest.raises(RegistryError, match="instead"):
+            publish_records({"name": "evil", "time": {"1.0.0": "2020-01-01T00:00:00.000Z"},
+                             "versions": {}}, "chalk", ("1.0.0",))
+
     def test_withdrawn_is_not_the_same_as_malicious(self):
         # 2.2.0 was withdrawn in 2016 and has nothing to do with the 2025 incident,
         # which is why this list cross-checks a version list and never replaces it.
         assert withdrawn_versions(PACKUMENTS["ansi-styles"]) == ("2.2.0", "6.2.2")
+
+
+class TestBoundedRead:
+    """The chunked read itself, which nothing exercised.
+
+    Every test that fed `fetch_packument` a body used an object exposing only
+    `read`, so the `read1` loop — with the deadline, the size cap and the
+    stopped-early handler in it — never ran once. Disabling both limits left the
+    whole suite green.
+    """
+
+    def opener(self, response):
+        return lambda request, timeout=None: response
+
+    class Response:
+        """Delivers a body in pieces, the way a socket does."""
+
+        def __init__(self, *chunks, error=None, pause=0.0):
+            self.chunks, self.error, self.pause = list(chunks), error, pause
+
+        def read1(self, size):
+            if self.error:
+                raise self.error
+            if self.pause:
+                time.sleep(self.pause)
+            return self.chunks.pop(0) if self.chunks else b""
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def test_the_limits_are_values_that_can_actually_bite(self):
+        """The tests below patch these, so they pass whatever the real numbers are.
+
+        Raising `MAX_BYTES` to a terabyte or `DEADLINE` to a year left every one of
+        them green while the production limits stopped limiting anything. The bounds
+        here are the reasoning, not a restatement: the largest packument measured is
+        `debug` at 195,840 bytes, so the cap must leave room to grow and still be a
+        cap; the deadline must outlast a slow but real transfer and still expire
+        inside an operator's patience.
+        """
+        # next is 31,118,994 bytes today and grows about 4.8MB a year, so the cap has
+        # to sit well clear of it: an earlier 32MiB was already 92.7% consumed.
+        assert 64 * 1024 * 1024 <= registry.MAX_BYTES <= 1024 * 1024 * 1024
+        # Long enough that a 31MB packument over a slow link finishes, short enough
+        # that a trickle does not hold the importer for an afternoon.
+        assert 300 <= registry.DEADLINE <= 3600
+        # TIMEOUT is the stall budget and has to expire long before the total one.
+        assert 5 <= registry.TIMEOUT <= 120
+        assert registry.TIMEOUT < registry.DEADLINE
+
+    def test_a_body_arriving_in_pieces_is_assembled(self):
+        response = self.Response(b'{"na', b'me": "ch', b'alk"}')
+        assert fetch_packument("chalk", opener=self.opener(response)) == {"name": "chalk"}
+
+    def test_a_body_over_the_cap_is_refused(self, monkeypatch):
+        monkeypatch.setattr(registry, "MAX_BYTES", 8)
+        response = self.Response(b"x" * 6, b"x" * 6)
+        with pytest.raises(RegistryError, match="exceeded"):
+            fetch_packument("chalk", opener=self.opener(response))
+
+    def test_the_cap_is_the_largest_body_still_accepted(self, monkeypatch):
+        # Pins `>` rather than `>=`: exactly MAX_BYTES is fine, one more is not.
+        monkeypatch.setattr(registry, "MAX_BYTES", 17)
+        exact = self.Response(b'{"name": "chalk"}')
+        assert fetch_packument("chalk", opener=self.opener(exact)) == {"name": "chalk"}
+        monkeypatch.setattr(registry, "MAX_BYTES", 16)
+        with pytest.raises(RegistryError, match="exceeded"):
+            fetch_packument("chalk", opener=self.opener(self.Response(b'{"name": "chalk"}')))
+
+    def test_a_response_that_never_ends_is_given_up_on(self, monkeypatch):
+        # urllib's timeout is per socket operation, so a trickle resets it forever;
+        # this is the wall clock that makes the docstring's promise true.
+        monkeypatch.setattr(registry, "DEADLINE", 0.05)
+        response = self.Response(*[b" "] * 1000, pause=0.02)
+        with pytest.raises(RegistryError, match="still sending"):
+            fetch_packument("chalk", opener=self.opener(response))
+
+    def test_a_truncated_body_is_refused_rather_than_parsed(self):
+        """`read1` returns what arrived, so a cut-short body simply ends.
+
+        `read()` would have raised IncompleteRead here; without this check the
+        truncation is silent and surfaces later as bad JSON, or worse as a packument
+        that parsed as far as it got.
+        """
+        class Short(self.Response):
+            headers = {"Content-Length": "99"}
+
+        with pytest.raises(RegistryError, match="declared 99 bytes and sent"):
+            fetch_packument("chalk", opener=self.opener(Short(b'{"name": "chalk"}')))
+
+    def test_the_fallback_path_enforces_the_cap_too(self, monkeypatch):
+        # "The fallback is only for tests" is the assumption that stops being true.
+        monkeypatch.setattr(registry, "MAX_BYTES", 4)
+
+        asked = []
+
+        class OnlyRead:
+            def read(self, size=-1):
+                asked.append(size)
+                return b"x" * 16
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        with pytest.raises(RegistryError, match="exceeded"):
+            fetch_packument("chalk", opener=lambda *a, **k: OnlyRead())
+        # Bounded at the call, not merely rejected afterwards: an unbounded read pulls
+        # the whole body into memory first, which is the thing the cap exists to stop.
+        assert asked == [registry.MAX_BYTES + 1]
+
+    def test_a_connection_that_goes_quiet_leaves_as_a_registry_error(self):
+        """The stall case, which TIMEOUT catches rather than the deadline.
+
+        Measured against a local server that sends a header and then stops: with
+        TIMEOUT=2.0 the next read raises TimeoutError after 2.0s. An explicit idle
+        budget on top of it was unreachable — the check sits before the blocking call
+        and every chunk resets it — so this is the path that actually runs.
+        """
+        response = self.Response(error=TimeoutError("timed out"))
+        with pytest.raises(RegistryError, match="stopped early"):
+            fetch_packument("chalk", opener=self.opener(response))
+
+    def test_the_socket_timeout_is_resolved_when_called(self, monkeypatch):
+        # `timeout=TIMEOUT` as a default captured it at import, so lowering TIMEOUT had
+        # no effect — including in the test written to prove a stall is caught, which
+        # then hung past its own deadline. Same defect as the opener, one line apart.
+        seen = {}
+        monkeypatch.setattr(registry, "TIMEOUT", 1.5)
+
+        def opener(request, timeout=None):
+            seen["timeout"] = timeout
+            raise AssertionError("stop")
+
+        with pytest.raises(AssertionError):
+            fetch_packument("chalk", opener=opener)
+        assert seen["timeout"] == 1.5
+
+    def test_a_connection_dropped_mid_read_is_not_a_traceback(self):
+        # IncompleteRead is an HTTPException, so it is caught by neither `main()` nor
+        # the JSON handler, and used to leave as exit 1 — "rotate these credentials".
+        response = self.Response(error=http.client.IncompleteRead(b"partial", 99992))
+        with pytest.raises(RegistryError, match="stopped early"):
+            fetch_packument("chalk", opener=self.opener(response))
+
+    @pytest.mark.parametrize("body,expected", [
+        (gzip.compress(b'{"time":{}}'), "could not be read as JSON"),
+        (b'{"time":' + bytes([0xff, 0xfe]) + b"}", "could not be read as JSON"),
+        (b"[" * 100000 + b"]" * 100000, "could not be read as JSON"),
+    ])
+    def test_a_body_python_cannot_decode_is_not_a_traceback(self, body, expected):
+        # gzip and non-UTF-8 raise UnicodeDecodeError, which is a ValueError but not a
+        # JSONDecodeError; deep nesting raises RecursionError. All three escaped.
+        response = self.Response(body)
+        with pytest.raises(RegistryError, match=expected):
+            fetch_packument("chalk", opener=self.opener(response))
 
 
 class TestPackumentUrl:
@@ -214,7 +420,8 @@ class TestFetchFailures:
 
     def test_a_response_that_is_not_json_is_refused(self):
         class Body:
-            def read(self):
+            # No `read1`, which is the fallback path an injected opener takes.
+            def read(self, size=-1):
                 return b"<html>maintenance</html>"
 
             def __enter__(self):
