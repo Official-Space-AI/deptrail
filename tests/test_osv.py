@@ -117,6 +117,40 @@ class TestMaliciousReleases:
         with pytest.raises(OsvError):
             malicious_releases("chalk", opener=opener_for({"chalk": answer}))
 
+    def test_a_failure_names_osv_rather_than_the_registry(self):
+        """The transport is shared, so its messages take the source from here.
+
+        Carried over from when it served only npm, an OSV outage told the responder
+        the registry was at fault and offered them a packument size budget.
+        """
+        import deptrail.fetch as fetch
+
+        class Big:
+            def read1(self, size):
+                return b"x" * 64
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        original = fetch.MAX_BYTES
+        fetch.MAX_BYTES = 4
+        try:
+            with pytest.raises(OsvError, match="OSV sent more than"):
+                malicious_releases("chalk", opener=lambda *a, **k: Big())
+        finally:
+            fetch.MAX_BYTES = original
+
+    def test_the_status_survives_the_re_raise(self):
+        def gone(request, timeout=None):
+            raise urllib.error.HTTPError("u", 503, "Service Unavailable", {}, None)
+
+        with pytest.raises(OsvError) as caught:
+            malicious_releases("chalk", opener=gone)
+        assert caught.value.status == 503
+
     def test_a_transport_failure_arrives_as_an_osv_error(self):
         def broken(request, timeout=None):
             raise urllib.error.URLError("no route")

@@ -85,7 +85,8 @@ def _post_json(url: str, payload: dict, *, label: str, opener=None,
     def prepared(_ignored, timeout=None):
         return (opener or urllib.request.urlopen)(request, timeout=timeout)
 
-    return read_json(url, label=label, opener=prepared, timeout=timeout)
+    return read_json(url, label=label, source="OSV", opener=prepared,
+                     timeout=timeout)
 
 
 def malicious_releases(name: str, *, opener=None,
@@ -101,7 +102,7 @@ def malicious_releases(name: str, *, opener=None,
                             {"package": {"name": name, "ecosystem": "npm"}},
                             label=name, opener=opener, timeout=timeout)
     except FetchError as e:
-        raise OsvError(str(e)) from e
+        raise OsvError(str(e), status=e.status) from e
 
     if not isinstance(answer, dict):
         raise OsvError(f"{name}: OSV's answer was not an object")
