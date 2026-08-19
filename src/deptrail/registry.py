@@ -76,7 +76,7 @@ def fetch_packument(name: str, *, opener=None, timeout: float | None = None) -> 
     """Read one package's packument. ``opener`` is injectable so tests stay offline."""
     try:
         packument = read_json(packument_url(name), label=name,
-                              opener=opener, timeout=timeout)
+                              source="the registry", opener=opener, timeout=timeout)
     except FetchError as e:
         if e.status == 404:
             raise RegistryError(
@@ -84,7 +84,7 @@ def fetch_packument(name: str, *, opener=None, timeout: float | None = None) -> 
                 "does not resolve cannot be the one that was compromised — check "
                 "the spelling and the scope rather than dropping the entry."
             ) from e
-        raise RegistryError(str(e)) from e
+        raise RegistryError(str(e), status=e.status) from e
     if not isinstance(packument, dict):
         raise RegistryError(f"{name}: the registry's answer was not an object")
     return packument

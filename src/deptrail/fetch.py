@@ -54,9 +54,14 @@ class FetchError(RuntimeError):
         self.status = status
 
 
-def read_json(url: str, *, label: str, opener=None,
+def read_json(url: str, *, label: str, source: str = "the source", opener=None,
               timeout: float | None = None) -> object:
     """Fetch one JSON document. ``opener`` is injectable so tests stay offline.
+
+    ``source`` is how the caller's own system is named in a failure — "the registry",
+    "OSV". Carrying npm's name into a shared module meant an OSV outage told the
+    responder npm was at fault, and offered them a packument size budget that had
+    nothing to do with it.
 
     Both ``opener`` and ``timeout`` are resolved when called rather than bound as
     defaults: a default argument captures the value at import, so a test that lowers
@@ -72,9 +77,10 @@ def read_json(url: str, *, label: str, opener=None,
     )
     try:
         with opener(request, timeout=timeout) as response:
-            raw = read_bounded(response, label)
+            raw = read_bounded(response, label, source=source)
     except urllib.error.HTTPError as e:
-        raise FetchError(f"{label}: {url} answered HTTP {e.code}", status=e.code) from e
+        raise FetchError(f"{label}: {source} answered HTTP {e.code} for {url}",
+                         status=e.code) from e
     except urllib.error.URLError as e:
         # A missing trust store is not a network outage, and "could not reach it"
         # sends the reader to inspect a firewall that is fine. Python installed from
@@ -83,23 +89,23 @@ def read_json(url: str, *, label: str, opener=None,
         if isinstance(e.reason, ssl.SSLCertVerificationError):
             raise FetchError(
                 f"{label}: the certificate for {url} could not be verified, which "
-                "usually means this Python has no CA bundle rather than that the host "
+                f"usually means this Python has no CA bundle rather than that {source} "
                 "is unreachable. On a python.org install run "
                 "'Install Certificates.command', or point SSL_CERT_FILE at a bundle "
                 f"(e.g. /etc/ssl/cert.pem). Underlying error: {e.reason}"
             ) from e
-        raise FetchError(f"{label}: could not reach {url}: {e.reason}") from e
+        raise FetchError(f"{label}: could not reach {source} at {url}: {e.reason}") from e
 
     try:
         return json.loads(raw)
     except Exception as e:
         raise FetchError(
-            f"{label}: the answer from {url} could not be read as JSON "
+            f"{label}: the answer from {source} at {url} could not be read as JSON "
             f"({type(e).__name__}: {e})"
         ) from e
 
 
-def read_bounded(response, name: str) -> bytes:
+def read_bounded(response, name: str, *, source: str = "the source") -> bytes:
     """Read a response under both a size cap and a wall clock.
 
     ``read()`` with no argument returns only at EOF, and urllib's timeout is per
@@ -111,19 +117,18 @@ def read_bounded(response, name: str) -> bytes:
     which is what lets the deadline below actually be checked. An injected opener in
     a test may only offer ``read``, and for those the single call is the whole body.
     """
-    def too_big(size: int) -> RegistryError:
+    def too_big(size: int) -> FetchError:
         return FetchError(
-            f"{name}: the registry's answer exceeded {MAX_BYTES} bytes "
-            f"({size} so far). The largest packument measured is next at about 31MB, "
-            "so this is either a much larger package than any seen or a broken "
-            "response; retrying will not change it."
+            f"{name}: {source} sent more than the {MAX_BYTES} byte limit "
+            f"({size} so far), which is either a document far larger than any "
+            "measured or a broken response; retrying will not change it."
         )
 
-    def stopped_early(e: Exception) -> RegistryError:
+    def stopped_early(e: Exception) -> FetchError:
         # A connection dropped mid-read raises http.client.IncompleteRead, which is
         # neither an OSError nor caught by `main()`.
         return FetchError(
-            f"{name}: the registry's answer stopped early "
+            f"{name}: {source} stopped sending early "
             f"({type(e).__name__}: {e})"
         )
 
@@ -153,7 +158,7 @@ def read_bounded(response, name: str) -> bytes:
     while True:
         if _time.monotonic() - started > DEADLINE:
             raise FetchError(
-                f"{name}: the registry was still sending after {DEADLINE:.0f}s "
+                f"{name}: {source} was still sending after {DEADLINE:.0f}s "
                 f"({size} bytes so far); giving up rather than hanging"
             )
         try:
@@ -167,7 +172,7 @@ def read_bounded(response, name: str) -> bytes:
             # and either way the reason is lost.
             if declared is not None and size != declared:
                 raise FetchError(
-                    f"{name}: the registry declared {declared} bytes and sent {size}"
+                    f"{name}: {source} declared {declared} bytes and sent {size}"
                 )
             return b"".join(chunks)
         size += len(chunk)
