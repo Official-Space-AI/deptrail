@@ -19,44 +19,19 @@ once, into a file a human reads, and the scan reads the file.
 """
 from __future__ import annotations
 
-import json
-import ssl
-import time as _time
-import urllib.error
 import urllib.parse
-import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from . import __version__
+from .fetch import FetchError, read_json
 
 REGISTRY = "https://registry.npmjs.org"
-
-# urllib's timeout is per socket operation, not a deadline: a server dribbling one
-# byte at a time resets it forever, and a 30-second TIMEOUT was measured still
-# running after 12 seconds of that with no way to tell it was stuck. So the read is
-# chunked with a wall clock over it.
-TIMEOUT = 30.0
-
-# TIMEOUT is per socket operation, so it is already the stall budget: a connection
-# that goes quiet raises TimeoutError from the next read, measured at 2.0s with
-# TIMEOUT=2.0. What it cannot catch is a connection that never stops and never
-# finishes, because a trickle resets it forever — that is DEADLINE's job, and the two
-# are not interchangeable.
-DEADLINE = 900.0
-
-# Measured against the live registry rather than guessed from the three small packages
-# this importer was first tried on: next is 31,118,994 bytes, firebase 30,213,522, npm
-# 25,470,903. An earlier 32 MiB cap was already 92.7% consumed by next and would have
-# begun rejecting it within months, as exit 4 "retry may help" for a condition no
-# retry can fix.
-MAX_BYTES = 256 * 1024 * 1024
 
 # `time` holds these two alongside one entry per version.
 _NOT_A_VERSION = frozenset({"created", "modified"})
 
 
-class RegistryError(RuntimeError):
+class RegistryError(FetchError):
     """The registry could not answer, or answered something unusable.
 
     Never raised for an answer we merely dislike: a version the registry says was
@@ -98,139 +73,21 @@ def packument_url(name: str) -> str:
 
 
 def fetch_packument(name: str, *, opener=None, timeout: float | None = None) -> dict:
-    """Read one package's packument. ``opener`` is injectable so tests stay offline.
-
-    Resolved at call time rather than bound as a default: a default argument captures
-    ``urllib.request.urlopen`` when this module is imported, so a test that replaces
-    that attribute to prove nothing reaches the network would be quietly ignored.
-    """
-    opener = opener or urllib.request.urlopen
-    # Same reason as the opener: `timeout=TIMEOUT` as a default captures the value at
-    # import, so raising or lowering it later — including in a test that means to prove
-    # a stalled connection is caught — has no effect at all.
-    timeout = TIMEOUT if timeout is None else timeout
-    request = urllib.request.Request(
-        packument_url(name),
-        headers={"User-Agent": f"deptrail/{__version__}",
-                 "Accept": "application/json"},
-    )
+    """Read one package's packument. ``opener`` is injectable so tests stay offline."""
     try:
-        with opener(request, timeout=timeout) as response:
-            raw = _read_bounded(response, name)
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
+        packument = read_json(packument_url(name), label=name,
+                              opener=opener, timeout=timeout)
+    except FetchError as e:
+        if e.status == 404:
             raise RegistryError(
                 f"{name}: the registry has no such package. A package name that "
                 "does not resolve cannot be the one that was compromised — check "
                 "the spelling and the scope rather than dropping the entry."
             ) from e
-        raise RegistryError(f"{name}: the registry answered HTTP {e.code}") from e
-    except urllib.error.URLError as e:
-        # A missing trust store is not a network outage, and saying "could not reach
-        # the registry" sends the reader to look at their firewall. Python installed
-        # from python.org ships no CA bundle until its own Install Certificates step
-        # is run, which is a fresh macOS machine's default state — measured here.
-        if isinstance(e.reason, ssl.SSLCertVerificationError):
-            raise RegistryError(
-                f"{name}: the registry's certificate could not be verified, which "
-                "usually means this Python has no CA bundle rather than that the "
-                "registry is unreachable. On a python.org install run "
-                "'Install Certificates.command', or point SSL_CERT_FILE at a bundle "
-                f"(e.g. /etc/ssl/cert.pem). Underlying error: {e.reason}"
-            ) from e
-        raise RegistryError(f"{name}: could not reach the registry: {e.reason}") from e
-
-    try:
-        packument = json.loads(raw)
-    # Not just JSONDecodeError. A gzip or non-UTF-8 body raises UnicodeDecodeError and
-    # deeply nested JSON raises RecursionError; neither is caught by `main()`, so both
-    # used to leave as an uncaught traceback — which this contract reads as exit 1,
-    # "rotate these credentials". Measured on all three.
-    except Exception as e:
-        raise RegistryError(
-            f"{name}: the registry's answer could not be read as JSON "
-            f"({type(e).__name__}: {e})"
-        ) from e
+        raise RegistryError(str(e)) from e
     if not isinstance(packument, dict):
         raise RegistryError(f"{name}: the registry's answer was not an object")
     return packument
-
-
-def _read_bounded(response, name: str) -> bytes:
-    """Read a response under both a size cap and a wall clock.
-
-    ``read()`` with no argument returns only at EOF, and urllib's timeout is per
-    socket operation — so a server sending one byte every half second holds the
-    importer open forever. Measured: a 30-second TIMEOUT was still running after 12
-    seconds against exactly that.
-
-    ``read1`` returns whatever has arrived rather than blocking for a full chunk,
-    which is what lets the deadline below actually be checked. An injected opener in
-    a test may only offer ``read``, and for those the single call is the whole body.
-    """
-    def too_big(size: int) -> RegistryError:
-        return RegistryError(
-            f"{name}: the registry's answer exceeded {MAX_BYTES} bytes "
-            f"({size} so far). The largest packument measured is next at about 31MB, "
-            "so this is either a much larger package than any seen or a broken "
-            "response; retrying will not change it."
-        )
-
-    def stopped_early(e: Exception) -> RegistryError:
-        # A connection dropped mid-read raises http.client.IncompleteRead, which is
-        # neither an OSError nor caught by `main()`.
-        return RegistryError(
-            f"{name}: the registry's answer stopped early "
-            f"({type(e).__name__}: {e})"
-        )
-
-    declared = None
-    header = getattr(response, "headers", None)
-    if header is not None:
-        try:
-            declared = int(header.get("Content-Length"))
-        except (TypeError, ValueError):
-            declared = None
-
-    reader = getattr(response, "read1", None)
-    if reader is None:
-        # An injected opener in a test may only offer `read`; the cap still applies,
-        # because "the fallback is only for tests" is exactly the assumption that
-        # stops being true later.
-        try:
-            raw = response.read(MAX_BYTES + 1)
-        except Exception as e:
-            raise stopped_early(e) from e
-        if len(raw) > MAX_BYTES:
-            raise too_big(len(raw))
-        return raw
-
-    started = _time.monotonic()
-    chunks, size = [], 0
-    while True:
-        if _time.monotonic() - started > DEADLINE:
-            raise RegistryError(
-                f"{name}: the registry was still sending after {DEADLINE:.0f}s "
-                f"({size} bytes so far); giving up rather than hanging"
-            )
-        try:
-            chunk = reader(65536)
-        except Exception as e:
-            raise stopped_early(e) from e
-        if not chunk:
-            # `read1` returns what has arrived, so a body cut short simply ends —
-            # where `read()` would have raised IncompleteRead. Without this a
-            # truncated packument parses as far as it got, or fails as bad JSON,
-            # and either way the reason is lost.
-            if declared is not None and size != declared:
-                raise RegistryError(
-                    f"{name}: the registry declared {declared} bytes and sent {size}"
-                )
-            return b"".join(chunks)
-        size += len(chunk)
-        if size > MAX_BYTES:
-            raise too_big(size)
-        chunks.append(chunk)
 
 
 def _published_at(stamp: object, where: str) -> datetime:

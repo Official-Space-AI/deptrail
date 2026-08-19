@@ -21,6 +21,7 @@ from pathlib import Path
 
 import pytest
 
+import deptrail.fetch as fetch
 import deptrail.registry as registry
 from deptrail.cli import main
 from deptrail.registry import (
@@ -266,37 +267,37 @@ class TestBoundedRead:
         """
         # next is 31,118,994 bytes today and grows about 4.8MB a year, so the cap has
         # to sit well clear of it: an earlier 32MiB was already 92.7% consumed.
-        assert 64 * 1024 * 1024 <= registry.MAX_BYTES <= 1024 * 1024 * 1024
+        assert 64 * 1024 * 1024 <= fetch.MAX_BYTES <= 1024 * 1024 * 1024
         # Long enough that a 31MB packument over a slow link finishes, short enough
         # that a trickle does not hold the importer for an afternoon.
-        assert 300 <= registry.DEADLINE <= 3600
+        assert 300 <= fetch.DEADLINE <= 3600
         # TIMEOUT is the stall budget and has to expire long before the total one.
-        assert 5 <= registry.TIMEOUT <= 120
-        assert registry.TIMEOUT < registry.DEADLINE
+        assert 5 <= fetch.TIMEOUT <= 120
+        assert fetch.TIMEOUT < fetch.DEADLINE
 
     def test_a_body_arriving_in_pieces_is_assembled(self):
         response = self.Response(b'{"na', b'me": "ch', b'alk"}')
         assert fetch_packument("chalk", opener=self.opener(response)) == {"name": "chalk"}
 
     def test_a_body_over_the_cap_is_refused(self, monkeypatch):
-        monkeypatch.setattr(registry, "MAX_BYTES", 8)
+        monkeypatch.setattr(fetch, "MAX_BYTES", 8)
         response = self.Response(b"x" * 6, b"x" * 6)
         with pytest.raises(RegistryError, match="exceeded"):
             fetch_packument("chalk", opener=self.opener(response))
 
     def test_the_cap_is_the_largest_body_still_accepted(self, monkeypatch):
         # Pins `>` rather than `>=`: exactly MAX_BYTES is fine, one more is not.
-        monkeypatch.setattr(registry, "MAX_BYTES", 17)
+        monkeypatch.setattr(fetch, "MAX_BYTES", 17)
         exact = self.Response(b'{"name": "chalk"}')
         assert fetch_packument("chalk", opener=self.opener(exact)) == {"name": "chalk"}
-        monkeypatch.setattr(registry, "MAX_BYTES", 16)
+        monkeypatch.setattr(fetch, "MAX_BYTES", 16)
         with pytest.raises(RegistryError, match="exceeded"):
             fetch_packument("chalk", opener=self.opener(self.Response(b'{"name": "chalk"}')))
 
     def test_a_response_that_never_ends_is_given_up_on(self, monkeypatch):
         # urllib's timeout is per socket operation, so a trickle resets it forever;
         # this is the wall clock that makes the docstring's promise true.
-        monkeypatch.setattr(registry, "DEADLINE", 0.05)
+        monkeypatch.setattr(fetch, "DEADLINE", 0.05)
         response = self.Response(*[b" "] * 1000, pause=0.02)
         with pytest.raises(RegistryError, match="still sending"):
             fetch_packument("chalk", opener=self.opener(response))
@@ -316,7 +317,7 @@ class TestBoundedRead:
 
     def test_the_fallback_path_enforces_the_cap_too(self, monkeypatch):
         # "The fallback is only for tests" is the assumption that stops being true.
-        monkeypatch.setattr(registry, "MAX_BYTES", 4)
+        monkeypatch.setattr(fetch, "MAX_BYTES", 4)
 
         asked = []
 
@@ -335,7 +336,7 @@ class TestBoundedRead:
             fetch_packument("chalk", opener=lambda *a, **k: OnlyRead())
         # Bounded at the call, not merely rejected afterwards: an unbounded read pulls
         # the whole body into memory first, which is the thing the cap exists to stop.
-        assert asked == [registry.MAX_BYTES + 1]
+        assert asked == [fetch.MAX_BYTES + 1]
 
     def test_a_connection_that_goes_quiet_leaves_as_a_registry_error(self):
         """The stall case, which TIMEOUT catches rather than the deadline.
@@ -354,7 +355,7 @@ class TestBoundedRead:
         # no effect — including in the test written to prove a stall is caught, which
         # then hung past its own deadline. Same defect as the opener, one line apart.
         seen = {}
-        monkeypatch.setattr(registry, "TIMEOUT", 1.5)
+        monkeypatch.setattr(fetch, "TIMEOUT", 1.5)
 
         def opener(request, timeout=None):
             seen["timeout"] = timeout
