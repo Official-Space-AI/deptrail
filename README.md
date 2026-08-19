@@ -222,6 +222,27 @@ read as a scan that found nothing.
   package; an importer that derives windows from registry publish times is
   [#10](https://github.com/Official-Space-AI/deptrail/issues/10).
 
+## Validated against a real incident
+
+One bundled feed is the September 2025 npm maintainer phishing (`chalk` 5.6.1,
+`debug` 4.4.2, `ansi-styles` 6.2.2). Nothing in it was transcribed: the package
+names come from the public writeup it cites, the malicious versions from OSV's
+`MAL-` records, and the window starts from the registry's own publish times.
+
+```bash
+deptrail scan --ioc npm-2025-09-08-chalk-debug --repo /path/to/clone
+```
+
+It has been run end to end against a real affected repository whose lockfile held
+both versions on the day, and against one that never did. The tool's timeline
+matched a hand check of the git history to the commit, and reported one package the
+hand check had not thought to look for. Method and results are in the project's
+experiment log (E21), including the two things it did **not** establish: the
+`CONFIRMED` path has still never been exercised against a real incident's CI history
+([#66](https://github.com/Official-Space-AI/deptrail/issues/66)), and most npm
+projects have moved to lockfiles this version cannot parse
+([#65](https://github.com/Official-Space-AI/deptrail/issues/65)).
+
 ## Status
 
 🏗 Built for the **2026 Korea Open Source Developer Contest**, and under active

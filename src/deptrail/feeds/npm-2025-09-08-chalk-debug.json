@@ -1,0 +1,108 @@
+{
+  "schema_version": 2,
+  "id": "GHSA-2v46-p5h4-248w",
+  "name": "September 2025 npm maintainer phishing",
+  "ecosystem": "npm",
+  "coverage": "partial",
+  "window": {
+    "start": "2025-09-08T13:12:10.343000+00:00",
+    "end": null,
+    "provenance": {
+      "start": {
+        "kind": "derived",
+        "source": "https://registry.npmjs.org/ansi-styles"
+      },
+      "end": {
+        "kind": "unknown",
+        "source": "https://registry.npmjs.org/ansi-styles"
+      }
+    }
+  },
+  "packages": [
+    {
+      "name": "ansi-styles",
+      "versions": [
+        "6.2.2"
+      ],
+      "sources": [
+        "https://registry.npmjs.org/ansi-styles"
+      ],
+      "notes": "Window start read from the registry's publish time; the end is null because npm records no per-version removal time. No longer served as of 2026-08-19T06:58:27.287692+00:00: 6.2.2 — so removal happened at or before that instant, which is an upper bound on the end and not the end.",
+      "window": {
+        "start": "2025-09-08T13:12:10.343000+00:00",
+        "end": null,
+        "provenance": {
+          "start": {
+            "kind": "derived",
+            "source": "https://registry.npmjs.org/ansi-styles"
+          },
+          "end": {
+            "kind": "unknown",
+            "source": "https://registry.npmjs.org/ansi-styles"
+          }
+        }
+      }
+    },
+    {
+      "name": "debug",
+      "versions": [
+        "4.4.2"
+      ],
+      "sources": [
+        "https://registry.npmjs.org/debug"
+      ],
+      "notes": "Window start read from the registry's publish time; the end is null because npm records no per-version removal time. No longer served as of 2026-08-19T06:58:27.287692+00:00: 4.4.2 — so removal happened at or before that instant, which is an upper bound on the end and not the end.",
+      "window": {
+        "start": "2025-09-08T13:12:39.973000+00:00",
+        "end": null,
+        "provenance": {
+          "start": {
+            "kind": "derived",
+            "source": "https://registry.npmjs.org/debug"
+          },
+          "end": {
+            "kind": "unknown",
+            "source": "https://registry.npmjs.org/debug"
+          }
+        }
+      }
+    },
+    {
+      "name": "chalk",
+      "versions": [
+        "5.6.1"
+      ],
+      "sources": [
+        "https://registry.npmjs.org/chalk"
+      ],
+      "notes": "Window start read from the registry's publish time; the end is null because npm records no per-version removal time. No longer served as of 2026-08-19T06:58:27.287692+00:00: 5.6.1 — so removal happened at or before that instant, which is an upper bound on the end and not the end.",
+      "window": {
+        "start": "2025-09-08T13:13:05.239000+00:00",
+        "end": null,
+        "provenance": {
+          "start": {
+            "kind": "derived",
+            "source": "https://registry.npmjs.org/chalk"
+          },
+          "end": {
+            "kind": "unknown",
+            "source": "https://registry.npmjs.org/chalk"
+          }
+        }
+      }
+    }
+  ],
+  "sources": [
+    "https://www.aikido.dev/blog/npm-debug-and-chalk-packages-compromised",
+    "https://api.osv.dev/v1/vulns/MAL-2025-46969",
+    "https://www.bleepingcomputer.com/news/security/hackers-hijack-npm-packages-with-2-billion-weekly-downloads-in-supply-chain-attack/",
+    "https://github.com/advisories/GHSA-2v46-p5h4-248w",
+    "https://api.osv.dev/v1/vulns/MAL-2025-46974",
+    "https://github.com/github/advisory-database/issues/6099",
+    "https://github.com/advisories/GHSA-8mgj-vmr8-frr6",
+    "https://github.com/debug-js/debug/security/advisories/GHSA-4x49-vf9v-38px",
+    "https://api.osv.dev/v1/vulns/MAL-2025-46967",
+    "https://github.com/advisories/GHSA-p5rr-crjh-x7gr"
+  ],
+  "notes": "Derived, not transcribed: package names from the Aikido writeup, malicious versions from OSV's MAL- records, window starts from the registry's own publish times. Ends are null because npm records no per-version removal time. Coverage is partial — the September 2025 wave named more packages than the three here, so a CLEAN verdict under this feed means 'not found among these three'."
+}
