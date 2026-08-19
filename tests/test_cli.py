@@ -1239,17 +1239,143 @@ class TestBundledFeeds:
         for name in names:
             load_advisory(name)
 
-    def test_a_real_incident_feed_declares_partial_coverage(self):
-        """The September 2025 wave named more packages than any feed here lists.
+    # The payload, not the shape. An earlier pair of tests locked only the metadata,
+    # and setting chalk to 5.6.2 — the *fixed* version — left the whole suite green.
+    # These are historical facts and will not change: OSV's MAL-2025-46969 names
+    # 5.6.1, and the registry dates it 2025-09-08T13:13:05.239Z.
+    SEPTEMBER_2025 = {
+        "ansi-regex": ("6.2.1", "2025-09-08T13:14:15.663000+00:00"),
+        "ansi-styles": ("6.2.2", "2025-09-08T13:12:10.343000+00:00"),
+        "chalk": ("5.6.1", "2025-09-08T13:13:05.239000+00:00"),
+        "debug": ("4.4.2", "2025-09-08T13:12:39.973000+00:00"),
+        "wrap-ansi": ("9.0.1", "2025-09-08T13:14:36.637000+00:00"),
+    }
 
-        Declaring `complete` would let a scan prove absence it cannot prove, which is
-        the failure this whole tool is built around.
+    def test_the_incident_feed_carries_the_versions_osv_names(self):
+        from deptrail.ioc import load_advisory
+
+        advisory = load_advisory("npm-2025-09-08-chalk-debug")
+        by_name = {p.name: p for p in advisory.packages}
+        # Twenty, because an earlier attempt stopped at eighteen and missed two.
+        assert len(advisory.packages) == 20
+        for name, (version, _) in self.SEPTEMBER_2025.items():
+            assert by_name[name].versions == (version,), name
+
+    def test_every_window_start_is_the_registry_publish_time(self):
+        from datetime import datetime
+
+        from deptrail.ioc import load_advisory
+
+        advisory = load_advisory("npm-2025-09-08-chalk-debug")
+        by_name = {p.name: p for p in advisory.packages}
+        for name, (_, published) in self.SEPTEMBER_2025.items():
+            window = by_name[name].window or advisory.window
+            assert window.start == datetime.fromisoformat(published), name
+            assert window.end is None, name
+            assert window.provenance.start.kind == "derived", name
+            assert name in window.provenance.start.source, name
+
+    def test_a_real_incident_feed_stays_partial(self):
+        """`complete` would let a scan prove an absence it cannot prove.
+
+        A contiguous OSV id block is strong evidence of one incident, not proof that
+        no twenty-first record exists under a distant id.
         """
         from deptrail.ioc import load_advisory
 
         advisory = load_advisory("npm-2025-09-08-chalk-debug")
         assert advisory.coverage == "partial"
-        assert advisory.window.end is None
-        # Derived rather than typed: the whole point of the feed.
-        assert advisory.window.provenance.start.kind == "derived"
-        assert "registry.npmjs.org" in advisory.window.provenance.start.source
+        assert advisory.coverage_warning
+
+
+class TestAnUnreadableSnapshotIsNeverClean:
+    """The detector that keeps "could not read it" out of "nothing was found".
+
+    Tested under a `complete` feed on purpose. Under the shipped `partial` one the
+    exit code is 2 whatever happens, so an assertion that an unreadable lockfile
+    exits 2 would hold with this detector deleted — the control below is what makes
+    the rest of the class mean anything.
+    """
+
+    ADVISORY = {
+        "schema_version": 2,
+        "id": "TEST-COMPLETE-0001",
+        "name": "Complete-coverage fixture, so absence can be established",
+        "ecosystem": "npm",
+        "coverage": "complete",
+        "window": {
+            "start": "2025-09-08T13:13:05.239000+00:00",
+            "end": "2025-09-08T14:47:54.000000+00:00",
+            "provenance": {
+                "start": {"kind": "derived", "source": "https://registry.npmjs.org/chalk"},
+                "end": {"kind": "operator-supplied", "source": "https://a.test/fixture"},
+            },
+        },
+        "packages": [{"name": "chalk", "versions": ["5.6.1"],
+                      "sources": ["https://registry.npmjs.org/chalk"]}],
+        "sources": ["https://a.test/fixture"],
+    }
+
+    def repo(self, tmp_path, lockfile):
+        """One commit inside the window, holding whatever bytes are given."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        target = repo / "package-lock.json"
+        if lockfile is None:
+            # A directory where the lockfile should be. Git cannot record an empty
+            # one, so it needs a file inside — which is the point: the walker looks
+            # for a path whose basename is package-lock.json and there is none.
+            target.mkdir()
+            (target / "inner.json").write_text("{}")
+        else:
+            target.write_bytes(lockfile)
+        subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(repo), "-c", "user.email=a@b",
+                        "-c", "user.name=a", "commit", "-q", "-m", "lockfile",
+                        "--date=2025-09-08T14:00:00+00:00"],
+                       check=True, env={**os.environ,
+                                        "GIT_COMMITTER_DATE": "2025-09-08T14:00:00+00:00"})
+        return repo
+
+    def scan(self, tmp_path, lockfile):
+        advisory = tmp_path / "advisory.json"
+        advisory.write_text(json.dumps(self.ADVISORY))
+        repo = self.repo(tmp_path, lockfile)
+        return main(["scan", "--ioc", str(advisory), "--repo", str(repo)])
+
+    CLEAN = json.dumps({"lockfileVersion": 3,
+                        "packages": {"node_modules/chalk": {"version": "5.6.0"}}}).encode()
+
+    def test_a_readable_clean_tree_exits_zero(self, tmp_path, capsys):
+        """The control. Without it every case below passes for free."""
+        assert self.scan(tmp_path, self.CLEAN) == EXIT_CLEAN
+
+    def test_the_malicious_version_is_still_found(self, tmp_path, capsys):
+        pinned = json.dumps({"lockfileVersion": 3,
+                             "packages": {"node_modules/chalk": {"version": "5.6.1"}}})
+        assert self.scan(tmp_path, pinned.encode()) == EXIT_ROTATE
+
+    @pytest.mark.parametrize("shape,lockfile", [
+        ("empty", b""),
+        ("truncated", b'{"lockfileVersion": 3, "packages": {'),
+        ("json but not a lockfile", b'{"hello": "world"}'),
+        ("not utf-8", bytes([0xff, 0xfe, 0x00, 0x01])),
+    ])
+    def test_an_unreadable_tree_cannot_prove_absence(self, tmp_path, shape, lockfile,
+                                                     capsys):
+        # Exit 2, not 0: "looked and could not prove absence". A 0-byte
+        # package-lock.json is not hypothetical — one turned up in the wild, committed
+        # by accident, in the repository used to validate this tool.
+        assert self.scan(tmp_path, lockfile) == EXIT_INCOMPLETE, shape
+
+    def test_a_tree_with_no_lockfile_at_all_still_exits_zero(self, tmp_path, capsys):
+        """Recorded rather than asserted as correct.
+
+        A directory named `package-lock.json` leaves no path whose basename is a
+        lockfile, so the walker finds nothing — and "this repository has no lockfile"
+        exits 0 with no caveat, which is #22. It is a different case from an
+        unreadable lockfile and it is why #22 is still open; pinning it here means a
+        change to that behaviour has to be deliberate.
+        """
+        assert self.scan(tmp_path, None) == EXIT_CLEAN
