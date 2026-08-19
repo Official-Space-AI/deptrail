@@ -43,6 +43,7 @@ from . import __version__
 from .demo import advisory_path, build, runs_provider, secrets_provider
 from .grading import RunHistory, annotate_installs, runs_from_github
 from .ioc import (
+    COVERAGE_VALUES,
     Advisory,
     InstallableWindow,
     IocError,
@@ -52,6 +53,13 @@ from .ioc import (
     parse_advisory,
 )
 from .org import OrgReport, render_report, scan_organization
+from .registry import (
+    PublishRecord,
+    RegistryError,
+    advisory_from_records,
+    fetch_packument,
+    publish_records,
+)
 from .report import render_html
 
 # Codes 0 and 1 are verdicts about evidence that was read; everything above says
@@ -445,6 +453,98 @@ def cmd_advisory_init(args: argparse.Namespace) -> int:
     return EXIT_CLEAN
 
 
+def _package_specs(args: argparse.Namespace) -> dict[str, tuple[str, ...]]:
+    """Read `name@version` specs from flags and from a file, into one map.
+
+    A scoped name contains an `@` of its own, so the split is on the last one:
+    `@babel/core@7.0.0` is `@babel/core` at `7.0.0`.
+    """
+    lines = list(args.package or ())
+    if args.packages_from:
+        text = Path(args.packages_from).read_text(encoding="utf-8")
+        lines += [line.split("#", 1)[0].strip() for line in text.splitlines()]
+
+    wanted: dict[str, list[str]] = {}
+    for line in lines:
+        spec = line.strip()
+        if not spec:
+            continue
+        name, sep, version = spec.rpartition("@")
+        if not sep or not name or not version:
+            raise ValueError(f"{spec!r}: expected name@version, e.g. chalk@5.6.1")
+        wanted.setdefault(name, [])
+        # The same version twice is a transcription artefact, not a second wave.
+        if version not in wanted[name]:
+            wanted[name].append(version)
+    if not wanted:
+        raise ValueError("no packages given; pass --package name@version "
+                         "or --packages-from FILE")
+    return {name: tuple(versions) for name, versions in wanted.items()}
+
+
+def cmd_advisory_derive(args: argparse.Namespace) -> int:
+    """Build an advisory whose window starts come from the registry, not a keyboard.
+
+    This is the only command in the tool that touches the network, and it is
+    deliberately not a scan: the derived advisory is written to a file a human reads
+    and then passes to `scan`. A verdict must not depend on a registry the incident
+    may itself have taken down, and a window that differs between two runs of the
+    same scan is not evidence.
+    """
+    try:
+        wanted = _package_specs(args)
+    except ValueError as e:
+        print(e, file=sys.stderr)
+        return EXIT_BAD_INPUT
+    except OSError as e:
+        print(f"could not read {args.packages_from}: {e}", file=sys.stderr)
+        return EXIT_TRANSIENT
+
+    records: tuple[PublishRecord, ...] = ()
+    for name, versions in wanted.items():
+        try:
+            records += publish_records(fetch_packument(name), name, versions)
+        except RegistryError as e:
+            # Not EXIT_BAD_INPUT even when the cause is a wrong version string: the
+            # importer reached out and got an answer it cannot build on, and the
+            # message says which. Guessing on the caller's behalf is what this
+            # command exists to stop.
+            print(f"{e}", file=sys.stderr)
+            return EXIT_TRANSIENT
+
+    body = advisory_from_records(
+        records, identifier=args.id, name=args.name,
+        sources=tuple(args.source), coverage=args.coverage, notes=args.notes,
+    )
+    text = json.dumps(body, indent=2, ensure_ascii=False) + "\n"
+
+    # Written only after it validates. A file that exists but cannot be loaded is
+    # worse than none: it invites a retry of the scan rather than of the import.
+    try:
+        parse_advisory(text)
+    except IocError as e:
+        print(f"the derived advisory does not validate, which is a bug in the "
+              f"importer rather than in your input: {e}", file=sys.stderr)
+        return EXIT_TRANSIENT
+
+    if args.output:
+        try:
+            Path(args.output).write_text(text, encoding="utf-8")
+        except OSError as e:
+            return _write_failure(args.output, e)
+        print(f"wrote {args.output}", file=sys.stderr)
+    else:
+        print(text, end="")
+
+    for record in records:
+        state = "still served" if record.still_served else "withdrawn"
+        print(f"  {record.name}@{record.version} published "
+              f"{record.published_at.isoformat()} ({state})", file=sys.stderr)
+    print("every window start is a registry publish time; every end is null, "
+          "because no registry records a removal time", file=sys.stderr)
+    return EXIT_CLEAN
+
+
 def cmd_advisory_validate(args: argparse.Namespace) -> int:
     """Say whether an advisory is usable, before a scan depends on it."""
     try:
@@ -534,6 +634,26 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--source", help="URL the claim comes from")
     init.add_argument("--output", help="write here instead of stdout")
     init.set_defaults(func=cmd_advisory_init)
+
+    derive = advisory_subs.add_parser(
+        "derive", help="build an advisory from registry publish times (needs network)")
+    derive.add_argument("--package", action="append", metavar="NAME@VERSION",
+                        help="a compromised package and exact version; repeat for several")
+    derive.add_argument("--packages-from", metavar="FILE",
+                        help="read NAME@VERSION lines from a file; '#' starts a comment")
+    derive.add_argument("--id", required=True,
+                        help="the advisory's own identifier, e.g. GHSA-xxxx")
+    derive.add_argument("--name", required=True,
+                        help="one line a responder will recognise months later")
+    derive.add_argument("--source", action="append", required=True,
+                        help="URL the version list comes from; repeat for several")
+    derive.add_argument("--coverage", choices=COVERAGE_VALUES, default="partial",
+                        help="'partial' unless this advisory names every compromised "
+                             "package, because only 'complete' can prove absence")
+    derive.add_argument("--notes", help="anything a responder needs that the fields "
+                                        "do not carry")
+    derive.add_argument("--output", help="write here instead of stdout")
+    derive.set_defaults(func=cmd_advisory_derive)
 
     check = advisory_subs.add_parser(
         "validate", help="check an advisory before a scan depends on it")
