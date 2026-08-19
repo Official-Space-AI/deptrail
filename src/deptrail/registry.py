@@ -340,3 +340,113 @@ def withdrawn_versions(packument: dict) -> tuple[str, ...]:
     if not isinstance(times, dict) or not isinstance(served, dict):
         return ()
     return tuple(sorted(v for v in times if v not in _NOT_A_VERSION and v not in served))
+def _entry_notes(package: str, versions: list[str], moment: datetime,
+                 records: tuple[PublishRecord, ...], derived_at: str) -> str:
+    """What is true of this entry, per version rather than as one sweeping claim."""
+    mine = {r.version: r for r in records if r.name == package and r.published_at == moment}
+    served = sorted(v for v in versions if mine[v].still_served)
+    gone = sorted(v for v in versions if not mine[v].still_served)
+    relabelled = sorted(v for v in versions if mine[v].dated_from not in ("", v))
+
+    parts = ["Window start read from the registry's publish time; the end is null "
+             "because npm records no per-version removal time."]
+    if served:
+        parts.append(f"Still served as of {derived_at}: {', '.join(served)}.")
+    if gone:
+        parts.append(
+            f"No longer served as of {derived_at}: {', '.join(gone)} — so removal "
+            "happened at or before that instant, which is an upper bound on the end "
+            "and not the end.")
+    if relabelled:
+        detail = ", ".join(f"{v} dated from the earlier key {mine[v].dated_from!r}"
+                           for v in relabelled)
+        parts.append(
+            f"npm re-keyed a legacy version here, so the later entry is the "
+            f"re-keying instant rather than the publish: {detail}.")
+    return " ".join(parts)
+
+
+def advisory_from_records(records: tuple[PublishRecord, ...], *, identifier: str,
+                          name: str, sources: tuple[str, ...],
+                          coverage: str = "partial",
+                          notes: str | None = None,
+                          derived_at: datetime | None = None) -> dict:
+    """Assemble an advisory whose every window start is a registry publish time.
+
+    Pure: it makes no request, so the shape this produces can be tested without a
+    network and the request that produced ``records`` can be tested separately.
+
+    Versions of one package published at the same instant share an entry. Versions
+    published at different instants become separate entries, which is what the
+    schema calls a wave — the September 2025 compromise published ``ansi-styles``
+    6.2.2 at 13:12:10, ``debug`` 4.4.2 at 13:12:39 and ``chalk`` 5.6.1 at 13:13:05,
+    and collapsing those into one start would report each package as installable
+    before it existed.
+
+    Every ``end`` is ``null``. No removal time is recorded anywhere in the registry,
+    and the whole point of this importer is to stop that blank being filled in by
+    hand with something plausible.
+    """
+    if not records:
+        raise RegistryError("no versions to derive a window from")
+    # Stamped into the notes: the withdrawn/served split below is a claim about one
+    # instant, and a reader months later cannot weigh it without knowing which.
+    derived_at = (derived_at or datetime.now(timezone.utc)).isoformat()
+
+    waves: dict[tuple[str, datetime], list[str]] = {}
+    for record in records:
+        waves.setdefault((record.name, record.published_at), []).append(record.version)
+
+    # The advisory window has to contain every package window, so it opens at the
+    # earliest publish instant among them.
+    earliest = min(moment for _, moment in waves)
+    opener = next(pkg for pkg, moment in waves if moment == earliest)
+
+    def window(moment: datetime, package: str) -> dict:
+        source = packument_url(package)
+        return {
+            "start": moment.isoformat(),
+            "end": None,
+            "provenance": {
+                # Read from this packument's `time` map, which keeps the entry after
+                # the version is withdrawn.
+                "start": {"kind": "derived", "source": source},
+                # The same document is where the absence of a removal time was
+                # observed, which is why it is cited for a bound that does not exist.
+                "end": {"kind": "unknown", "source": source},
+            },
+        }
+
+    packages = []
+    for (package, moment), versions in sorted(waves.items(), key=lambda kv: (kv[0][1], kv[0][0])):
+        served = [r for r in records if r.name == package and r.published_at == moment
+                  and r.still_served]
+        entry = {
+            "name": package,
+            "versions": sorted(versions),
+            "sources": [packument_url(package)],
+            "notes": _entry_notes(package, versions, moment, records, derived_at),
+        }
+        # Always, not only when it differs from the advisory's. Two packages published
+        # in the same millisecond — a scripted mass-publish, which is what Shai-Hulud
+        # was — would otherwise both inherit a window citing whichever packument sorted
+        # first, so one package's start would be sourced to another's document. The
+        # loader accepts an explicit copy: `(name, start)` is unchanged, so it is not
+        # read as a second wave.
+        entry["window"] = window(moment, package)
+        packages.append(entry)
+
+    return {
+        "schema_version": 2,
+        "id": identifier,
+        "name": name,
+        "ecosystem": "npm",
+        "coverage": coverage,
+        "window": window(earliest, opener),
+        "packages": packages,
+        "sources": list(sources),
+        "notes": notes or (
+            "Window starts derived from registry publish times; ends left unknown "
+            "because no registry records a removal time."
+        ),
+    }

@@ -171,6 +171,41 @@ under a `partial` feed as "not found among the packages this feed lists".
 
 ## Writing a feed on incident day
 
+If you have the package and version list, do not transcribe the timestamps —
+`deptrail advisory derive` reads them out of the registry for you:
+
+```bash
+deptrail advisory derive \
+  --package chalk@5.6.1 \
+  --package debug@4.4.2 \
+  --package ansi-styles@6.2.2 \
+  --id GHSA-... \
+  --name "September 2025 npm maintainer phishing" \
+  --source https://github.com/advisories/GHSA-... \
+  --output incident.json
+```
+
+For a wave naming many packages, put one `name@version` per line in a file and
+pass `--packages-from`; `#` starts a comment.
+
+Every `window.start` it writes is a `time[version]` entry read from that package's
+packument, cited by URL and marked `derived`. Every `end` is `null` and marked
+`unknown`, because no registry records a removal time. Versions of one package
+published at different instants become separate waves, which is what the September
+2025 compromise actually looks like: `ansi-styles` 6.2.2 at 13:12:10, `debug` 4.4.2
+at 13:12:39, `chalk` 5.6.1 at 13:13:05.
+
+A version the registry has no publish time for stops the import rather than being
+skipped. A malicious version silently missing from a feed is the difference between
+a repository being reported and being cleared.
+
+**This is the only command that touches the network, and it is not a scan.** It
+writes a file you read and then pass to `scan`. A verdict must not depend on a
+registry the incident may itself have taken down, and a window that differs between
+two runs of the same scan is not evidence.
+
+### By hand
+
 1. Copy the block at the top of this page.
 2. Set `id`, `name`, and the `window`. Read the start from `https://registry.npmjs.org/<package>` → `time[<version>]`; leave `end` as `null` unless somebody recorded a removal. Record `derived` plus the packument URL for that start, and `unknown` plus the source you checked for the open end. Do not use the attacker-activity times the advisory leads with (see above).
 3. For each named package, add `name`, exact `versions`, and the URL you read it from.

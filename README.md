@@ -98,7 +98,25 @@ Upstream IOC feeds (OSV malicious-packages, vendor advisories, wormsign.io) are 
 
 ## Real use
 
-On incident day, start from the advisory — it is the only thing you have to write:
+On incident day, start from the advisory — it is the only thing you have to write.
+If you already have the package and version list, do not transcribe the timestamps:
+
+```bash
+deptrail advisory derive \
+  --package chalk@5.6.1 --package debug@4.4.2 --package ansi-styles@6.2.2 \
+  --id GHSA-... \
+  --name "September 2025 npm maintainer phishing" \
+  --source https://github.com/advisories/GHSA-... \
+  --output incident.json
+```
+
+Each window start is read from that package's registry publish time and cited by
+URL; each end is left `null`, because no registry records a removal time. This is
+the one command that touches the network, and it is not a scan — it writes a file
+you then pass to `scan`, so a verdict never depends on a registry the incident may
+itself have taken down.
+
+Writing one by hand instead:
 
 `--id` is the advisory's own id, never one you invent, and `--end-unknown` records
 that no registry publishes a removal time — see below.
