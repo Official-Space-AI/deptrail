@@ -469,6 +469,13 @@ def _package_specs(args: argparse.Namespace) -> dict[str, tuple[str, ...]]:
         name, sep, version = spec.rpartition("@")
         if not sep or not name or not version:
             raise ValueError(f"{spec!r}: expected name@version, e.g. chalk@5.6.1")
+        # Not stripped into shape: the probe would then validate a name the fetch does
+        # not use, so "chalk @5.6.1" passed the check and came back 404 at exit 4 —
+        # a typo reported as the registry's problem.
+        if name != name.strip() or version != version.strip():
+            raise ValueError(
+                f"{spec!r}: has whitespace inside it; write it as "
+                f"{name.strip()}@{version.strip()}")
         wanted.setdefault(name, [])
         # The same version twice is a transcription artefact, not a second wave.
         if version not in wanted[name]:
@@ -511,7 +518,7 @@ def _check_derive_inputs(wanted: dict[str, tuple[str, ...]],
         parse_advisory(json.dumps(probe))
     except IocError as e:
         hint = ""
-        if any(name != name.lower() for name in wanted):
+        if "npm names are lowercase" in str(e):
             hint = (" This advisory schema accepts only lowercase npm names, and "
                     "some published packages are not lowercase. Do not lowercase the "
                     "name to get past this: a lowercase spelling can be a different "
@@ -549,7 +556,9 @@ def cmd_advisory_derive(args: argparse.Namespace) -> int:
         # A path that is wrong is the caller's move, not a retry — the same split
         # `_write_failure` already makes twelve lines up.
         print(f"could not read {args.packages_from}: {e}", file=sys.stderr)
-        return EXIT_BAD_INPUT if e.errno in _PATH_IS_WRONG else EXIT_TRANSIENT
+        wrong_path = (e.errno in _PATH_IS_WRONG
+                      or Path(args.packages_from).is_dir())
+        return EXIT_BAD_INPUT if wrong_path else EXIT_TRANSIENT
 
     # Everything the caller typed is checked before a single request goes out. A
     # rejected --source used to surface after 180 fetches, as "a bug in the importer".

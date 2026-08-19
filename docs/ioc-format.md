@@ -165,9 +165,11 @@ queries = advisory.plan().queries              # one WindowQuery per package
 times and therefore could only return CLEAN — the exact failure this document now
 warns about. Real feeds need per-version publish and removal times, which belong
 to an importer reading the registry and OSV rather than to hand-copying; that
-importer is tracked as its own work. Until it lands, write the feed for the
-incident you are responding to from the guidance above, and treat a CLEAN verdict
-under a `partial` feed as "not found among the packages this feed lists".
+importer for upstream feeds (OSV, vendor advisories) is tracked as its own work.
+The window starts it would fill in are available now — see `deptrail advisory
+derive` below — but the package and version list still comes from you, and a CLEAN
+verdict under a `partial` feed means "not found among the packages this feed
+lists".
 
 ## Writing a feed on incident day
 
@@ -190,8 +192,8 @@ pass `--packages-from`; `#` starts a comment.
 
 Every `window.start` it writes is a `time[version]` entry read from that package's
 packument, cited by URL and marked `derived`. Every `end` is `null` and marked
-`unknown`, because no registry records a removal time. Versions of one package
-published at different instants become separate waves, which is what the September
+`unknown`, because no registry records a removal time. Versions published at different instants become separate waves, whether they belong
+to one package or several, which is what the September
 2025 compromise actually looks like: `ansi-styles` 6.2.2 at 13:12:10, `debug` 4.4.2
 at 13:12:39, `chalk` 5.6.1 at 13:13:05.
 

@@ -340,6 +340,8 @@ def withdrawn_versions(packument: dict) -> tuple[str, ...]:
     if not isinstance(times, dict) or not isinstance(served, dict):
         return ()
     return tuple(sorted(v for v in times if v not in _NOT_A_VERSION and v not in served))
+
+
 def _entry_notes(package: str, versions: list[str], moment: datetime,
                  records: tuple[PublishRecord, ...], derived_at: str) -> str:
     """What is true of this entry, per version rather than as one sweeping claim."""
@@ -419,8 +421,6 @@ def advisory_from_records(records: tuple[PublishRecord, ...], *, identifier: str
 
     packages = []
     for (package, moment), versions in sorted(waves.items(), key=lambda kv: (kv[0][1], kv[0][0])):
-        served = [r for r in records if r.name == package and r.published_at == moment
-                  and r.still_served]
         entry = {
             "name": package,
             "versions": sorted(versions),
