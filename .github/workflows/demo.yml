@@ -27,8 +27,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      # Installed from the checkout the way the README's git+https line does, so
-      # what CI proves is what a reader is told to run.
+      # Installed from the checkout rather than from PyPI, so this job judges the
+      # commit in front of it. What a reader is told to run is `pip install deptrail`,
+      # and that path is proved at release time by the fresh-venv gate in release.yml.
       - run: pip install .
       - name: deptrail demo
         run: |

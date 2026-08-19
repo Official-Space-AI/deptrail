@@ -84,11 +84,48 @@ jobs:
             echo "::error::the wheel carries $shipped of $expected feeds"; exit 1; }
           echo "EXPECTED_FEEDS=$expected" >> "$GITHUB_ENV"
 
-      - name: The metadata must render on PyPI
-        # Renders the README and validates the metadata. It does not ask PyPI whether
-        # the version is acceptable — a local version like 0.1.0+x passes here and is
-        # rejected at upload.
+      - name: The metadata must be well formed
+        # Validates the metadata. It does *not* ask PyPI whether the version is
+        # acceptable — a local version like 0.1.0+x passes here and is rejected at
+        # upload — and, despite its name, it does not render this project's README
+        # either. See the next step.
         run: twine check --strict dist/*
+
+      # `twine check` maps text/markdown to no renderer at all
+      # (twine/commands/check.py: `"text/markdown": None  # Rendering cannot fail`),
+      # so on a markdown README it passes while proving nothing. It printed PASSED
+      # here with no markdown backend installed at all. The description *is* the
+      # pypi.org project page, and PyPI freezes it at upload — a broken one cannot be
+      # edited afterwards, only superseded by another release. So render it here with
+      # the library warehouse itself uses, against the artifact about to be uploaded.
+      - name: The project page must render, and its links must work off GitHub
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet "readme_renderer[md]"
+          python - <<'PY'
+          import email, glob, re, sys, zipfile
+          import readme_renderer.markdown as md
+
+          with zipfile.ZipFile(glob.glob("dist/*.whl")[0]) as z:
+              name = next(n for n in z.namelist() if n.endswith(".dist-info/METADATA"))
+              meta = email.message_from_bytes(z.read(name))
+
+          ctype = meta.get("Description-Content-Type", "")
+          if "markdown" not in ctype:
+              sys.exit(f"::error::unexpected description content type: {ctype!r}")
+
+          html = md.render(meta.get_payload(), variant="GFM")
+          if not html:
+              sys.exit("::error::the description does not render as markdown")
+
+          # Relative links resolve against pypi.org, where these paths do not exist.
+          # They look correct on GitHub, which is the only place an author sees them.
+          dead = sorted(set(re.findall(r'href="(?!https?://|mailto:|#)([^"]+)"', html)))
+          if dead:
+              sys.exit("::error::links dead on PyPI: " + ", ".join(dead))
+
+          print(f"description renders: {len(html)} chars, no relative links")
+          PY
 
       # Installed from the wheel, in an environment with nothing else in it — the same
       # position a judge or a responder is in. Testing the source tree instead would

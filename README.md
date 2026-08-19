@@ -4,7 +4,7 @@
 
 [![PyPI](https://img.shields.io/pypi/v/deptrail)](https://pypi.org/project/deptrail/)
 [![Python](https://img.shields.io/pypi/pyversions/deptrail)](https://pypi.org/project/deptrail/)
-[![License](https://img.shields.io/pypi/l/deptrail)](LICENSE)
+[![License](https://img.shields.io/pypi/l/deptrail)](https://github.com/Official-Space-AI/deptrail/blob/main/LICENSE)
 
 When a supply-chain attack hits npm (Shai-Hulud, chalk/debug, TanStack, Keyv, ...), every organization asks the same three questions the morning after the IOC drops:
 
@@ -16,48 +16,41 @@ Current-state scanners answer a different question — "are we infected **now**?
 
 **`CONFIRMED` / `LIKELY` / `POSSIBLE` / `NO EVIDENCE`**
 
-## How it differs from existing tools
-
-| Capability | Dependabot | worm-sign | **DepTrail** |
-|---|:---:|:---:|:---:|
-| Current lockfile malware check | ✅ | ✅ | byproduct |
-| Heuristic / payload detection | ✅ | ✅ | ✖ (their domain) |
-| Attack-window exposure from **lockfile git history** | ✖ | ✖ | ✅ core |
-| **CI run correlation** ("did it actually execute?") | ✖ | ✖ | ✅ core |
-| Org-wide incident timeline | current only | ✖ | ✅ |
-| Secrets rotation scope & checklist | ✖ | ✖ | ✅ |
-| Evidence grading | ✖ | ✖ | ✅ |
-
-Upstream IOC feeds (OSV malicious-packages, vendor advisories, wormsign.io) are **inputs**, not competitors — DepTrail consumes them.
-
 ## Try it in ten seconds
 
 No token, no network, no waiting — the bundled demo builds a mock infection and
 judges it with the production code path:
 
 ```bash
-pip install deptrail
+pip install deptrail          # Python 3.10+, no dependencies
 deptrail demo
 ```
 
 ```
+advisory GHSA-demo-0000-0000 — Demo incident — chalk compromised
 scanned 4 repo(s); worst grade CONFIRMED
+installable windows (one per judgment)
+  chalk@5.6.1: 2025-11-24T00:00:00+00:00 → 2025-11-26T23:59:59+00:00
+    provenance: start operator-supplied from https://example.test/demo-advisory; end
+        operator-supplied from https://example.test/demo-advisory
 
 timeline
   [LIKELY     ] docs-site: chalk@5.6.1 in package-lock.json 2025-11-25 12:00 → still pinned
-                run 4415 (Docs, push) built 8c555ebf ..., but the workflows at that commit install no dependencies
+                run 4415 (Docs, push) built 62741f22 at 2025-11-25T13:00:00+00:00, while 5.6.1 was still served, but the workflows at that commit install no dependencies
   [CONFIRMED  ] api-server: chalk@5.6.1 in package-lock.json 2025-11-25 14:30 → 2025-11-28 09:00
-                run 4412 (CI, push) built c6cd5f96 ..., while 5.6.1 was still served by the registry
+                run 4412 (CI, push) built 54676c71 at 2025-11-25T15:30:00+00:00, while 5.6.1 was still served by the registry
                 the workflows at that commit install dependencies, so 5.6.1 executed
 
 rotate (3 credential(s))
   [CONFIRMED  ] api-server: DEPLOY_KEY (run 4412) — named in .github/workflows/ci.yml at
-                c6cd5f96 (covers chalk@5.6.1)
-  [CONFIRMED  ] api-server: NPM_TOKEN (run 4412) — named in .github/workflows/ci.yml at c6cd5f96
+                54676c71 (covers chalk@5.6.1)
+  [CONFIRMED  ] api-server: NPM_TOKEN (run 4412) — named in .github/workflows/ci.yml at 54676c71
                 (covers chalk@5.6.1)
   [LIKELY     ] docs-site: ALGOLIA_KEY [DEVELOPER] — pinned in package-lock.json, and no
                 implicated run could have installed it — so any install happened outside CI;
-                Actions secrets are not automatically present on a developer machine, but ...
+                Actions secrets are not automatically present on a developer machine, but the
+                same values often are, so investigate that machine's credentials as well (covers
+                chalk@5.6.1)
 
 not judged (no lockfile this tool can read)
   mobile-app: yarn.lock: Yarn lockfiles are not parsed yet, so the versions this tree installed were not judged
@@ -86,6 +79,20 @@ retry, or to fix something:
 | `2` | looked, and could not prove absence | deepen the clone, or investigate by hand |
 | `3` | the request was malformed | fix the arguments or the advisory |
 | `4` | the tool could not run | retry; a tool or an API call failed |
+
+## How it differs from existing tools
+
+| Capability | Dependabot | worm-sign | **DepTrail** |
+|---|:---:|:---:|:---:|
+| Current lockfile malware check | ✅ | ✅ | byproduct |
+| Heuristic / payload detection | ✅ | ✅ | ✖ (their domain) |
+| Attack-window exposure from **lockfile git history** | ✖ | ✖ | ✅ core |
+| **CI run correlation** ("did it actually execute?") | ✖ | ✖ | ✅ core |
+| Org-wide incident timeline | current only | ✖ | ✅ |
+| Secrets rotation scope & checklist | ✖ | ✖ | ✅ |
+| Evidence grading | ✖ | ✖ | ✅ |
+
+Upstream IOC feeds (OSV malicious-packages, vendor advisories, wormsign.io) are **inputs**, not competitors — DepTrail consumes them.
 
 ## Real use
 
@@ -119,7 +126,7 @@ forgotten flag must not become a window that never closes.
 
 The template carries the definition of the window in the file itself, because that is the
 field most easily transcribed wrong and getting it backwards makes every scan report
-clean. Full format in [`docs/ioc-format.md`](docs/ioc-format.md).
+clean. Full format in [`docs/ioc-format.md`](https://github.com/Official-Space-AI/deptrail/blob/main/docs/ioc-format.md).
 
 Then judge:
 
@@ -146,10 +153,10 @@ the scan could not run at all — a green check must never mean "we could not lo
 
 ## How it decides
 
-- [`docs/grading.md`](docs/grading.md) — what each grade requires, and why
+- [`docs/grading.md`](https://github.com/Official-Space-AI/deptrail/blob/main/docs/grading.md) — what each grade requires, and why
   `POSSIBLE` still means rotate
-- [`docs/rotation.md`](docs/rotation.md) — how the credential list is scoped
-- [`docs/ioc-format.md`](docs/ioc-format.md) — how to write an advisory feed, and
+- [`docs/rotation.md`](https://github.com/Official-Space-AI/deptrail/blob/main/docs/rotation.md) — how the credential list is scoped
+- [`docs/ioc-format.md`](https://github.com/Official-Space-AI/deptrail/blob/main/docs/ioc-format.md) — how to write an advisory feed, and
   what a window means
 
 ## Limitations
@@ -192,13 +199,13 @@ read as a scan that found nothing.
 
 ## Status
 
-🏗 Under active development for the **2026 Korea Open Source Developer Contest**
-(submission: Aug 27, 2026). Released on PyPI as
+🏗 Built for the **2026 Korea Open Source Developer Contest** (submitted Aug 27,
+2026), and still under active development. Released on PyPI as
 [`deptrail`](https://pypi.org/project/deptrail/); `deptrail --version` reports
 which version wrote a given answer.
 
 Releases are published straight from a tag by
-[`release.yml`](.github/workflows/release.yml) over OIDC trusted publishing —
+[`release.yml`](https://github.com/Official-Space-AI/deptrail/blob/main/.github/workflows/release.yml) over OIDC trusted publishing —
 no API token exists to leak, and every artifact carries a PEP 740 attestation
 tying it to the commit and workflow that built it. Nothing is uploaded until the
 build proves the wheel installs into an empty environment, opens every bundled
@@ -210,4 +217,4 @@ npm 공급망 침해 사건(예: Shai-Hulud 웜)이 터진 다음 날 아침, �
 
 ## License
 
-[Apache-2.0](LICENSE)
+[Apache-2.0](https://github.com/Official-Space-AI/deptrail/blob/main/LICENSE)
