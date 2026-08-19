@@ -1221,3 +1221,35 @@ class TestVersion:
         )
         assert result.returncode == 0, result.stderr
         assert result.stdout.strip() == f"deptrail {deptrail.__version__}"
+
+
+class TestBundledFeeds:
+    """Every feed that ships must load, and say what it can prove.
+
+    A bundled feed is the one advisory a reader never writes, so nothing else would
+    catch a broken one until they ran it — and `deptrail feeds` lists a name whether
+    or not the file behind it parses.
+    """
+
+    def test_every_bundled_feed_loads(self):
+        from deptrail.ioc import bundled_feeds, load_advisory
+
+        names = bundled_feeds()
+        assert names, "no feeds ship at all"
+        for name in names:
+            load_advisory(name)
+
+    def test_a_real_incident_feed_declares_partial_coverage(self):
+        """The September 2025 wave named more packages than any feed here lists.
+
+        Declaring `complete` would let a scan prove absence it cannot prove, which is
+        the failure this whole tool is built around.
+        """
+        from deptrail.ioc import load_advisory
+
+        advisory = load_advisory("npm-2025-09-08-chalk-debug")
+        assert advisory.coverage == "partial"
+        assert advisory.window.end is None
+        # Derived rather than typed: the whole point of the feed.
+        assert advisory.window.provenance.start.kind == "derived"
+        assert "registry.npmjs.org" in advisory.window.provenance.start.source
