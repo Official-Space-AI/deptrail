@@ -1,48 +1,86 @@
 """Read the YAML subset that lockfiles are written in, and refuse the rest.
 
-``pnpm-lock.yaml`` and Yarn Berry's ``yarn.lock`` are YAML, so reading them means
-either taking a YAML dependency or writing a reader. This project ships no runtime
-dependencies on purpose — a supply-chain forensics tool that carries a supply-chain
-dependency argues against itself — so it writes one.
+``pnpm-lock.yaml`` and Yarn Berry's ``yarn.lock`` are YAML, so reading them means either
+taking a YAML dependency or writing a reader. This project ships no runtime dependencies
+on purpose — a supply-chain forensics tool that carries a supply-chain dependency argues
+against itself — so it writes one.
 
 A hand-rolled YAML reader is usually a bad trade, because YAML is large and a parser
-that is quietly wrong about a lockfile would report a tree as clean that was not.
-Two things make the trade defensible here.
+that is quietly wrong about a lockfile would report a tree as clean that was not. Three
+things make the trade defensible here.
 
-**The subset is measured, not guessed.** Across four real ``pnpm-lock.yaml`` v9 files
-and two Yarn Berry lockfiles — 39,112 lines at the largest — anchors, aliases, merge
-keys, explicit tags, tab indentation, flow collections spanning lines, and trailing
-comments do not occur once. What does occur is block mappings, block sequences,
-single-line flow collections, all three scalar styles, one block scalar, full-line
-comments, and more than one document in a file.
+**The subset is measured, not guessed.** Checked against 1,505 real lockfiles: every
+pnpm ``lockfileVersion`` in the wild (5.1, 5.3, 5.4, 6.0, 6.1, 9.0) and every Yarn Berry
+``__metadata.version`` (4, 5, 6, 8, 10), including 1,193 historical ``pnpm-lock.yaml``
+blobs from one repository's full history — the case that matters most, because this tool
+walks history rather than HEAD and meets five lockfile versions in one repository's past.
+Anchors, aliases, merge keys, explicit tags, tab indentation, flow collections spanning
+lines, and trailing comments do not occur once. What does occur is block mappings, block
+sequences, single-line flow collections, all three scalar styles, block scalars,
+full-line comments, and more than one document in a file.
 
-**Everything outside the subset raises.** ``YamlSubsetError`` reaches the caller as an
-unreadable snapshot, which leaves the repository INDETERMINATE rather than clean. This
-reader is allowed to answer "I cannot read this"; it is not allowed to guess.
+**Everything outside the subset raises, and raises something the caller already
+catches.** ``YamlSubsetError`` is a ``LockfileParseError``, which is what ``history.py``
+turns into an unreadable snapshot — and an unreadable snapshot leaves the repository
+INDETERMINATE rather than clean. It was a bare ``ValueError`` until a review pointed out
+that the sentence above was therefore false: the error would have travelled straight
+past the handler it names. This reader is allowed to answer "I cannot read this"; it is
+not allowed to guess, and it is not allowed to fail in a way its caller does not expect.
+
+**The claim is checked rather than asserted.** PyYAML is a test-only dependency, and the
+suite parses the corpus both ways on every run. The contract is not "this parser is
+correct" — that would be a claim about YAML at large, which this deliberately does not
+implement. It is: return what PyYAML returns, or raise. A silent disagreement fails the
+build.
 
 Scalars come back as strings, always, and mappings as plain dicts. YAML's plain-scalar
-typing would read ``lockfileVersion: 6.0`` as a float and turn the version ``1.10``
-into ``1.1``, which is the wrong answer for a file whose content is version
-identifiers. Callers that want a number convert one deliberately.
+typing would read ``lockfileVersion: 6.0`` as a float and turn the version ``1.10`` into
+``1.1``, which is the wrong answer for a file whose content is version identifiers.
+Callers that want a number convert one deliberately. Null is the exception, because
+absence is structure rather than text: ``key:``, ``key: null`` and ``key: ~`` all read as
+``None``.
+
+**A note for whoever writes the pnpm parser.** ``load_documents`` returns a list because
+``pnpm-lock.yaml`` really can hold more than one document, and nothing in the content
+tells them apart: measured on ``pnpm/pnpm``, both documents carry ``lockfileVersion:
+'9.0'`` and both have ``packages`` and ``snapshots``, while the first holds 9 packages
+and the second 1,678. Reaching for ``documents[0]`` there reports the 9 and calls the
+rest absent, which is a clean verdict for a tree that was never opened. Refuse a lockfile
+whose documents disagree about what they are, rather than picking one — refusing costs a
+verdict and says so, picking wrong invents one. ``load`` already refuses anything that is
+not exactly one document.
 """
 from __future__ import annotations
 
-# The one construct here that no lockfile in the corpus uses, kept because refusing it
-# would cost a verdict rather than a field: `deprecated: >-` folds, and the folded text
-# is not something this tool reads. Getting it slightly wrong is free; declining to
-# read the file it sits in is not.
+import string
+
+from .lockfile import LockfileParseError
+
+# Folded scalars (`>`) appear in no lockfile in the corpus, and are implemented rather
+# than refused because refusing would cost a whole repository its verdict over a
+# `deprecated:` message nothing reads. "Slightly wrong is free" was the original excuse
+# and it was wrong: what a careless fold drops is a line break, not whitespace, so this
+# is measured against PyYAML like everything else.
 _CHOMP = {"-": "strip", "+": "keep", "": "clip"}
 
-# YAML calls space and tab whitespace and nothing else, so `str.strip()` is wrong
-# here: it also removes U+00A0 and the rest of Unicode's spaces, which are ordinary
-# characters in a package name. Measured against PyYAML on a generated corpus, where
-# a trailing no-break space vanished from a scalar that PyYAML kept whole.
-_WS = " \t"
+# `str.strip()` is wrong here: it also removes U+00A0 and the rest of Unicode's spaces,
+# which are ordinary characters in a package name -- measured against PyYAML, where a
+# trailing no-break space vanished from a scalar PyYAML kept whole. Tab is left out for
+# the opposite reason: PyYAML rejects a tab in every plain-scalar position, so stripping
+# one would turn a file it calls broken into a value, and `_plain` refuses it instead.
+_WS = " "
 
 # YAML's null is absence rather than a value, which is why an empty `key:` already
 # reads as None here. Spelling that absence out loud should mean the same thing.
 # Numbers and booleans stay text: `1.10` is a version, not 1.1.
 _NULL = frozenset({"null", "Null", "NULL", "~"})
+
+# Recursion, not taste. Every nesting level costs two Python frames, so a 996-byte file
+# of nothing but `-` lines used to raise RecursionError -- which is not a
+# YamlSubsetError, so it walked straight through the caller's handler and killed the
+# scan on a file PyYAML reads without complaint. The deepest real lockfile measured is
+# seven levels, so this is an order of magnitude of headroom.
+_MAX_DEPTH = 64
 
 _ESCAPES = {
     '"': '"', "\\": "\\", "/": "/", "b": "\b", "f": "\f", "n": "\n",
@@ -51,7 +89,7 @@ _ESCAPES = {
 }
 
 
-class YamlSubsetError(ValueError):
+class YamlSubsetError(LockfileParseError):
     """The input is not in the subset of YAML this reader is measured against.
 
     Raised both for genuinely malformed YAML and for valid YAML using a construct
@@ -97,12 +135,21 @@ def load(text: str) -> object:
 def _prepare(text: str) -> list[str]:
     """Split into lines, drop a BOM, normalise line endings, and reject tab indents.
 
-    CRLF matters because this tool runs on Windows, where a checkout can rewrite line
-    endings; a trailing carriage return would otherwise become part of every scalar.
+    The one caller in this project pipes ``git show`` through ``subprocess`` with
+    ``text=True``, which already applies universal newlines, so CRLF never reaches here
+    by that route — the earlier comment claiming Windows checkouts made this load-bearing
+    described a path that does not exist. It is kept for the caller that reads a file
+    itself, where a trailing carriage return would otherwise end every scalar.
     """
     if text.startswith("﻿"):
         text = text[1:]
-    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    # `.replace().replace().split()` made three full copies of the text, which cost 1.5 GB
+    # peak on a 100 MB input; a MemoryError there is not a YamlSubsetError either. Almost
+    # every real file is LF or CRLF, and both are handled by dropping one trailing
+    # carriage return per line. Only a lone CR mid-line needs the expensive path.
+    lines = [line[:-1] if line[-1:] == "\r" else line for line in text.split("\n")]
+    if any("\r" in line for line in lines):
+        lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
     if lines and lines[-1] == "":
         # The newline that ends a file is a terminator, not an empty last line, and a
         # block scalar written `|+` would otherwise keep it as content.
@@ -157,6 +204,13 @@ def _holds_content(lines: list[str], start: int, end: int) -> bool:
     return any(_significant(line) for line in lines[start:end])
 
 
+def _deeper(depth: int, index: int) -> int:
+    depth += 1
+    if depth > _MAX_DEPTH:
+        raise YamlSubsetError(f"nested deeper than {_MAX_DEPTH} levels", index + 1)
+    return depth
+
+
 def _significant(line: str) -> bool:
     stripped = line.strip(_WS)
     return bool(stripped) and not stripped.startswith("#")
@@ -172,30 +226,34 @@ def _indent_of(line: str) -> int:
     return len(line) - len(line.lstrip(" "))
 
 
-def _parse_block(lines: list[str], index: int, end: int, indent: int) -> tuple[object, int]:
-    """One block node at column ``indent``, and the index just past it."""
+def _parse_block(lines: list[str], index: int, end: int, indent: int,
+                 depth: int = 0) -> tuple[object, int]:
+    """One block node at column ``indent``, and the index just past it.
+
+    ``depth`` is counted by whoever descends, not here: a mapping and the sequence it
+    dispatches to are the same level, and counting in both places halved the bound.
+    """
     index = _skip_blank(lines, index, end)
     if index >= end:
         return None, index
-    found = _indent_of(lines[index])
-    if found < indent:
-        return None, index
-    if found > indent:
-        raise YamlSubsetError(
-            f"indented {found} where {indent} was expected", index + 1)
+    # No indentation check here. Both callers already fix `indent` to this line's own
+    # column -- `load_documents` at zero, `_parse_value` from the line it just measured --
+    # so a mismatch is unreachable, and a guard nothing can reach is a guard nothing can
+    # test. A line at the wrong column is caught where it is actually read, by the loop
+    # in `_parse_mapping` or `_parse_sequence` and then by the trailing-content check.
     stripped = lines[index].strip(_WS)
     if stripped == "-" or stripped.startswith("- "):
-        return _parse_sequence(lines, index, end, indent)
+        return _parse_sequence(lines, index, end, indent, depth)
     if stripped[:1] in ("{", "["):
         # A whole node written in flow style. Without this the line goes to the mapping
         # parser, which splits `{"a": b, "c": d}` at its first `": "` and invents a key
         # named `{"a"` -- a different tree, returned without complaint.
         return _parse_flow_scalar(stripped, index + 1), index + 1
-    return _parse_mapping(lines, index, end, indent)
+    return _parse_mapping(lines, index, end, indent, depth)
 
 
-def _parse_mapping(lines: list[str], index: int, end: int,
-                   indent: int) -> tuple[dict, int]:
+def _parse_mapping(lines: list[str], index: int, end: int, indent: int,
+                   depth: int = 0) -> tuple[dict, int]:
     mapping: dict[str, object] = {}
     while True:
         index = _skip_blank(lines, index, end)
@@ -210,12 +268,15 @@ def _parse_mapping(lines: list[str], index: int, end: int,
             # lockfile means two answers to "what was installed" and no way to tell
             # which the package manager used.
             raise YamlSubsetError(f"duplicate key {key!r}", index + 1)
-        mapping[key], index = _parse_value(lines, index, end, indent, rest)
+        # Only a mapping key may own a sequence written at its own column; see
+        # `_parse_value`.
+        mapping[key], index = _parse_value(lines, index, end, indent, rest, depth,
+                                           owns_sibling_sequence=True)
     return mapping, index
 
 
-def _parse_sequence(lines: list[str], index: int, end: int,
-                    indent: int) -> tuple[list, int]:
+def _parse_sequence(lines: list[str], index: int, end: int, indent: int,
+                    depth: int = 0) -> tuple[list, int]:
     items: list[object] = []
     while True:
         index = _skip_blank(lines, index, end)
@@ -226,7 +287,14 @@ def _parse_sequence(lines: list[str], index: int, end: int,
         if stripped != "-" and not stripped.startswith("- "):
             break
         rest = stripped[2:].strip(_WS) if stripped != "-" else ""
-        if rest.startswith("- "):
+        if rest[:1] == "#":
+            # The whole value is a comment, so there is no value. Reading the comment
+            # text as the value is what happened before, which put `# see incident 4412`
+            # in a lockfile where a version belonged.
+            rest = ""
+        if rest == "-" or rest.startswith("- "):
+            # `- -` is a nested sequence exactly as `- - x` is; testing only for the
+            # trailing space let the bare form through as the string "-".
             raise YamlSubsetError(
                 "a sequence opened directly on a sequence item", index + 1)
         if rest and _looks_like_key(rest):
@@ -236,49 +304,62 @@ def _parse_sequence(lines: list[str], index: int, end: int,
             # mapping parser read the whole item, rather than a special case that reads
             # the first key and loses the rest -- which is how `- cpu: ppc64` followed by
             # `os: aix` would quietly become a mapping with one key instead of two.
+            # A tab here cannot survive to be rewritten: `_looks_like_key` runs `_plain`
+            # over the key, and `_plain` refuses a tab, so such a line has already been
+            # sent down the ordinary value path and refused there.
             column = len(line) - len(line.lstrip(" ")) + 1
             while line[column] == " ":
                 column += 1
             lines[index] = " " * column + line[column:]
-            value, index = _parse_mapping(lines, index, end, column)
+            value, index = _parse_mapping(lines, index, end, column, _deeper(depth, index))
         else:
-            value, index = _parse_value(lines, index, end, indent, rest)
+            value, index = _parse_value(lines, index, end, indent, rest, depth)
         items.append(value)
     return items, index
 
 
-def _parse_value(lines: list[str], index: int, end: int, indent: int,
-                 rest: str) -> tuple[object, int]:
+def _parse_value(lines: list[str], index: int, end: int, indent: int, rest: str,
+                 depth: int = 0, *,
+                 owns_sibling_sequence: bool = False) -> tuple[object, int]:
     """The value written after ``key:`` or ``-`` on line ``index``, and the next index.
 
     ``rest`` is what followed on the same line: empty means the value is either a block
     underneath or nothing at all.
+
+    ``owns_sibling_sequence`` is what separates a mapping key from a sequence item. YAML
+    lets a sequence sit at its own *key's* column, and a key has no other reading for
+    one. A sequence *item* does: the next `-` at the same column is the item after it,
+    not a child of it. Letting both take the same branch made `-` followed by `-` nest
+    instead of appending -- ten empty items became ten levels deep, and about a thousand
+    of them exhausted the interpreter's stack on a file PyYAML reads without complaint.
     """
     number = index + 1
-    if rest.startswith(("|", ">")) and _is_block_scalar_header(rest):
+    if rest[:1] == "#":
+        rest = ""
+    if rest[:1] in ("|", ">"):
+        if not _is_block_scalar_header(rest):
+            # `|` and `>` cannot open a plain scalar in YAML, so `k: |pipe` is not the
+            # string "|pipe"; it is a file this reader has no reading for.
+            raise YamlSubsetError(
+                f"not a block scalar header: {rest!r}", number)
         return _parse_block_scalar(lines, index, end, indent, rest)
     if rest:
-        value = _parse_flow_scalar(rest, number)
-        return value, index + 1
+        return _parse_flow_scalar(rest, number), index + 1
     following = _skip_blank(lines, index + 1, end)
     if following < end:
         found = _indent_of(lines[following])
         if found > indent:
-            return _parse_block(lines, following, end, found)
+            return _parse_block(lines, following, end, found, _deeper(depth, index))
         after = lines[following].strip(_WS)
-        if found == indent and (after == "-" or after.startswith("- ")):
-            # YAML lets a sequence sit at its own key's column, and there is no other
-            # owner it could belong to: a mapping and a sequence cannot be siblings at
-            # one indent. Refusing this shape cost a verdict for a file that is ordinary
-            # YAML, merely not the shape pnpm happens to write.
-            return _parse_sequence(lines, following, end, indent)
+        if (owns_sibling_sequence and found == indent
+                and (after == "-" or after.startswith("- "))):
+            return _parse_sequence(lines, following, end, indent, _deeper(depth, index))
     return None, index + 1
 
 
 def _is_block_scalar_header(rest: str) -> bool:
     """``|``, ``>-``, ``|+`` and friends — but not a plain scalar that starts with them."""
-    body = rest[1:]
-    return body in ("", "-", "+")
+    return rest[1:] in ("", "-", "+")
 
 
 def _parse_block_scalar(lines: list[str], index: int, end: int, indent: int,
@@ -309,30 +390,52 @@ def _parse_block_scalar(lines: list[str], index: int, end: int, indent: int,
 
 
 def _fold(body: list[str]) -> str:
-    """Folded (``>``) scalars: line breaks become spaces, blank lines become breaks.
+    """Folded (``>``) scalars: one break between ordinary lines becomes a space.
 
-    Lines that are themselves indented further are "more indented" in YAML's sense and
-    keep their breaks.
+    A line indented further than the block is "more indented" in YAML's sense: its break
+    is kept, and so is the break before it. Blank lines contribute a newline each.
+
+    Lines are emitted as they stand. Two earlier versions stripped trailing whitespace
+    -- first on every line, then only where the break folded -- and PyYAML disagreed with
+    both: it keeps those spaces, so a folded value came back shorter than the file said.
     """
     out: list[str] = []
-    for position, line in enumerate(body):
-        if not line.strip(_WS):
-            out.append("\n")
+    started = False
+    previous_more = False
+    blanks = 0
+    for line in body:
+        if not line:
+            # Emptiness is measured after the block's own indentation is removed, so a
+            # line of nothing but spaces is a *more indented* line whose content is
+            # those spaces -- not a break. Treating it as one dropped a line PyYAML kept.
+            blanks += 1
             continue
-        more_indented = line[:1] == " "
-        if out and not out[-1].endswith("\n") and not more_indented:
-            out.append(" ")
-        elif out and out[-1] == "\n" and position and body[position - 1].strip(_WS):
-            pass
-        out.append(line if more_indented else line.strip(_WS))
-        if more_indented:
-            out.append("\n")
-    text = "".join(out)
-    return text if text.endswith("\n") else text + "\n"
+        more = line[:1] in (" ", "\t")
+        if started:
+            if blanks:
+                out.append("\n" * blanks)
+            elif more or previous_more:
+                out.append("\n")
+            else:
+                out.append(" ")
+        elif blanks:
+            # Blank lines ahead of the first content line are breaks too; dropping them
+            # shortened the value by exactly the newlines a reader would see.
+            out.append("\n" * blanks)
+        out.append(line)
+        started, previous_more, blanks = True, more, 0
+    # `started` is always true by here: the caller only folds once it has found a line
+    # with content, and that line is non-empty after its indentation comes off.
+    out.append("\n" * (blanks + 1))
+    return "".join(out)
 
 
 def _is_explicit_key(text: str) -> bool:
-    """``? `` opening a key, as against a scalar or a key that merely starts with one."""
+    """``? `` opening a key in block context, not a scalar that merely starts with one.
+
+    Flow context does not go through here: there any ``?`` opens an explicit key, and
+    ``_scan_flow`` refuses it without asking about the space.
+    """
     return text[:1] == "?" and (len(text) == 1 or text[1] in _WS)
 
 
@@ -392,24 +495,39 @@ def _parse_flow_scalar(text: str, number: int) -> object:
 
 
 def _null_or(text: str) -> str | None:
-    return None if text in _NULL else text
+    # The empty scalar is null in YAML too, which is what `{a: }` writes. Returning ""
+    # made a flow mapping disagree with the block parser about the same absence.
+    return None if text == "" or text in _NULL else text
 
 
 def _plain(text: str, number: int) -> str:
     """An unquoted scalar, refused where YAML would read it as something else."""
+    if "\t" in text:
+        # PyYAML rejects a tab in every plain-scalar position -- before, inside and after
+        # -- and accepts one only inside a quoted scalar or a block scalar body, neither
+        # of which comes through here. Stripping it instead turned `a: b<TAB>` into the
+        # value "b", which is a file PyYAML calls broken read as one that is not.
+        raise YamlSubsetError("a tab cannot appear in a plain scalar", number)
+    if ": " in text or text.endswith(":"):
+        # A plain scalar cannot carry `": "` in YAML -- `deprecated: note: this is gone`
+        # is a broken file, not a value. Reading it as one meant accepting input PyYAML
+        # rejects, which is the direction this reader is not allowed to fail in.
+        raise YamlSubsetError(f"a plain scalar cannot contain ': ': {text!r}", number)
     if " #" in text:
         # Measured absent from every lockfile in the corpus, and ambiguous if it did
         # appear: YAML would cut a comment here and this reader would not.
         raise YamlSubsetError("a comment cannot follow a plain scalar here", number)
     if text[:1] in ("&", "*", "!"):
-        kind = {"&": "anchor", "*": "alias", "!": "tag"}[text[0]]
-        raise YamlSubsetError(f"{kind}s are outside the subset", number)
+        kind = {"&": "anchors", "*": "aliases", "!": "tags"}[text[0]]
+        raise YamlSubsetError(f"{kind} are outside the subset", number)
     if text.startswith("<<"):
         raise YamlSubsetError("merge keys are outside the subset", number)
     return text.strip(_WS)
 
 
-def _scan_flow(text: str, position: int, number: int) -> tuple[object, int]:
+def _scan_flow(text: str, position: int, number: int,
+               depth: int = 0) -> tuple[object, int]:
+    depth = _deeper(depth, number - 1)
     opener = text[position]
     closer = "}" if opener == "{" else "]"
     container: object = {} if opener == "{" else []
@@ -421,24 +539,34 @@ def _scan_flow(text: str, position: int, number: int) -> tuple[object, int]:
                 "a flow collection has to close on the line it opened", number)
         if text[position] == closer:
             return container, position + 1
+        if text[position] == "?":
+            # In flow context any `?` opens an explicit key, with or without the space
+            # that block context requires. Testing for the space missed `{?a: 1}`, which
+            # then parsed as an ordinary key named `?a`.
+            raise YamlSubsetError("explicit keys (`? `) are outside the subset", number)
         if opener == "{":
-            if _is_explicit_key(text[position:]):
-                raise YamlSubsetError(
-                    "explicit keys (`? `) are outside the subset", number)
-            quoted_key = text[position:position + 1] in ("'", '"')
-            key, position = _scan_flow_scalar(text, position, number, stop=":,}")
-            if not quoted_key and key in _NULL:
-                raise YamlSubsetError("a null mapping key is outside the subset", number)
+            quoted_key = text[position] in ("'", '"')
+            if quoted_key:
+                key, position = _scan_quoted(text, position, number)
+            else:
+                key, position = _scan_flow_key(text, position, number)
+                if key in _NULL or key == "":
+                    raise YamlSubsetError(
+                        "a null mapping key is outside the subset", number)
             position = _skip_spaces(text, position)
             if text[position:position + 1] != ":":
                 raise YamlSubsetError(f"flow mapping key {key!r} has no value", number)
             position = _skip_spaces(text, position + 1)
-            value, position = _scan_flow_item(text, position, number, closer)
+            value, position = _scan_flow_item(text, position, number, closer, depth)
             if key in container:
                 raise YamlSubsetError(f"duplicate key {key!r} in a flow mapping", number)
             container[key] = value
         else:
-            value, position = _scan_flow_item(text, position, number, closer)
+            value, position = _scan_flow_item(text, position, number, closer, depth)
+            if text[_skip_spaces(text, position):][:1] == ":":
+                raise YamlSubsetError(
+                    "a single-pair mapping inside a flow sequence is outside the subset",
+                    number)
             container.append(value)
         position = _skip_spaces(text, position)
         if text[position:position + 1] == ",":
@@ -448,10 +576,31 @@ def _scan_flow(text: str, position: int, number: int) -> tuple[object, int]:
                 f"expected ',' or {closer!r} in a flow collection", number)
 
 
-def _scan_flow_item(text: str, position: int, number: int,
-                    closer: str) -> tuple[object, int]:
+def _scan_flow_key(text: str, position: int, number: int) -> tuple[str, int]:
+    """An unquoted key inside a flow mapping.
+
+    A colon ends the key only where YAML says it does: followed by a space, by a flow
+    indicator, or by the end of the line. Stopping at *any* colon split
+    ``{node@runtime:26.7.0: 2}`` into the key ``node@runtime`` and the value
+    ``26.7.0: 2`` -- a package renamed without a word, on a key shape pnpm already
+    writes elsewhere in the same file.
+    """
+    start = position
+    while position < len(text):
+        character = text[position]
+        if character in ",{}[]":
+            break
+        if character == ":" and text[position + 1:position + 2] in ("", " ", ",", "}",
+                                                                    "]", "{", "["):
+            break
+        position += 1
+    return _plain(text[start:position], number), position
+
+
+def _scan_flow_item(text: str, position: int, number: int, closer: str,
+                    depth: int = 0) -> tuple[object, int]:
     if text[position:position + 1] in ("{", "["):
-        return _scan_flow(text, position, number)
+        return _scan_flow(text, position, number, depth)
     quoted = text[position:position + 1] in ("'", '"')
     value, position = _scan_flow_scalar(text, position, number, stop="," + closer)
     return (value if quoted else _null_or(value)), position
@@ -492,8 +641,10 @@ def _unescape(text: str, position: int, number: int, out: list[str]) -> int:
     if code in ("x", "u", "U"):
         width = {"x": 2, "u": 4, "U": 8}[code]
         digits = text[position + 2:position + 2 + width]
-        if len(digits) != width:
-            raise YamlSubsetError(rf"truncated \{code} escape", number)
+        if len(digits) != width or not all(c in string.hexdigits for c in digits):
+            # `int(digits, 16)` accepts " 123", "+123" and "1_23", so a malformed escape
+            # produced a wrong character in silence rather than an error.
+            raise YamlSubsetError(rf"truncated or non-hexadecimal \{code} escape", number)
         try:
             out.append(chr(int(digits, 16)))
         except ValueError as error:
