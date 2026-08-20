@@ -41,7 +41,13 @@ classifiers = [
 deptrail = "deptrail.cli:main"
 
 [project.optional-dependencies]
-dev = ["pytest"]
+# PyYAML is here and nowhere else on purpose. src/deptrail/yamlsubset.py reads the YAML
+# that pnpm and Yarn Berry lockfiles are written in, and the argument for writing that
+# reader instead of depending on one is that a supply-chain forensics tool should not
+# carry a supply-chain dependency. What replaces the dependency is a measurement: the
+# suite parses real lockfiles both ways and fails on any disagreement the reader did not
+# announce. A test guard asserts that importing deptrail never imports yaml.
+dev = ["pytest", "PyYAML"]
 
 [project.urls]
 Homepage = "https://github.com/Official-Space-AI/deptrail"
