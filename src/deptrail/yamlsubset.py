@@ -115,31 +115,46 @@ def _prepare(text: str) -> list[str]:
 
 
 def _document_ranges(lines: list[str]) -> list[tuple[int, int]]:
-    """Half-open index ranges, one per document.
+    """Half-open index ranges, one per document, empty documents included.
 
     Splitting before parsing is safe only because an unterminated quote is an error
-    here: no scalar can span lines, so a ``---`` in the first column is always a real
-    document marker and never content.
-    """
-    markers = [i for i, line in enumerate(lines)
-               if line.rstrip(_WS) in ("---", "...")]
-    if not markers:
-        return [(0, len(lines))]
+    here: no scalar can span lines, so a `---` in the first column is always a real
+    marker and never content.
 
-    ranges: list[tuple[int, int]] = []
-    # Anything ahead of the first marker is a document in its own right, but only if it
-    # holds something: a file opening with `---`, as pnpm's does, has no preamble.
-    first = markers[0]
-    if any(_significant(line) for line in lines[:first]):
-        ranges.append((0, first))
-    for position, marker in enumerate(markers):
-        end = markers[position + 1] if position + 1 < len(markers) else len(lines)
-        if lines[marker].rstrip(_WS) == "...":
-            # `...` ends a document without opening one; a following `---` opens the next.
+    An empty document is kept rather than dropped, because the count is load-bearing --
+    a caller reading a multi-document lockfile decides what to do per document, and
+    silently renumbering them hides one.
+    """
+    ranges: list[tuple[int, int, bool]] = []
+    start, opened, ended = 0, False, False
+    for index, line in enumerate(lines):
+        stripped = line.rstrip(_WS)
+        if line[:1] in ("-", ".") and stripped[:4] in ("--- ", "... "):
+            # `--- a: 1` is a document marker with a node on the same line. Left
+            # unrecognised the whole line goes to the mapping parser, which reads a key
+            # named `--- a` -- a package name that was never in the file.
+            raise YamlSubsetError(
+                "a node on a document marker line is outside the subset", index + 1)
+        if stripped not in ("---", "..."):
+            if ended and _significant(line):
+                # Dropping this quietly is how 25,430 lines would go missing.
+                raise YamlSubsetError(
+                    "content after a document was ended by `...`", index + 1)
             continue
-        ranges.append((marker + 1, end))
-    return [(start, end) for start, end in ranges
-            if any(_significant(line) for line in lines[start:end])]
+        held = _holds_content(lines, start, index)
+        if stripped == "..." and not (opened or held):
+            raise YamlSubsetError("`...` ends a document that never began", index + 1)
+        if opened or held:
+            ranges.append((start, index, opened))
+        start = index + 1
+        opened, ended = stripped == "---", stripped == "..."
+    if opened or _holds_content(lines, start, len(lines)):
+        ranges.append((start, len(lines), opened))
+    return [(begin, finish) for begin, finish, _ in ranges]
+
+
+def _holds_content(lines: list[str], start: int, end: int) -> bool:
+    return any(_significant(line) for line in lines[start:end])
 
 
 def _significant(line: str) -> bool:
@@ -246,8 +261,17 @@ def _parse_value(lines: list[str], index: int, end: int, indent: int,
         value = _parse_flow_scalar(rest, number)
         return value, index + 1
     following = _skip_blank(lines, index + 1, end)
-    if following < end and _indent_of(lines[following]) > indent:
-        return _parse_block(lines, following, end, _indent_of(lines[following]))
+    if following < end:
+        found = _indent_of(lines[following])
+        if found > indent:
+            return _parse_block(lines, following, end, found)
+        after = lines[following].strip(_WS)
+        if found == indent and (after == "-" or after.startswith("- ")):
+            # YAML lets a sequence sit at its own key's column, and there is no other
+            # owner it could belong to: a mapping and a sequence cannot be siblings at
+            # one indent. Refusing this shape cost a verdict for a file that is ordinary
+            # YAML, merely not the shape pnpm happens to write.
+            return _parse_sequence(lines, following, end, indent)
     return None, index + 1
 
 

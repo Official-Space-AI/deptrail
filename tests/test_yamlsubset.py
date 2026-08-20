@@ -162,6 +162,14 @@ UNCOVERED = {
     "document end marker": "a: 1\n...\n",
     "three documents": "---\na: 1\n---\nb: 2\n---\nc: 3\n",
     "leading document marker": "---\na: 1\n",
+    "nothing at all": "",
+    "blank lines only": "\n\n",
+    "comments only": "# nothing here\n",
+    "an empty document between markers": "---\n---\na: 1\n",
+    "a lone document marker": "---\n",
+    "a document restarted after an end marker": "a: 1\n...\n---\nb: 2\n",
+    "a sequence at its key's own column": "a:\n- x\n- y\n",
+    "a sequence at a nested key's column": "a:\n  b:\n  - x\nc: 1\n",
 }
 
 
@@ -259,6 +267,9 @@ REFUSED = {
     "scalar document": "just a string\n",
     "unindented continuation": "a: 1\n  b: 2\n",
     "mapping key with no value": "{a}\n",
+    "content after a document end": "a: 1\n...\nb: 2\n",
+    "a node on a document marker line": "--- a: 1\n",
+    "a document end that ends nothing": "...\n",
 }
 
 
@@ -317,6 +328,9 @@ class TestWhatItRefuses:
         "truncated unicode escape": "truncated",
         "comment after a plain scalar": "comment cannot follow a plain scalar",
         "unindented continuation": "content after the end of the document",
+        "content after a document end": "content after a document was ended",
+        "a node on a document marker line": "node on a document marker line",
+        "a document end that ends nothing": "ends a document that never began",
     }
 
     @pytest.mark.parametrize("name", sorted(REASONS))
@@ -353,6 +367,30 @@ class TestFindingsFromTheDifferentialRun:
     def test_an_explicit_key_is_refused_rather_than_read_as_a_key_named_question_mark(self):
         with pytest.raises(YamlSubsetError):
             load("{? long : 1}\n")
+
+    def test_content_after_a_document_end_is_not_dropped(self):
+        """`...` closed the document and everything after it was thrown away in silence.
+
+        In a lockfile that is the whole failure this project exists to prevent: the
+        packages that were installed sit in the part that went missing, and what comes
+        back is a shorter file that looks clean.
+        """
+        with pytest.raises(YamlSubsetError):
+            load_documents("a: 1\n...\nb: 2\n")
+
+    def test_a_file_with_nothing_in_it_holds_no_documents(self):
+        """`[None]` reads as one document whose content is null, which is a different
+        claim from "there is nothing here" -- and the wrong one for a truncated file."""
+        assert load_documents("") == []
+        assert load_documents("# only a comment\n") == []
+
+    def test_an_empty_document_still_counts(self):
+        """The count is what a caller iterates, so a dropped document is a dropped tree."""
+        assert load_documents("---\n---\na: 1\n") == [None, {"a": "1"}]
+
+    def test_a_sequence_may_sit_at_its_key_own_column(self):
+        """Ordinary YAML that pnpm happens not to write; refusing it cost a verdict."""
+        assert load("a:\n- x\n- y\n") == {"a": ["x", "y"]}
 
     def test_every_escape_means_what_yaml_says_it_means(self):
         # `\L` and `\P` were written as spaces here once, which is a wrong character
