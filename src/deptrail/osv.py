@@ -119,13 +119,10 @@ def malicious_releases(name: str, *, opener=None,
             continue
         versions = _affected_versions(record, name)
         if not versions:
-            # A malicious record naming no version cannot be acted on, and skipping it
-            # would drop the package from the advisory without saying so.
-            raise OsvError(
-                f"{name}: {identifier} names no affected version, so there is nothing "
-                "to judge a lockfile against. Read the record and supply the versions "
-                f"by hand: {OSV}/vulns/{identifier}"
-            )
+            # Skipping would drop the package from the advisory without saying so, but
+            # *why* there is nothing to take decides the operator's next move, and the
+            # two cases point opposite ways.
+            raise OsvError(_nothing_to_take(record, name, identifier))
         found.append(MaliciousRelease(
             package=name,
             versions=versions,
@@ -138,6 +135,51 @@ def malicious_releases(name: str, *, opener=None,
             ),
         ))
     return tuple(found)
+
+
+def _whole_package_ranges(record: dict, name: str) -> bool:
+    """Whether this record says every version of the package is malicious.
+
+    OSV writes that as a range introduced at ``0`` with no fix, which is how a
+    typosquat is recorded — the package was never anything but malicious, so there is
+    no version list to give. Measured: 5 of roughly 40 consecutive ``MAL-`` records
+    sampled from 2025-09 are this shape, so it is ordinary rather than exotic.
+    """
+    for affected in record.get("affected") or []:
+        if not isinstance(affected, dict):
+            continue
+        package = affected.get("package")
+        if not isinstance(package, dict) or package.get("name") != name:
+            continue
+        for entry in affected.get("ranges") or []:
+            if not isinstance(entry, dict):
+                continue
+            for event in entry.get("events") or []:
+                if isinstance(event, dict) and event.get("introduced") == "0":
+                    return True
+    return False
+
+
+def _nothing_to_take(record: dict, name: str, identifier: str) -> str:
+    """Say which of the two shapes this is, because the fix differs.
+
+    The earlier message said the record "names no affected version" in both cases.
+    For a whole-package record that is the opposite of true — it names every version
+    — and an operator who went to read it found a range and no list.
+    """
+    where = f"{OSV}/vulns/{identifier}"
+    if _whole_package_ranges(record, name):
+        return (
+            f"{name}: {identifier} says every version of this package is malicious, "
+            "not a specific one. This advisory schema matches lockfile entries by "
+            "exact version, so it cannot carry 'all of them'. List the versions the "
+            "registry published — https://registry.npmjs.org/" + name + " — and pass "
+            f"them with --package. Tracked as #68. Record: {where}"
+        )
+    return (
+        f"{name}: {identifier} names no affected version at all, so there is nothing "
+        f"to judge a lockfile against. Read the record and decide: {where}"
+    )
 
 
 def _affected_versions(record: dict, name: str) -> tuple[str, ...]:
