@@ -107,7 +107,56 @@ class TestMaliciousReleases:
     def test_a_malicious_record_naming_no_version_stops_the_import(self):
         # Skipping it would drop the package from the advisory without saying so.
         answers = {"chalk": {"vulns": [{"id": "MAL-2025-2", "affected": []}]}}
-        with pytest.raises(OsvError, match="names no affected version"):
+        with pytest.raises(OsvError, match="names no affected version at all"):
+            malicious_releases("chalk", opener=opener_for(answers))
+
+    def test_a_whole_package_record_says_so_rather_than_the_opposite(self):
+        """OSV writes "every version is malicious" as a range introduced at 0.
+
+        Five of roughly forty consecutive MAL- records sampled from 2025-09 are this
+        shape — it is how a typosquat is recorded. The refusal is right, because this
+        schema matches by exact version; the earlier message was not, because it told
+        the operator the record named *no* version and sent them to read one that
+        names every one.
+        """
+        answers = {"arjvg": {"vulns": [{
+            "id": "MAL-2025-47013",
+            "affected": [{"package": {"name": "arjvg", "ecosystem": "npm"},
+                          "ranges": [{"type": "SEMVER",
+                                      "events": [{"introduced": "0"}]}]}],
+        }]}}
+        with pytest.raises(OsvError) as caught:
+            malicious_releases("arjvg", opener=opener_for(answers))
+        message = str(caught.value)
+        assert "every version of this package is malicious" in message
+        assert "names no affected version" not in message
+        # The operator's next move, which differs from the other shape's.
+        assert "registry.npmjs.org/arjvg" in message and "#68" in message
+
+    def test_another_packages_range_does_not_make_this_one_whole_package(self):
+        # One record can carry several `affected` entries. Reading the neighbour's
+        # range would tell the operator every version of *this* package is malicious.
+        answers = {"chalk": {"vulns": [{
+            "id": "MAL-2025-4",
+            "affected": [
+                {"package": {"name": "chalk", "ecosystem": "npm"}},
+                {"package": {"name": "arjvg", "ecosystem": "npm"},
+                 "ranges": [{"type": "SEMVER", "events": [{"introduced": "0"}]}]},
+            ],
+        }]}}
+        with pytest.raises(OsvError, match="names no affected version at all"):
+            malicious_releases("chalk", opener=opener_for(answers))
+
+    def test_a_range_that_is_not_introduced_at_zero_is_the_other_shape(self):
+        # A fixed range names a boundary, not the whole package, and this schema
+        # cannot carry either — but the advice must not claim the wrong one.
+        answers = {"chalk": {"vulns": [{
+            "id": "MAL-2025-3",
+            "affected": [{"package": {"name": "chalk", "ecosystem": "npm"},
+                          "ranges": [{"type": "SEMVER",
+                                      "events": [{"introduced": "5.0.0"}]}]}],
+        }]}}
+        with pytest.raises(OsvError, match="names no affected version at all"):
             malicious_releases("chalk", opener=opener_for(answers))
 
     @pytest.mark.parametrize("answer", [
