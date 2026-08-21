@@ -145,8 +145,13 @@ class TestRealLockfiles:
         assert node["resolution"]["integrity"].startswith("sha512-z6nr0TTEOBGk")
         assert node["dev"] == "false"
         raw = FIXTURES.joinpath("pnpm-v5.3-prettier.yaml").read_text(encoding="utf-8")
-        assert "\n      {\n        integrity:" in raw, (
-            "the fixture no longer carries Prettier's line-broken flow mapping")
+        # Prettier's signature is all three parts: the brace on its own line, a trailing
+        # comma on the entry, and the closer on its own line. Pinning one substring let
+        # the commas be deleted and the closers moved up with nothing going red.
+        assert raw.count("\n      {\n        integrity:") == 10
+        assert raw.count("==,\n      }\n") == 10
+        assert len(prettier["packages"]) == 10
+        assert all("integrity" in entry["resolution"] for entry in prettier["packages"].values())
 
         berry_ten = document("yarn-berry.lock")
         assert berry_ten["__metadata"] == {"version": "10", "cacheKey": "10"}
@@ -276,10 +281,20 @@ UNCOVERED = {
     "empty flow mapping across lines": "k: {\n}\n",
     "blank line inside a flow collection": "k: {\n  a: 1,\n\n  b: 2\n}\n",
     "a bracket inside quotes across lines": "k: {a: '{',\n  b: 1}\n",
-    # A closing bracket alone is a plain scalar, and must not be handed to the joiner,
-    # which would count it as a collection closing before it opened.
-    "a lone closing bracket as a value": "k: }\n",
-    "a lone closing square bracket as a value": "k: ]\n",
+    "a double-quoted bracket across lines": 'k: {a: "{",\n  b: 1}\n',
+    # A comma may open a continuation line; the closer before it ends the entry.
+    "a continuation line opening with a comma after a mapping": "k: {a: {b: 1}\n  , c: 2}\n",
+    "a continuation line opening with a comma after a sequence": "k: [[1]\n  , [2]]\n",
+    "a whitespace-only line inside a flow collection": "k: {\n  a: 1,\n   \n  b: 2\n}\n",
+    "a comment line after a flow closed across lines": "k: {\n  a: 1\n}\n# note\nz: 2\n",
+    "a comment line after a single-line flow": "{}\n# end\n",
+    # Regression pinned: a quote in the middle of a plain scalar is not a quote. Three
+    # independent reviews caught `_flow_depth` refusing these after it first shipped.
+    "an apostrophe inside a flow value": "k: {a: it's}\n",
+    "an apostrophe inside a flow sequence item": "k: [it's]\n",
+    "a double quote inside a flow value": 'k: {a: 5" tall}\n',
+    "mixed quotes and apostrophes in one flow mapping": "k: {a: it's, b: '}', c: that's}\n",
+    "a hash with no space before it is not a comment": "k: {a: x#y}\n",
 }
 
 
@@ -456,8 +471,24 @@ REFUSED = {
     "plain scalar continued across lines in a flow": "k: {a: hello\n  world}\n",
     "flow key and value on different lines": "k: {a:\n  1}\n",
     "comment inside a flow collection across lines": "k: {\n  a: 1,\n  # c\n  b: 2\n}\n",
+    # A trailing comment inside a flow collection. Joined across lines it became a mapping
+    # key named `# dev` -- a tree PyYAML never produced; reviewed and pinned.
+    "trailing comment inside a prettier flow mapping":
+        "resolution:\n  {\n    integrity: sha512-abc==, # dev: true,\n  }\n",
+    "trailing comment inside a flow sequence across lines": "k: [\n  a, # c\n]\n",
+    "trailing comment inside a single-line flow": "k: [a, # c]\n",
+    "comment with no space before it inside a flow": "k: [a,#c\n]\n",
+    "comment in the value position of a flow mapping": "k: {a: # c\n}\n",
+    # Mismatched brackets reach guards deep in `_scan_flow` that lost their only tests
+    # when multi-line gathering started intercepting the "unterminated" inputs.
+    "a sequence closed with a brace": "k: {a: [1}]\n",
+    "a mapping closed with a square bracket": "k: [{a: 1]}\n",
+    "a mismatched closer then an unterminated collection": "k: {a: [1}],\n",
     "flow closed at a shallower indent than it opened": "k:\n  a: {\n  b: 1\n}\n",
     "content after a flow closed across lines": "k: {\n  a: 1\n} x\n",
+    # PyYAML rejects these too; this reader used to read `k: }` as the string "}".
+    "a lone closing bracket as a value": "k: }\n",
+    "a lone closing square bracket as a value": "k: ]\n",
     "a flow collection closed twice": "k: {a: 1}}\n",
     "a flow collection closed twice across lines": "k: {\n  a: 1\n}}\n",
     "tab after a plain scalar": "a: b\t\n",
@@ -489,6 +520,10 @@ DECLINED_ON_PURPOSE = {
     "plain scalar continued across lines in a flow",
     "flow key and value on different lines",
     "comment inside a flow collection across lines",
+    "trailing comment inside a prettier flow mapping",
+    "trailing comment inside a flow sequence across lines",
+    "comment with no space before it inside a flow",
+    "comment in the value position of a flow mapping",
     "flow closed at a shallower indent than it opened",
 }
 
@@ -569,11 +604,21 @@ class TestWhatItRefuses:
         "plain scalar continued across lines in a flow": "cannot continue onto the next line",
         "flow key and value on different lines": "cannot continue onto the next line",
         "comment inside a flow collection across lines": "comment inside a flow collection",
+        "trailing comment inside a prettier flow mapping": "comment inside a flow collection",
+        "trailing comment inside a flow sequence across lines": "comment inside a flow collection",
+        "trailing comment inside a single-line flow": "comment inside a flow collection",
+        "comment with no space before it inside a flow": "comment inside a flow collection",
+        "comment in the value position of a flow mapping": "comment inside a flow collection",
+        "a sequence closed with a brace": "expected ',' or '}'",
+        "a mapping closed with a square bracket": "expected ',' or ']'",
+        "a mismatched closer then an unterminated collection": "close on the line it opened",
         "flow closed at a shallower indent than it opened": "close on the line it opened",
         "content after a flow closed across lines": "trailing content after a flow",
         # The diagnosis matters: without its own guard this is reported as "has to close
         # on the line it opened", which sends a reader hunting for a missing bracket
         # when the problem is one too many.
+        "a lone closing bracket as a value": "cannot begin with a closing bracket",
+        "a lone closing square bracket as a value": "cannot begin with a closing bracket",
         "a flow collection closed twice": "closes before it opens",
         "a flow collection closed twice across lines": "closes before it opens",
         "tab after a plain scalar": "tab cannot appear in a plain scalar",
@@ -605,6 +650,22 @@ class TestWhatItRefuses:
             load("a: 1\nb: 2\nc: &anchor 3\n")
         assert caught.value.line == 3
         assert "line 3" in str(caught.value)
+
+    @pytest.mark.parametrize("name,expected_line", [
+        ("comment inside a flow collection across lines", 3),
+        ("trailing comment inside a flow sequence across lines", 2),
+        ("a flow collection closed twice across lines", 3),
+        ("plain scalar continued across lines in a flow", 1),
+        ("flow closed at a shallower indent than it opened", 2),
+        ("content after a flow closed across lines", 1),
+    ])
+    def test_a_multi_line_flow_error_names_the_line_it_was_found_on(self, name, expected_line):
+        """An error found while gathering names its own line; one found after the join
+        names the opener, because the join erased the rest. Four mutants that shifted
+        these numbers by one survived until this test existed."""
+        with pytest.raises(YamlSubsetError) as caught:
+            load_documents(REFUSED[name])
+        assert caught.value.line == expected_line, str(caught.value)
 
     def test_a_refusal_is_the_kind_of_error_a_lockfile_caller_already_catches(self):
         """`history.py` catches `LockfileParseError` and turns it into an unreadable

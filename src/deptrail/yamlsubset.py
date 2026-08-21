@@ -502,25 +502,25 @@ def _gather_flow(lines: list[str], index: int, end: int, first: str) -> tuple[st
     refused for the same reason.
 
     Brackets inside quotes do not count, so ``{a: '}', b: 1}`` still closes where YAML
-    says it does. The error for anything wrong inside points at the opening line, which
-    is the line a reader will find the collection on.
+    says it does. An error found while gathering (a comment, a quote left open, one
+    closer too many) names the line it is on; an error found after the join names the
+    opening line, because the join has erased the others.
     """
     depth = _flow_depth(first, 0, index + 1)
     if depth == 0:
         return first, index + 1
     parts = [first]
     cursor = index + 1
+    # Measured once. Recomputing it per continuation line copied the opener each time,
+    # which made a 9.6 MB single-line opener cost 27 seconds.
+    opener_indent = _indent_of(lines[index])
     while cursor < end:
         line = lines[cursor]
         stripped = line.strip(_WS)
         if not stripped:
             cursor += 1
             continue
-        if stripped[:1] == "#":
-            raise YamlSubsetError(
-                "a comment inside a flow collection spanning lines is outside the subset",
-                cursor + 1)
-        if _indent_of(line) <= _indent_of(lines[index]) and stripped[:1] not in ("}", "]"):
+        if _indent_of(line) <= opener_indent and stripped[:1] not in ("}", "]"):
             # Dedented without closing: the collection was never finished.
             break
         parts.append(stripped)
@@ -549,19 +549,45 @@ def _gather_flow(lines: list[str], index: int, end: int, first: str) -> tuple[st
 
 
 def _flow_depth(text: str, depth: int, number: int) -> int:
-    """Bracket depth after ``text``, ignoring brackets inside quoted scalars."""
+    """Bracket depth after ``text``, skipping quoted scalars and refusing comments.
+
+    A quote opens a quoted scalar only where a scalar can begin -- after an opening
+    bracket, a comma, or a key's colon. Treating every ``'`` as an opener made
+    ``{a: it's}`` refuse on "a quoted scalar has to close", a file the reader had been
+    reading correctly before this function existed.
+
+    A ``#`` outside quotes is a comment to YAML and the comment runs to the end of the
+    line. Joining lines erases that line end, so ``integrity: abc, # dev: true,`` became
+    a mapping with a key named ``# dev`` -- a tree PyYAML never produced. Refusing here,
+    before the join, is the only place the line boundary still exists. The check is
+    "at the start of a scalar, or after a space", which is where YAML sees a comment;
+    ``a#b`` stays a plain scalar.
+    """
     position = 0
+    at_scalar_start = True
     while position < len(text):
         character = text[position]
-        if character in ("'", '"'):
+        if character in ("'", '"') and at_scalar_start:
             _, position = _scan_quoted(text, position, number)
+            at_scalar_start = False
             continue
+        if character == "#" and (at_scalar_start or text[position - 1] == " "):
+            raise YamlSubsetError(
+                "a comment inside a flow collection is outside the subset", number)
         if character in "{[":
             depth += 1
+            at_scalar_start = True
         elif character in "}]":
             depth -= 1
             if depth < 0:
                 raise YamlSubsetError("a flow collection closes before it opens", number)
+            at_scalar_start = False
+        elif character == ",":
+            at_scalar_start = True
+        elif character == ":" and text[position + 1:position + 2] in ("", " "):
+            at_scalar_start = True
+        elif character != " ":
+            at_scalar_start = False
         position += 1
     return depth
 
@@ -608,6 +634,12 @@ def _plain(text: str, number: int) -> str:
         # Measured absent from every lockfile in the corpus, and ambiguous if it did
         # appear: YAML would cut a comment here and this reader would not.
         raise YamlSubsetError("a comment cannot follow a plain scalar here", number)
+    if text[:1] in ("}", "]"):
+        # A plain scalar cannot begin with a closing bracket; PyYAML rejects `k: }`
+        # outright. Reading it as the string "}" was a quiet disagreement that survived
+        # until a mutation pointed at it -- the guard it defeated was only reachable
+        # because the input was already being misread.
+        raise YamlSubsetError("a plain scalar cannot begin with a closing bracket", number)
     if text[:1] in ("&", "*", "!"):
         kind = {"&": "anchors", "*": "aliases", "!": "tags"}[text[0]]
         raise YamlSubsetError(f"{kind} are outside the subset", number)
