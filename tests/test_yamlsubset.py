@@ -295,6 +295,12 @@ UNCOVERED = {
     "a double quote inside a flow value": 'k: {a: 5" tall}\n',
     "mixed quotes and apostrophes in one flow mapping": "k: {a: it's, b: '}', c: that's}\n",
     "a hash with no space before it is not a comment": "k: {a: x#y}\n",
+    # A quoted key followed by its colon with no space. The closing quote was taken as the
+    # end of a scalar, so the colon went unrecognised and the brace inside the value
+    # counted as a closer. Found by the independent codex review of #78.
+    "a quoted key with no space after its colon": 'k: {"a":"}"}\n',
+    "a quoted key with no space after its colon, across lines": 'k: {\n  "a":"}",\n}\n',
+    "a quoted key with no space before a nested mapping": 'k: {"a":{"b":"]"}}\n',
 }
 
 
