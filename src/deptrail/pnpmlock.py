@@ -46,11 +46,12 @@ from .lockfile import ROOT, InstalledPackage, LockfileModel, LockfileParseError
 from .pnpmkeys import UNKNOWN, KeyRecord, band_of, split_key, suffix_groups
 from .yamlsubset import load_documents
 
-# Blocks of an importer whose keys are names the project depends on. ``specifiers`` is
-# 5.x's declared-range table and names the same packages as the three resolved blocks;
-# the last two are pnpm 12's, where the package manager pins itself and its config
-# dependencies, and they were installed like anything else.
-_IMPORTER_BLOCKS = ("dependencies", "devDependencies", "optionalDependencies", "specifiers",
+# Blocks of an importer whose keys are names the project depends on. The last two are
+# pnpm 12's, where the package manager pins itself and its config dependencies, and they
+# were installed like anything else. 5.x's ``specifiers`` block is not read: it names the
+# same packages as the resolved blocks, but by their alias names, and an alias name in
+# ``root_deps`` ends a chain at a package the project never declared.
+_IMPORTER_BLOCKS = ("dependencies", "devDependencies", "optionalDependencies",
                     "packageManagerDependencies", "configDependencies")
 # Blocks of a package entry whose keys are names the package depends on. Peer
 # dependencies are constraints on the parent, not edges to an installed instance.

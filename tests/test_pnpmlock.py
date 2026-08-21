@@ -480,7 +480,11 @@ class TestWhatTheProjectDependsOn:
         assert "pnpm" in model.root_deps
         assert model.versions_of("pnpm") == {"12.0.0-rc.7"}
 
-    def test_a_five_importer_lists_versions_and_a_six_importer_lists_mappings(self):
+    def test_a_five_importer_lists_versions_and_its_specifiers_are_not_read(self):
+        """``specifiers`` names an aliased dependency by its alias; ``dependencies``
+        resolves it. Reading both put ``@popperjs/core`` next to ``@sxzz/popperjs-es``
+        in the roots of ``element-plus``, and a chain to the real ``@popperjs/core``,
+        had it been installed transitively, would have stopped there."""
         five = parse("""\
             lockfileVersion: 5.4
 
@@ -490,16 +494,22 @@ class TestWhatTheProjectDependsOn:
                 dependencies:
                   chalk: 5.6.1
                   tslint: 6.1.2_typescript@3.9.3
+                  '@popperjs/core': /@sxzz/popperjs-es/2.11.6
                 specifiers:
                   chalk: ^5.0.0
                   tslint: ^6.0.0
+                  '@popperjs/core': npm:@sxzz/popperjs-es@^2.11.6
+                  unresolved: ^1.0.0
 
             packages:
 
               /chalk/5.6.1:
                 resolution: {integrity: sha512-a}
+
+              /@sxzz/popperjs-es/2.11.6:
+                resolution: {integrity: sha512-b}
             """)
-        assert five.root_deps == {"chalk", "tslint"}
+        assert five.root_deps == {"chalk", "tslint", "@sxzz/popperjs-es"}
 
 
 class TestEdgesResolveToWhatTheyInstall:
