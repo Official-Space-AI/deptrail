@@ -8,7 +8,8 @@ import pathlib
 
 import pytest
 
-from deptrail.lockfile import LockfileParseError, parse_lockfile
+from deptrail.lockfile import (NOT_NPM, NPM, OTHER_REGISTRY, SOURCE, InstalledPackage,
+                               LockfileModel, LockfileParseError, parse_lockfile)
 
 FIXTURES = pathlib.Path(__file__).parent / "fixtures"
 
@@ -20,7 +21,7 @@ def load(dialect: str) -> str:
 class TestPackagesFormat:
     def test_v3_basics(self):
         model = parse_lockfile(load("v3"))
-        assert model.lockfile_version == 3
+        assert model.lockfile_version == "3"
         assert model.root_name == "web-app"
         assert model.versions_of("express") == {"4.19.2"}
 
@@ -44,7 +45,7 @@ class TestPackagesFormat:
 
     def test_v2_prefers_packages_block(self):
         model = parse_lockfile(load("v2"))
-        assert model.lockfile_version == 2
+        assert model.lockfile_version == "2"
         assert model.versions_of("chalk") == {"5.6.1"}
         assert model.chain_to("chalk") == ["express", "debug", "chalk"]
 
@@ -52,7 +53,7 @@ class TestPackagesFormat:
 class TestV1Format:
     def test_v1_root_deps_heuristic(self):
         model = parse_lockfile(load("v1"))
-        assert model.lockfile_version == 1
+        assert model.lockfile_version == "1"
         assert model.root_deps == {"express", "chalk"}
 
     def test_v1_nested_package_path(self):
@@ -96,3 +97,90 @@ class TestSchemaNormalization:
     def test_malformed_root_entry_normalized(self):
         with pytest.raises(LockfileParseError):
             parse_lockfile('{"lockfileVersion": 3, "packages": {"": []}}')
+
+
+def _model(*packages: InstalledPackage, declared=None, root_deps=None) -> LockfileModel:
+    return LockfileModel(lockfile_version="0", root_name="t", root_deps=set(root_deps or ()),
+                         packages=list(packages), declared=dict(declared or {}))
+
+
+class TestOriginDecidesWhatAnAdvisoryCanMatch:
+    """Real case behind this: ``vercel/next.js`` pins ``ci-info`` 2.0.0 from the registry
+    and, separately, from a GitHub tarball whose package.json also says 2.0.0. An
+    advisory for ``ci-info 2.0.0`` is about the registry artifact only."""
+
+    def test_every_package_is_npm_unless_a_parser_says_otherwise(self):
+        assert InstalledPackage("a", "1.0.0", "node_modules/a").origin == NPM
+        for package in parse_lockfile(load("v3")).packages:
+            assert package.origin == NPM
+
+    def test_a_source_row_stays_in_the_inventory_and_does_not_answer(self):
+        # The real rows share the version; the tarball here says 2.0.1 so that the
+        # assertion can tell the filter from its absence.
+        model = _model(InstalledPackage("ci-info", "2.0.0", "ci-info@2.0.0"),
+                       InstalledPackage("ci-info", "2.0.1", "ci-info@https://codeload/...",
+                                        origin=SOURCE))
+        assert model.versions_of("ci-info") == {"2.0.0"}
+        assert len(model.packages) == 2, "the tarball stays in the inventory"
+        assert [p.version for p in model.instances_of("ci-info")] == ["2.0.0"]
+
+    @pytest.mark.parametrize("origin", [SOURCE, NOT_NPM])
+    def test_a_name_installed_only_from_git_or_as_a_runtime_has_no_versions(self, origin):
+        model = _model(InstalledPackage("ci-info", "2.0.0", "k", origin=origin),
+                       declared={"app": {"ci-info"}}, root_deps={"app"})
+        assert model.versions_of("ci-info") == set()
+        assert model.chain_to("ci-info") is None
+
+    def test_a_row_from_another_registry_answers_because_it_may_proxy_npmjs(self):
+        model = _model(InstalledPackage("semver", "7.6.3", "semver@verdaccio:7.6.3",
+                                        origin=OTHER_REGISTRY),
+                       declared={"app": {"semver"}}, root_deps={"app"})
+        assert model.versions_of("semver") == {"7.6.3"}
+        assert model.chain_to("semver") == ["app", "semver"]
+
+    @pytest.mark.parametrize("origin", ["registry", "git", "local-dir", "", "unknown"])
+    def test_an_origin_outside_the_vocabulary_is_refused_at_construction(self, origin):
+        """``pnpmkeys.KeyRecord.origin`` holds a different vocabulary; a parser that
+        copies it across would otherwise build a model in which nothing answers."""
+        with pytest.raises(ValueError, match="origin"):
+            InstalledPackage("a", "1.0.0", "a@1.0.0", origin=origin)
+
+    def test_the_same_name_from_two_origins_keeps_the_npm_versions_apart(self):
+        model = _model(InstalledPackage("vue", "3.5.13", "vue@3.5.13"),
+                       InstalledPackage("vue", "3.5.14", "vue@https://pkg.pr.new/...",
+                                        origin=SOURCE),
+                       InstalledPackage("vue", "3.4.0", "vue@3.4.0"))
+        assert model.versions_of("vue") == {"3.5.13", "3.4.0"}
+
+
+class TestUnreadRows:
+    def test_a_parsed_npm_lockfile_reads_every_row(self):
+        for dialect in ("v1", "v2", "v3"):
+            assert parse_lockfile(load(dialect)).unread == []
+
+    def test_unread_is_a_field_a_parser_can_fill(self):
+        model = _model(InstalledPackage("a", "1.0.0", "a@1.0.0"))
+        model.unread.append("weird@key: no name@version separator")
+        assert model.unread == ["weird@key: no name@version separator"]
+        assert model.versions_of("a") == {"1.0.0"}, "readable rows are still readable"
+
+
+class TestTheDeclaredVersionIsText:
+    """``int`` could not hold pnpm's ``5.3-inlineSpecifiers`` (issue #72); nothing reads
+    the field as a number, so it holds what the file says."""
+
+    @pytest.mark.parametrize("literal, text", [("3", "3"), ("2", "2"), ("3.0", "3")])
+    def test_npm_integers_become_their_text(self, literal, text):
+        model = parse_lockfile('{"lockfileVersion": %s, "packages": {"": {}}}' % literal)
+        assert model.lockfile_version == text
+        assert isinstance(model.lockfile_version, str)
+
+    @pytest.mark.parametrize("literal", ['"three"', '"6.0"', '"5.3-inlineSpecifiers"'])
+    def test_what_int_refuses_is_still_refused(self, literal):
+        """Text the field can now hold is not text the npm parser accepts: a
+        lockfileVersion npm never wrote is not an npm lockfile."""
+        with pytest.raises(LockfileParseError):
+            parse_lockfile('{"lockfileVersion": %s, "packages": {"": {}}}' % literal)
+
+    def test_an_npm_lockfile_without_the_field_is_read_as_2(self):
+        assert parse_lockfile('{"packages": {"": {}}}').lockfile_version == "2"

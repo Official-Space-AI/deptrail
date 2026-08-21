@@ -1,9 +1,12 @@
-"""Parser for npm lockfiles (lockfileVersion 1, 2, 3) into one normalized model.
+"""The normalized lockfile model, and the parser for npm lockfiles (lockfileVersion 1, 2, 3).
 
 The forensic engine only needs two answers from a lockfile snapshot:
   1. which versions of a package were pinned at that point in history, and
   2. through which dependency chain the package entered the tree.
 Everything else in the lockfile is deliberately ignored.
+
+``LockfileModel`` is what every lockfile dialect is read into; the npm parser lives here
+because it was the first, and the pnpm one (``pnpmlock``) builds the same model.
 """
 from __future__ import annotations
 
@@ -12,6 +15,24 @@ from dataclasses import dataclass, field
 
 ROOT = "(root)"
 
+# Where an installed package came from, which decides whether its (name, version) is an
+# identity an npm advisory can be about. A git tarball whose package.json says 2.0.0 is
+# not the registry's 2.0.0: reporting an advisory against it is a claim about a GitHub
+# tarball, and merging the two rows did exactly that (``ci-info`` in ``vercel/next.js``).
+# Dropping such rows instead is also wrong -- a pinned git tarball would vanish from the
+# inventory -- so they stay, labelled, and ``versions_of`` leaves them out.
+NPM = "npm"                        # the npmjs registry: match advisories on (name, version)
+OTHER_REGISTRY = "other-registry"  # a registry that is not npmjs: JSR, or a named registry
+SOURCE = "source"                  # a real name and version, but built from git or a tarball
+NOT_NPM = "not-npm"                # not a package artifact at all: a runtime such as node
+# The origins an advisory can be about. A registry that is not npmjs may be a proxy of it
+# (Verdaccio and Nexus serve the npmjs tarball under the npmjs name), and a JSR name can
+# never collide with an npmjs one, so a match on such a row is reported -- the report
+# does not yet say which origin it came from (#83). A tarball built from git or a runtime
+# is never the registry's artifact, whatever its version says.
+REGISTRY_ORIGINS = frozenset({NPM, OTHER_REGISTRY})
+_ORIGINS = frozenset({NPM, OTHER_REGISTRY, SOURCE, NOT_NPM})
+
 
 class LockfileParseError(ValueError):
     """Raised when the input is not a lockfile format we understand."""
@@ -19,26 +40,59 @@ class LockfileParseError(ValueError):
 
 @dataclass(frozen=True)
 class InstalledPackage:
-    """One concrete package instance somewhere in the node_modules tree."""
+    """One concrete package instance the lockfile pinned.
+
+    ``path`` is where the instance sits: npm's tree location
+    (``node_modules/a/node_modules/b``; ``""`` is the root project), or the lockfile key
+    for a dialect without a tree, such as pnpm. A local directory link has no version
+    and is not an instance; its dependencies still appear in ``LockfileModel.declared``.
+    """
 
     name: str
     version: str
-    path: str  # tree location, e.g. "node_modules/a/node_modules/b"; "" is the root project
+    path: str
+    origin: str = NPM
+
+    def __post_init__(self) -> None:
+        # ``pnpmkeys.KeyRecord`` has an ``origin`` too, with a different vocabulary
+        # (``registry``, ``git``, ...); a parser that copies it here would label every
+        # row as something ``versions_of`` ignores, and every tree would read clean.
+        if self.origin not in _ORIGINS:
+            raise ValueError(f"origin {self.origin!r} is not one of {sorted(_ORIGINS)}")
 
 
 @dataclass
 class LockfileModel:
     """Normalized view of a lockfile snapshot, independent of lockfileVersion."""
 
-    lockfile_version: int
+    # The ``lockfileVersion`` the file declares, as text, because pnpm writes ``5.4``,
+    # ``6.0`` and once ``5.3-inlineSpecifiers`` and nothing reads the field as a number.
+    # The npm parser stores the integer npm writes, as text.
+    lockfile_version: str
     root_name: str
     root_deps: set[str]
     packages: list[InstalledPackage]
     # declarer package name -> names it declares as dependencies (name-level graph)
     declared: dict[str, set[str]] = field(default_factory=dict)
+    # Rows the parser found but could not read into a package, one message each. A
+    # row that is not read is a version that may have been installed and is not shown
+    # here, so ``history.py`` warns on a snapshot with anything in ``unread`` and does
+    # not let it end an exposure interval. Raising instead would hide every row that
+    # *was* readable; dropping the row would call the tree clean.
+    unread: list[str] = field(default_factory=list)
+
+    def instances_of(self, name: str) -> list[InstalledPackage]:
+        """The instances of ``name`` an advisory can be about: see ``REGISTRY_ORIGINS``.
+
+        The npm parser labels every row ``NPM``, including one resolved from a git URL;
+        classifying those is issue #82. The pnpm parser labels rows by their key.
+        """
+        return [p for p in self.packages if p.name == name and p.origin in REGISTRY_ORIGINS]
 
     def versions_of(self, name: str) -> set[str]:
-        return {p.version for p in self.packages if p.name == name}
+        """Versions of ``name`` an advisory can be about; ``SOURCE`` and ``NOT_NPM`` rows
+        are still in ``packages`` for inventory and do not answer here."""
+        return {p.version for p in self.instances_of(name)}
 
     def chain_to(self, name: str) -> list[str] | None:
         """Shortest name-level dependency chain from a direct dependency down to `name`.
@@ -47,6 +101,11 @@ class LockfileModel:
         because that is what an incident report needs to show a human
         ("express -> debug -> chalk"). Node's nearest-wins resolution of
         duplicated packages is intentionally not simulated here.
+
+        Asked only about advisory targets, so ``None`` for a name that is installed
+        solely from git or as a runtime: those rows are not what the chain is evidence
+        for. Intermediate names need no instance at all -- a local directory link that
+        only contributes edges still carries the chain through.
         """
         if not self.versions_of(name):
             return None
@@ -122,7 +181,8 @@ def _declared_names(entry: dict) -> set[str]:
 
 
 def _parse_packages_format(data: dict) -> LockfileModel:
-    version = int(data.get("lockfileVersion", 2))
+    # npm writes an integer; anything ``int()`` refuses is not an npm lockfile.
+    version = str(int(data.get("lockfileVersion", 2)))
     packages_block: dict = data["packages"]
     root_entry = packages_block.get("", {})
     root_name = data.get("name") or root_entry.get("name") or "(unnamed)"
@@ -184,7 +244,7 @@ def _parse_v1(data: dict) -> LockfileModel:
     walk(data["dependencies"], "")
     root_deps = top_level - required_by_someone or top_level
     return LockfileModel(
-        lockfile_version=1,
+        lockfile_version="1",
         root_name=data.get("name") or "(unnamed)",
         root_deps=root_deps,
         packages=installed,

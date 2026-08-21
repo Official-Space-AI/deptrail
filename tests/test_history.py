@@ -765,3 +765,90 @@ class TestOpenUpperBound:
             finding = scan_repo(repo, query)
             assert finding.unread_trees == [], query.window_end
             assert finding.verdict is Verdict.CLEAN
+
+
+class TestRowsTheParserCouldNotRead:
+    """A parser may read most of a lockfile and have to give up on a few rows
+    (``LockfileModel.unread``). Those rows may pin anything, so the snapshot warns and
+    cannot end an interval; the rows it did read are still judged. No npm lockfile
+    produces such a model, so the parser is stood in for here."""
+
+    @pytest.fixture
+    def parser_that_leaves_rows_unread(self, monkeypatch):
+        import deptrail.history as history
+        real = history.parse_lockfile
+
+        def parse(text):
+            model = real(text)
+            if '"x-unread"' in text:
+                model.unread.append("weird@key: no name@version separator")
+            return model
+        monkeypatch.setattr(history, "parse_lockfile", parse)
+
+    @staticmethod
+    def lock_with_unread_rows(chalk_version):
+        data = json.loads(lock_json(chalk_version))
+        data["x-unread"] = True
+        return json.dumps(data)
+
+    def test_a_snapshot_with_unread_rows_warns_and_is_not_clean(
+            self, tmp_path, parser_that_leaves_rows_unread):
+        repo = tmp_path / "partly"
+        repo.mkdir()
+        git(repo, "init", "-q")
+        (repo / "package-lock.json").write_text(self.lock_with_unread_rows("5.6.0"))
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "pin", date="2025-11-25T12:00:00+00:00")
+        finding = scan_repo(repo, WINDOW)
+        assert not finding.exposed
+        assert finding.verdict is Verdict.INDETERMINATE
+        assert len(finding.warnings) == 1
+        assert "1 package row(s) could not be read" in finding.warnings[0]
+        assert "weird@key" in finding.warnings[0]
+
+    def test_the_rows_it_did_read_are_still_judged(
+            self, tmp_path, parser_that_leaves_rows_unread):
+        repo = tmp_path / "partly-exposed"
+        repo.mkdir()
+        git(repo, "init", "-q")
+        (repo / "package-lock.json").write_text(self.lock_with_unread_rows("5.6.1"))
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "pin", date="2025-11-25T12:00:00+00:00")
+        finding = scan_repo(repo, WINDOW)
+        assert finding.exposed and finding.verdict is Verdict.EXPOSED
+        assert finding.exposures[0].chain == ("express", "debug", "chalk")
+        assert finding.warnings, "and the unread row is still on the record"
+
+    def test_a_later_snapshot_with_unread_rows_cannot_end_the_interval(
+            self, tmp_path, parser_that_leaves_rows_unread):
+        repo = make_repo(tmp_path, "closing", [("2025-11-25T12:00:00+00:00", "5.6.1")])
+        (repo / "package-lock.json").write_text(self.lock_with_unread_rows("5.6.0"))
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "bump, partly read", date="2025-11-26T12:00:00+00:00")
+        (repo / "package-lock.json").write_text(lock_json("5.6.0"))
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "bump, fully read", date="2025-11-27T12:00:00+00:00")
+        finding = scan_repo(repo, WINDOW)
+        assert finding.exposed
+        until = finding.exposures[0].until
+        assert until == _parse_iso("2025-11-27T12:00:00+00:00"), \
+            "the partly read snapshot may still pin 5.6.1 in a row nobody could read"
+
+    def test_the_evidence_chain_comes_from_a_registry_instance(self, tmp_path, monkeypatch):
+        """With two instances of the bad version, one from git nested under another
+        package, the chain must belong to the one the advisory is about."""
+        import deptrail.history as history
+        from deptrail.lockfile import SOURCE, InstalledPackage
+        real = history.parse_lockfile
+
+        def parse(text):
+            model = real(text)
+            model.packages.insert(0, InstalledPackage(
+                "chalk", "5.6.1", "node_modules/tarball-parent/node_modules/chalk",
+                origin=SOURCE))
+            return model
+        monkeypatch.setattr(history, "parse_lockfile", parse)
+        repo = make_repo(tmp_path, "two-chalks", [("2025-11-25T12:00:00+00:00", "5.6.1")])
+        finding = scan_repo(repo, WINDOW)
+        assert finding.exposed
+        assert finding.exposures[0].chain == ("express", "debug", "chalk")
