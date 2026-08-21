@@ -1,0 +1,90 @@
+lockfileVersion: '9.0'
+
+importers:
+  .:
+    dependencies:
+      '@scope/direct':
+        specifier: ^2.0.0
+        version: 2.0.0
+      ignored-tool:
+        specifier: ^3.0.0
+        version: 3.0.0
+      kleur:
+        specifier: ^4.1.5
+        version: 4.1.5
+      parent:
+        specifier: ^1.0.0
+        version: 1.0.0(peer-child@2.0.0)
+
+packages:
+  '@scope/direct@2.0.0':
+    resolution:
+      integrity: sha512-scoped
+
+  ignored-tool@3.0.0:
+    resolution:
+      repo: git+ssh://git@github.com/example/ignored-tool.git
+
+  kleur@4.1.5:
+    resolution:
+      integrity: sha512-kleur
+
+  kleur@3.0.3:
+    resolution:
+      integrity: sha512-kleur-old
+
+  peer-user@1.0.0:
+    resolution:
+      integrity: sha512-peer
+
+  parent@1.0.0:
+    resolution:
+      integrity: sha512-parent
+
+  child@2.0.0:
+    resolution:
+      integrity: sha512-child
+
+  optional-child@2.0.0:
+    resolution:
+      integrity: sha512-optional-child
+
+  peer-child@2.0.0:
+    resolution:
+      integrity: sha512-peer-child
+
+  '@scope/child@2.0.0':
+    resolution:
+      integrity: sha512-scoped-child
+
+  orphan@1.0.0:
+    resolution:
+      integrity: sha512-orphan
+
+  /legacy-package/1.2.3_peer@2.0.0:
+    resolution:
+      integrity: sha512-legacy
+
+  /@legacy/scope/4.5.6_peer@2.0.0:
+    resolution:
+      integrity: sha512-legacy-scope
+
+snapshots:
+  peer-user@1.0.0(kleur@4.1.5):
+    peerDependencies:
+      kleur: 4.1.5
+
+  parent@1.0.0(peer-child@2.0.0):
+    dependencies:
+      child: 2.0.0
+      '@scope/child': 2.0.0
+    optionalDependencies:
+      optional-child: 2.0.0
+    peerDependencies:
+      peer-child: 2.0.0
+
+  child@2.0.0: {}
+  optional-child@2.0.0: {}
+  peer-child@2.0.0: {}
+  '@scope/child@2.0.0': {}
+  orphan@1.0.0: {}
