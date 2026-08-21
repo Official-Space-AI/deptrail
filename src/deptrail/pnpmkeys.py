@@ -42,7 +42,8 @@ from dataclasses import dataclass
 from .lockfile import NOT_NPM, NPM, OTHER_REGISTRY, SOURCE, LockfileParseError
 
 # Semver as pnpm writes it. Build metadata is allowed by the grammar and absent from every
-# real key; see the module docstring for why that matters.
+# real key; see the module docstring for why that matters. Matched with ``fullmatch``: a
+# ``$`` alone accepts a trailing newline, and a quoted key can carry an escaped one.
 _SEMVER = re.compile(r"^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$")
 _NAME = re.compile(r"^(?:@[^/@()\s]+/)?[^/@()\s]+$")
 # A registry host as pnpm's encode-registry writes it: a port's ':' becomes '+'.
@@ -191,7 +192,7 @@ def _parse_v5_identity(key: str) -> tuple[str, str, str | None] | None:
             return None
         name, tail = parts[0], "/".join(parts[1:])
     version = tail.split("_", 1)[0]
-    if not _SEMVER.match(version) or not _NAME.match(name):
+    if not _SEMVER.fullmatch(version) or not _NAME.fullmatch(name):
         return None
     return name, version, host
 
@@ -219,7 +220,7 @@ def _parse_v6_identity(key: str) -> tuple[str, str, str | None] | None:
         return None
     name, tail = rest[:at], rest[at + 1:]
     version = tail.split("_", 1)[0]
-    if not _SEMVER.match(version) or not _NAME.match(name):
+    if not _SEMVER.fullmatch(version) or not _NAME.fullmatch(name):
         return None
     return name, version, host
 
@@ -273,10 +274,19 @@ def _split_v5v6(key: str, entry: object) -> KeyRecord:
     # with. A `version:` that is a mapping or a list is not a version; `str()` of it was
     # being written into the record, and a record with `"{'x': 1}"` where a version
     # belongs never matches an advisory -- a clean verdict manufactured from garbage.
+    # A blank one is the same failure with less to look at: `version: ''` outranked
+    # the key and left a row whose version is the empty string.
     for label, value in (("name", body_name), ("version", body_version)):
         if value is not None and not isinstance(value, str):
             return record(UNKNOWN, None, None, None, None,
                           f"body {label} is a {type(value).__name__}, not a string")
+        if isinstance(value, str) and not value.strip():
+            return record(UNKNOWN, None, None, None, None, f"body {label} is blank")
+    # A body name has to be a name pnpm could have installed: `name: not a name at all`
+    # became a registry row nothing matches, and `name: (root)` would have merged the
+    # package's edges into the project's.
+    if body_name is not None and not _NAME.fullmatch(body_name):
+        return record(UNKNOWN, None, None, None, None, f"body name {body_name!r} is not a name")
 
     if identity is not None:
         key_name, key_version, host = identity
@@ -286,6 +296,13 @@ def _split_v5v6(key: str, entry: object) -> KeyRecord:
         if body_version is None:
             return record(UNKNOWN, str(body_name), None, None, origin,
                           "body names the package but records no version")
+        # To outrank a version that is already in the key, the body's has to be one.
+        # For a git or tarball row below there is no key version to protect, and pnpm
+        # records whatever the checkout said -- `denolib/camelcase#aeb6b15f...` in
+        # its own fixtures -- so there it is kept as written.
+        if not _SEMVER.fullmatch(body_version):
+            return record(UNKNOWN, None, None, None, origin,
+                          f"body version {body_version!r} is not a version")
         return record(NPM, str(body_name), str(body_version), "body", origin)
 
     origin = _origin_of(key, body)
@@ -328,7 +345,7 @@ def _split_v9(key: str, entry: object, packages: object) -> KeyRecord:
         return KeyRecord(UNKNOWN, None, None, None, None,
                          reason=f"no name@version separator: {key!r}")
     name, key_version = base[:at], base[at + 1:]
-    if not key_version or not _NAME.match(name):
+    if not key_version or not _NAME.fullmatch(name):
         return KeyRecord(UNKNOWN, None, None, None, None, reason=f"implausible key: {key!r}")
     patched = any(g.startswith("patch_hash=") for g in groups)
     peers = tuple(g for g in groups if not g.startswith("patch_hash="))
@@ -339,6 +356,12 @@ def _split_v9(key: str, entry: object, packages: object) -> KeyRecord:
     if body_version is not None and not isinstance(body_version, str):
         return KeyRecord(UNKNOWN, name, None, None, None, patched, peers,
                          f"recorded version is a {type(body_version).__name__}, not a string")
+    if isinstance(body_version, str) and not body_version.strip():
+        return KeyRecord(UNKNOWN, name, None, None, None, patched, peers,
+                         "recorded version is blank")
+    # A recorded version may outrank a version that is in the key only if it is one;
+    # a git or tarball row keeps whatever pnpm recorded (see `_split_v5v6`).
+    outranks_badly = body_version is not None and not _SEMVER.fullmatch(body_version)
     resolution = body.get("resolution") or package_body.get("resolution") or {}
     if not isinstance(resolution, dict):
         resolution = {}
@@ -350,7 +373,10 @@ def _split_v9(key: str, entry: object, packages: object) -> KeyRecord:
     def versioned():
         return (str(body_version), "packages-body") if body_version else (key_version, "key")
 
-    if _SEMVER.match(key_version):
+    if _SEMVER.fullmatch(key_version):
+        if outranks_badly:
+            return record(UNKNOWN, None, None, None,
+                          f"recorded version {body_version!r} is not a version")
         version, source = versioned()
         if name.startswith("@jsr/") or "npm.jsr.io" in tarball:
             return record(OTHER_REGISTRY, version, source, "jsr",
@@ -378,7 +404,10 @@ def _split_v9(key: str, entry: object, packages: object) -> KeyRecord:
         if alias == "runtime":
             version, source = (str(body_version), "packages-body") if body_version else (rest, "key")
             return record(NOT_NPM, version, source, "runtime", "JS runtime, not an npm package")
-        if _SEMVER.match(rest):
+        if _SEMVER.fullmatch(rest):
+            if outranks_badly:
+                return record(UNKNOWN, None, None, None,
+                              f"recorded version {body_version!r} is not a version")
             version, source = (str(body_version), "packages-body") if body_version else (rest, "key")
             return record(NPM if alias == "npmjs" else OTHER_REGISTRY, version, source,
                           "named-registry:" + alias,
