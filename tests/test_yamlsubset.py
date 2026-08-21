@@ -95,6 +95,7 @@ class TestRealLockfiles:
     def test_the_corpus_did_not_quietly_shrink(self):
         assert set(REAL_LOCKFILES) == {
             "pnpm-v5.4.yaml",
+            "pnpm-v5.3-prettier.yaml",
             "pnpm-v6.0.yaml",
             "pnpm-v9.yaml",
             "pnpm-v9-two-documents.yaml",
@@ -137,6 +138,15 @@ class TestRealLockfiles:
         assert "@aashutoshrathi/word-wrap@1.2.6" in nine["packages"]
         assert nine["importers"]["."], "the importers block carries the root's own deps"
         assert len(nine["packages"]) >= 5 and len(nine["snapshots"]) >= 5
+
+        prettier = document("pnpm-v5.3-prettier.yaml")
+        assert prettier["lockfileVersion"] == "5.3"
+        node = prettier["packages"]["/@types/node/18.15.0"]
+        assert node["resolution"]["integrity"].startswith("sha512-z6nr0TTEOBGk")
+        assert node["dev"] == "false"
+        raw = FIXTURES.joinpath("pnpm-v5.3-prettier.yaml").read_text(encoding="utf-8")
+        assert "\n      {\n        integrity:" in raw, (
+            "the fixture no longer carries Prettier's line-broken flow mapping")
 
         berry_ten = document("yarn-berry.lock")
         assert berry_ten["__metadata"] == {"version": "10", "cacheKey": "10"}
@@ -251,6 +261,25 @@ UNCOVERED = {
     "a document restarted after an end marker": "a: 1\n...\n---\nb: 2\n",
     "a sequence at its key's own column": "a:\n- x\n- y\n",
     "a sequence at a nested key's column": "a:\n  b:\n  - x\nc: 1\n",
+    # Flow collections broken across lines, the way Prettier writes them. 53 of 4,424
+    # real lockfiles had been through it; refusing them was 1.2 % of repositories
+    # reported as "cannot tell" over whitespace.
+    "prettier flow mapping": "k:\n  {\n    integrity: sha512-abc==,\n  }\n",
+    "flow mapping continued on the next line": "a: {b: 1,\n    c: 2}\n",
+    "flow mapping closed on its own line": "k: {\n  a: 1,\n  b: 2\n}\n",
+    "flow mapping with trailing commas": "k: {\n  a: 1,\n  b: 2,\n}\n",
+    "flow sequence across lines": "k: [\n  a,\n  b,\n]\n",
+    "nested flow across lines": "k: {a: {b: 1},\n  c: {d: 2}\n}\n",
+    "flow across lines then a sibling": "k: {\n  a: 1\n}\nz: 2\n",
+    "flow across lines at the document root": "{\n  a: 1\n}\n",
+    "flow across lines as a sequence item": "- {\n    a: 1\n  }\n",
+    "empty flow mapping across lines": "k: {\n}\n",
+    "blank line inside a flow collection": "k: {\n  a: 1,\n\n  b: 2\n}\n",
+    "a bracket inside quotes across lines": "k: {a: '{',\n  b: 1}\n",
+    # A closing bracket alone is a plain scalar, and must not be handed to the joiner,
+    # which would count it as a collection closing before it opened.
+    "a lone closing bracket as a value": "k: }\n",
+    "a lone closing square bracket as a value": "k: ]\n",
 }
 
 
@@ -394,7 +423,6 @@ REFUSED = {
     "explicit key in flow": "{? a : 1}\n",
     "explicit key in flow without a space": "k: {?a: 1}\n",
     "explicit key in a flow sequence": "k: [?a]\n",
-    "flow spanning lines": "a: {b: 1,\n    c: 2}\n",
     "unterminated single quote": "a: 'x\n",
     "unterminated double quote": 'a: "x\n',
     "duplicate key": "a: 1\na: 2\n",
@@ -425,6 +453,13 @@ REFUSED = {
     "content after a document end": "a: 1\n...\nb: 2\n",
     "a node on a document marker line": "--- a: 1\n",
     "a document end that ends nothing": "...\n",
+    "plain scalar continued across lines in a flow": "k: {a: hello\n  world}\n",
+    "flow key and value on different lines": "k: {a:\n  1}\n",
+    "comment inside a flow collection across lines": "k: {\n  a: 1,\n  # c\n  b: 2\n}\n",
+    "flow closed at a shallower indent than it opened": "k:\n  a: {\n  b: 1\n}\n",
+    "content after a flow closed across lines": "k: {\n  a: 1\n} x\n",
+    "a flow collection closed twice": "k: {a: 1}}\n",
+    "a flow collection closed twice across lines": "k: {\n  a: 1\n}}\n",
     "tab after a plain scalar": "a: b\t\n",
     "tab inside a plain scalar": "a: b\tc\n",
     "tab after a key": "a\t: b\n",
@@ -443,12 +478,18 @@ REFUSED = {
 DECLINED_ON_PURPOSE = {
     "anchor", "merge key", "explicit tag", "explicit key in flow",
     "explicit key in flow without a space", "explicit key in a flow sequence",
-    "flow spanning lines", "duplicate key", "duplicate key in flow",
+    "duplicate key", "duplicate key in flow",
     "sequence on a sequence item", "empty sequence nested on a sequence item",
     "comment after a plain scalar", "scalar document", "mapping key with no value",
     "null key", "null key in flow", "flow key with no value",
     "single-pair mapping in a flow sequence",
     "block scalar with an indentation indicator",
+    # Multi-line flow, narrowed on purpose: PyYAML folds a scalar that runs across
+    # lines into one space, and that reading has zero real examples to be checked on.
+    "plain scalar continued across lines in a flow",
+    "flow key and value on different lines",
+    "comment inside a flow collection across lines",
+    "flow closed at a shallower indent than it opened",
 }
 
 
@@ -494,7 +535,6 @@ class TestWhatItRefuses:
         "explicit key in flow": "explicit keys",
         "explicit key in flow without a space": "explicit keys",
         "explicit key in a flow sequence": "explicit keys",
-        "flow spanning lines": "close on the line it opened",
         "unterminated single quote": "close on the line it opened",
         "unterminated double quote": "close on the line it opened",
         "duplicate key": "duplicate key",
@@ -526,14 +566,24 @@ class TestWhatItRefuses:
         "content after a document end": "content after a document was ended",
         "a node on a document marker line": "node on a document marker line",
         "a document end that ends nothing": "ends a document that never began",
+        "plain scalar continued across lines in a flow": "cannot continue onto the next line",
+        "flow key and value on different lines": "cannot continue onto the next line",
+        "comment inside a flow collection across lines": "comment inside a flow collection",
+        "flow closed at a shallower indent than it opened": "close on the line it opened",
+        "content after a flow closed across lines": "trailing content after a flow",
+        # The diagnosis matters: without its own guard this is reported as "has to close
+        # on the line it opened", which sends a reader hunting for a missing bracket
+        # when the problem is one too many.
+        "a flow collection closed twice": "closes before it opens",
+        "a flow collection closed twice across lines": "closes before it opens",
         "tab after a plain scalar": "tab cannot appear in a plain scalar",
         "tab inside a plain scalar": "tab cannot appear in a plain scalar",
         "tab after a key": "tab cannot appear in a plain scalar",
         "tab inside a flow value": "tab cannot appear in a plain scalar",
         "tab inside a sequence item": "tab cannot appear in a plain scalar",
-        "unterminated flow mapping key": "has no value",
-        "unterminated flow mapping value": "expected ',' or '}'",
-        "unterminated flow sequence": "expected ',' or ']'",
+        "unterminated flow mapping key": "close on the line it opened",
+        "unterminated flow mapping value": "close on the line it opened",
+        "unterminated flow sequence": "close on the line it opened",
         "flow key holding a bracket": "has no value",
         "sequence item inside a mapping": "sequence item inside a mapping",
     }

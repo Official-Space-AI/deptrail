@@ -9,15 +9,22 @@ A hand-rolled YAML reader is usually a bad trade, because YAML is large and a pa
 that is quietly wrong about a lockfile would report a tree as clean that was not. Three
 things make the trade defensible here.
 
-**The subset is measured, not guessed.** Checked against 1,505 real lockfiles: every
-pnpm ``lockfileVersion`` in the wild (5.1, 5.3, 5.4, 6.0, 6.1, 9.0) and every Yarn Berry
-``__metadata.version`` (4, 5, 6, 8, 10), including 1,193 historical ``pnpm-lock.yaml``
-blobs from one repository's full history — the case that matters most, because this tool
-walks history rather than HEAD and meets five lockfile versions in one repository's past.
-Anchors, aliases, merge keys, explicit tags, tab indentation, flow collections spanning
-lines, and trailing comments do not occur once. What does occur is block mappings, block
-sequences, single-line flow collections, all three scalar styles, block scalars,
-full-line comments, and more than one document in a file.
+**The subset is measured, not guessed — and re-measured when the sample grew.** Checked
+against 4,424 real lockfiles: every pnpm ``lockfileVersion`` in the wild (5, 5.1, 5.2,
+5.3, 5.4, 6.0, 6.1, 9.0) and every Yarn Berry ``__metadata.version`` (4, 5, 6, 8, 10),
+including 1,193 historical ``pnpm-lock.yaml`` blobs from one repository's full history —
+the case that matters most, because this tool walks history rather than HEAD and meets
+five lockfile versions in one repository's past.
+
+Anchors, aliases, merge keys, explicit tags and tab indentation do not occur once. An
+earlier version of this paragraph, written against 37 files, said the same of flow
+collections spanning lines; at 4,424 files that was false — Prettier breaks
+``resolution: {integrity: ...}`` across lines and 53 real lockfiles had been through it.
+Those are read now (``_gather_flow``). Explicit keys (``? ``) appear in 10 files and
+duplicate keys in 4; both stay refused on purpose, the first because it is the one
+construct here whose misreading produces a plausible tree, the second because two answers
+to "what was installed" is not a reading this tool should pick between. On the 4,404
+files it reads, every tree is identical to PyYAML's.
 
 **Everything outside the subset raises, and raises something the caller already
 catches.** ``YamlSubsetError`` is a ``LockfileParseError``, which is what ``history.py``
@@ -248,7 +255,8 @@ def _parse_block(lines: list[str], index: int, end: int, indent: int,
         # A whole node written in flow style. Without this the line goes to the mapping
         # parser, which splits `{"a": b, "c": d}` at its first `": "` and invents a key
         # named `{"a"` -- a different tree, returned without complaint.
-        return _parse_flow_scalar(stripped, index + 1), index + 1
+        joined, after = _gather_flow(lines, index, end, stripped)
+        return _parse_flow_scalar(joined, index + 1), after
     return _parse_mapping(lines, index, end, indent, depth)
 
 
@@ -344,6 +352,9 @@ def _parse_value(lines: list[str], index: int, end: int, indent: int, rest: str,
                 f"not a block scalar header: {rest!r}", number)
         return _parse_block_scalar(lines, index, end, indent, rest)
     if rest:
+        if rest[:1] in ("{", "["):
+            joined, after = _gather_flow(lines, index, end, rest)
+            return _parse_flow_scalar(joined, number), after
         return _parse_flow_scalar(rest, number), index + 1
     following = _skip_blank(lines, index + 1, end)
     if following < end:
@@ -475,6 +486,86 @@ def _split_key(text: str, number: int) -> tuple[str, str]:
     raise YamlSubsetError(f"not a mapping entry: {text!r}", number)
 
 
+def _gather_flow(lines: list[str], index: int, end: int, first: str) -> tuple[str, int]:
+    """The flow collection that opens on ``first``, joined into one line, and the index
+    just past its last line.
+
+    Prettier breaks ``resolution: {integrity: ...}`` across lines -- the brace on its own
+    line, the entries indented beneath, the closing brace on its own line -- and 53 of
+    4,424 real lockfiles had been through it. Refusing them was the safe outcome, and it
+    was also 1.2 % of repositories reported as "cannot tell" over whitespace.
+
+    What is joined is narrow on purpose: each continuation line has to be a whole entry
+    or a bare bracket. A plain scalar that itself runs across lines (``a: hello`` then
+    ``world``) is refused, because folding that into one space is a reading this reader
+    would be guaranteeing on zero real examples. Comment lines inside the collection are
+    refused for the same reason.
+
+    Brackets inside quotes do not count, so ``{a: '}', b: 1}`` still closes where YAML
+    says it does. The error for anything wrong inside points at the opening line, which
+    is the line a reader will find the collection on.
+    """
+    depth = _flow_depth(first, 0, index + 1)
+    if depth == 0:
+        return first, index + 1
+    parts = [first]
+    cursor = index + 1
+    while cursor < end:
+        line = lines[cursor]
+        stripped = line.strip(_WS)
+        if not stripped:
+            cursor += 1
+            continue
+        if stripped[:1] == "#":
+            raise YamlSubsetError(
+                "a comment inside a flow collection spanning lines is outside the subset",
+                cursor + 1)
+        if _indent_of(line) <= _indent_of(lines[index]) and stripped[:1] not in ("}", "]"):
+            # Dedented without closing: the collection was never finished.
+            break
+        parts.append(stripped)
+        depth = _flow_depth(stripped, depth, cursor + 1)
+        cursor += 1
+        if depth == 0:
+            break
+    if depth != 0:
+        raise YamlSubsetError(
+            "a flow collection has to close on the line it opened", index + 1)
+    for position, part in enumerate(parts[:-1]):
+        # A line has to end an entry before the next line begins one: on a comma, an
+        # opening bracket, or a closing bracket that finished a nested collection. The
+        # one exception is the entry just before a closing bracket, which YAML lets go
+        # without its comma. Anything else is a scalar that ran on to the next line --
+        # PyYAML folds that into one space, and this reader has no real example to check
+        # that reading on, so it refuses rather than guesses.
+        if part[-1:] in (",", "{", "[", "}", "]"):
+            continue
+        if parts[position + 1][:1] in ("}", "]"):
+            continue
+        raise YamlSubsetError(
+            "a plain scalar cannot continue onto the next line inside a flow "
+            "collection", index + 1)
+    return " ".join(parts), cursor
+
+
+def _flow_depth(text: str, depth: int, number: int) -> int:
+    """Bracket depth after ``text``, ignoring brackets inside quoted scalars."""
+    position = 0
+    while position < len(text):
+        character = text[position]
+        if character in ("'", '"'):
+            _, position = _scan_quoted(text, position, number)
+            continue
+        if character in "{[":
+            depth += 1
+        elif character in "}]":
+            depth -= 1
+            if depth < 0:
+                raise YamlSubsetError("a flow collection closes before it opens", number)
+        position += 1
+    return depth
+
+
 def _parse_flow_scalar(text: str, number: int) -> object:
     """A value written on one line: flow collection or scalar."""
     if text[:1] in ("{", "["):
@@ -570,6 +661,8 @@ def _scan_flow(text: str, position: int, number: int,
             container.append(value)
         position = _skip_spaces(text, position)
         if text[position:position + 1] == ",":
+            # A trailing comma before the closer is fine: the loop comes back round,
+            # skips the spaces, and finds the closer. Prettier writes one on every entry.
             position += 1
         elif text[position:position + 1] != closer:
             raise YamlSubsetError(
