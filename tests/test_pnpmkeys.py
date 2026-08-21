@@ -151,14 +151,18 @@ class TestPeerSuffixes:
         assert split_key("6.0", "/@scope", {}, {}).status == UNKNOWN
         assert split_key("6.0", "/@1.0.0", {}, {}).status == UNKNOWN
 
-    def test_a_host_needs_a_dot_or_to_be_localhost(self):
-        """`chalk/5.6.1` (no leading slash, no dot) is not `host=chalk`; it is not a
-        registry shape at all and falls through to the body."""
+    def test_a_host_is_any_first_segment_pnpm_could_have_encoded(self):
+        """`chalk/5.6.1` is not `host=chalk` because what follows (`5.6.1`) has no name
+        segment -- not because `chalk` lacks a dot. pnpm's parser has no dot rule, and
+        `verdaccio+4873` is a real registry host."""
         assert split_key("5.4", "chalk/5.6.1", {}, {}).status == UNKNOWN
-        record = split_key("5.4", "localhost+4873/chalk/5.6.1", {}, {})
-        assert (record.status, record.name, record.origin) == (NPM, "chalk", "registry-host")
+        for host in ("localhost+4873", "verdaccio+4873", "registry.npmmirror.com", "127.0.0.1+4873"):
+            record = split_key("5.4", f"{host}/chalk/5.6.1", {}, {})
+            assert (record.status, record.name, record.version, record.origin) == (NPM, "chalk", "5.6.1", "registry-host"), host
         record = split_key("6.0", "registry.npmmirror.com/immer@10.0.3", {}, {})
         assert (record.status, record.name, record.version) == (NPM, "immer", "10.0.3")
+        # `:` is not pnpm's port encoding (`+` is), so this is not a host shape at all.
+        assert split_key("5.4", "registry.example.com:4873/chalk/5.6.1", {}, {}).status == UNKNOWN
 
     def test_a_patch_hash_is_recorded_and_not_a_peer(self):
         record = split_key("9.0", "lodash@4.17.21(patch_hash=abc123)", {}, {})
@@ -205,6 +209,49 @@ class TestTheBodyOutranksTheKeyBefore9:
     def test_a_6x_document_may_carry_a_5x_key(self):
         assert split_key("6.0", "/chalk/5.6.1", {}, {}).name == "chalk"
         assert split_key("5.4", "/chalk@5.6.1", {}, {}).name == "chalk"
+
+
+class TestTheBodyIsOnlyTrustedWhenItIsText:
+    """The reader hands every scalar over as a string, so a non-string `name` or
+    `version` is a mapping or a list -- a malformed entry. `str()` of it was being
+    written into the record: `"{'x': 1}"` where a version belongs never matches an
+    advisory, which is a clean verdict manufactured from garbage. Found by the
+    independent codex review."""
+
+    @pytest.mark.parametrize("entry,field", [
+        ({"name": "chalk", "version": {"x": 1}}, "version"),
+        ({"name": ["chalk"], "version": "5.6.1"}, "name"),
+        ({"name": "chalk", "version": ["5.6.1"]}, "version"),
+    ])
+    def test_a_structured_name_or_version_in_a_5x_body_is_unknown(self, entry, field):
+        record = split_key("5.4", "/chalk/5.6.1", entry, {})
+        assert record.status == UNKNOWN and record.name is None and record.version is None
+        assert f"body {field} is a" in record.reason and "not a string" in record.reason
+
+    def test_a_structured_version_in_a_9_packages_body_is_unknown(self):
+        record = split_key("9.0", "chalk@5.6.1(x@1)", {}, {"chalk@5.6.1": {"version": {"x": 1}}})
+        assert (record.status, record.name, record.version) == (UNKNOWN, "chalk", None)
+        assert "not a string" in record.reason
+        record = split_key("9.0", "chalk@5.6.1", {"version": ["5.6.1"]}, {})
+        assert record.status == UNKNOWN
+
+    def test_the_body_version_really_is_the_one_returned(self):
+        """Every real row has body.version == key.version, so a mutant returning the key's
+        version with the body's label passed the whole corpus. Pinned with a disagreement."""
+        record = split_key("5.3", "registry.npmjs.org/q/1.5.1", {"name": "q", "version": "1.5.2"}, {})
+        assert (record.version, record.version_from) == ("1.5.2", "body")
+        record = split_key("9.0", "chalk@5.6.1(supports-color@9.0.0)", {}, {"chalk@5.6.1": {"version": "5.6.2"}})
+        assert (record.version, record.version_from) == ("5.6.2", "packages-body")
+
+
+class TestPatchedIsAStringBoolean:
+    """The reader delivers `patched: true` as the string `"true"`; `bool("false")` is
+    True. Real lockfiles only ever write `true` (241 rows, 106 files), so nothing was
+    wrong in the field -- but the rule was wrong in principle and had no test."""
+
+    @pytest.mark.parametrize("value,expected", [("true", True), ("false", False), ("True", True), ("0", False), ("yes", True), (True, True), (False, False)])
+    def test_every_spelling(self, value, expected):
+        assert split_key("6.0", "/lodash@4.17.21", {"patched": value}, {}).patched is expected
 
 
 class TestNineSnapshotsReadPackages:
@@ -305,6 +352,219 @@ class TestAgainstTheFixtureLockfiles:
                         record = split_key(document["lockfileVersion"], key, entry, packages)
                         assert record.status != UNKNOWN, (path.name, key, record.reason)
 
+
+# ---------------------------------------------------------------------------------------
+# Inputs derived from the grammar rather than from the corpus, each protecting a guard the
+# 83-row fixture cannot see. From the independent test-quality review: 57 targeted mutants,
+# 35 survived the suite as it then stood, 31 of them are killed below. Grouped by the line
+# each protects; the expected values are the module's measured output, cross-checked
+# against the specification and pnpm's own `dependency-path` where it answers.
+# ---------------------------------------------------------------------------------------
+
+class TestAVersionWithoutANameIsNotAnIdentity:
+    """pnpmkeys.py:210 (`at <= 0`), :302-305 (`at < 1`), :307-308 (implausible key)."""
+
+    @pytest.mark.parametrize("version,key", [("6.0", "/1.0.0"), ("9.0", "1.0.0")])
+    def test_a_bare_semver_is_not_read_as_a_package_named_1_0_dot(self, version, key):
+        record = split_key(version, key, {}, {})
+        assert (record.status, record.name) == (UNKNOWN, None)
+
+    @pytest.mark.parametrize("key", ["chalk", "@scope"])
+    def test_v9_without_a_separator_names_that_reason_and_leaks_no_name(self, key):
+        record = split_key("9.0", key, {}, {})
+        assert (record.status, record.name) == (UNKNOWN, None)
+        assert record.reason.startswith("no name@version separator")
+
+    @pytest.mark.parametrize("key", ["a/b@1.0.0", "@scope/a/b@1.0.0", "chalk@"])
+    def test_v9_implausible_names_and_empty_versions_are_refused(self, key):
+        record = split_key("9.0", key, {}, {})
+        assert (record.status, record.name) == (UNKNOWN, None)
+        assert record.reason.startswith("implausible key")
+
+
+class TestAHostIsWhateverPnpmWrites:
+    """`_host_split` (`fullmatch` at the host, no dot rule).
+
+    pnpm's own `dependency-path.parse` has no "must contain a dot" rule, and
+    `encode-registry` writes `http://verdaccio:4873` as `verdaccio+4873` -- a Docker
+    service name, ordinary in CI. A first version required a dot and demoted every such
+    registry to a tarball of unknown provenance; two independent reviews found it.
+    """
+
+    @pytest.mark.parametrize("version,key,name", [
+        ("5.4", "verdaccio+4873/e2e-verdaccio/1.0.0", "e2e-verdaccio"),
+        ("5.4", "verdaccio+4873/@myorg/pkg/1.0.0", "@myorg/pkg"),
+        ("6.0", "nexus+8081/@myorg/pkg@1.0.0(react@18.2.0)", "@myorg/pkg"),
+        ("5.4", "127.0.0.1+4873/x/1.0.0", "x"),
+        ("5.4", "notahost/chalk/5.6.1", "chalk"),
+    ])
+    def test_a_dotless_host_is_a_registry_host(self, version, key, name):
+        record = split_key(version, key, {}, {})
+        assert (record.status, record.name, record.version, record.origin) == (NPM, name, "1.0.0" if "1.0.0" in key else "5.6.1", "registry-host")
+
+    def test_a_colon_port_is_not_pnpms_host_encoding(self):
+        assert split_key("5.4", "registry.example.com:4873/chalk/5.6.1", {}, {}).status == UNKNOWN
+
+    def test_band_of_tolerates_surrounding_whitespace(self):
+        assert band_of(" 5.4 ") == "v5"
+
+
+class TestNoVersionIsNeverTheStringNone:
+    """pnpmkeys.py:274-276, :337-339, :344-346 -- deleting any of them returns
+    status `source` with the literal string 'None' as the version."""
+
+    def test_v5v6_non_identity_key_with_a_named_but_unversioned_body(self):
+        record = split_key("5.4", "github.com/owner/repo/7e4fef9abcdef", {"name": "repo"}, {})
+        assert (record.status, record.name, record.version, record.origin) == (UNKNOWN, "repo", None, "git")
+        assert record.reason == "body names the package but records no version"
+
+    def test_v9_local_tarball_without_a_version(self):
+        record = split_key("9.0", "xlsx@file:vendor/xlsx-0.20.3.tgz", {}, {})
+        assert (record.status, record.version, record.origin) == (UNKNOWN, None, "local-tarball")
+        assert record.reason == "local tarball with no version recorded"
+
+    @pytest.mark.parametrize("key,origin", [
+        ("vue@https://pkg.pr.new/vue@e1bc0eb", "remote-tarball"),
+        ("x@git+https://github.com/o/r.git#abc", "git"),
+        ("ags@https://codeload.github.com/aylur/ags/tar.gz/e169694", "git"),
+    ])
+    def test_v9_git_or_url_without_a_version(self, key, origin):
+        record = split_key("9.0", key, {}, {})
+        assert (record.status, record.version, record.origin) == (UNKNOWN, None, origin)
+        assert record.reason == f"no version recorded for a {origin} dependency"
+
+
+class TestTheProtocolTail:
+    """pnpmkeys.py:348-364 and :248-249."""
+
+    @pytest.mark.parametrize("key,alias", [("x@link:../foo", "link"), ("x@workspace:*", "workspace"),
+                                           ("x@npm:other@1.0.0", "npm")])
+    def test_an_unrecognised_protocol_is_unknown_even_with_a_body_version(self, key, alias):
+        record = split_key("9.0", key, {"version": "1.0.0"}, {})
+        assert (record.status, record.version, record.origin) == (UNKNOWN, None, "protocol:" + alias)
+        assert record.reason.startswith("unrecognised protocol version")
+
+    def test_a_version_part_that_is_nothing_recognisable_trusts_only_the_body(self):
+        record = split_key("9.0", "x@1.0", {"version": "1.0.0"}, {})
+        assert (record.status, record.version, record.version_from, record.origin) == (SOURCE, "1.0.0", "packages-body", "unknown")
+        record = split_key("9.0", "x@1.0", {}, {})
+        assert record.status == UNKNOWN and record.reason.startswith("version part is neither semver")
+
+    @pytest.mark.parametrize("version,key", [("6.0", "/x@1.0.0)"), ("5.4", "/x/1.0.0)")])
+    def test_an_unbalanced_parenthesis_is_unknown_not_a_crash_before_9_too(self, version, key):
+        record = split_key(version, key, {}, {})
+        assert record.status == UNKNOWN and "unbalanced" in record.reason
+
+
+class TestTheBodyVersionOutranksTheKeyVersion:
+    """pnpmkeys.py:265 and :324 -- the only inputs on which the rule's *version* half can fail."""
+
+    def test_v5_host_key_with_a_body_that_disagrees_on_the_version(self):
+        record = split_key("5.3", "registry.npmjs.org/q/1.5.1", {"name": "q", "version": "1.5.2"}, {})
+        assert (record.version, record.version_from) == ("1.5.2", "body")
+
+    def test_v9_snapshot_whose_packages_body_disagrees_with_the_key(self):
+        record = split_key("9.0", "chalk@5.6.1(supports-color@9.0.0)", {}, {"chalk@5.6.1": {"version": "5.6.2"}})
+        assert (record.version, record.version_from) == ("5.6.2", "packages-body")
+
+
+class TestOriginFromTheResolutionBody:
+    """pnpmkeys.py:221-233 (_origin_of), each clause on its own."""
+
+    @pytest.mark.parametrize("version,key,entry", [
+        ("6.0", "jihulab.com/james-curtis/vscode-loc/ddd7174069c9d981d0bacbc23fe74de3112ec706",
+         {"name": "vscode-loc", "version": "0.0.0",
+          "resolution": {"commit": "ddd7174069c9d981d0bacbc23fe74de3112ec706",
+                         "repo": "https://jihulab.com/james-curtis/vscode-loc", "type": "git"}}),
+        ("5.3", "git@bitbucket.org+my-org/my-bitbucket-project/6104ae42cd32c3d724036d3964678f197b2c9cdb",
+         {"name": "my-bitbucket-package", "version": "1.0.0",
+          "resolution": {"commit": "6104ae42cd32c3d724036d3964678f197b2c9cdb",
+                         "repo": "git@bitbucket.org:my-org/my-bitbucket-project.git", "type": "git"}}),
+    ])
+    def test_a_git_host_outside_the_allow_list_is_git_by_its_resolution(self, version, key, entry):
+        """Verbatim from the corpus (21 rows: jihulab.com, git@bitbucket.org+...)."""
+        record = split_key(version, key, entry, {})
+        assert (record.status, record.name, record.version, record.origin) == (SOURCE, entry["name"], entry["version"], "git")
+
+    @pytest.mark.parametrize("resolution", [{"directory": "../pkg"}, {"type": "directory"}])
+    def test_a_directory_is_known_by_either_field(self, resolution):
+        record = split_key("5.4", "file:../pkg", {"name": "pkg", "resolution": resolution}, {})
+        assert (record.status, record.origin) == (NOT_NPM, "local-dir")
+        assert record.reason == "local directory link, not a published artifact"
+
+    def test_a_codeload_tarball_is_git_whatever_the_key_says(self):
+        entry = {"name": "repo", "version": "1.0.0",
+                 "resolution": {"tarball": "https://codeload.github.com/owner/repo/tar.gz/abc123"}}
+        assert split_key("5.4", "git@github.com+owner/repo/abc123", entry, {}).origin == "git"
+
+    def test_a_remote_tarball_is_known_from_the_body_without_a_name(self):
+        entry = {"resolution": {"tarball": "https://github.com/visionmedia/dox/tarball/master"}}
+        record = split_key("5.4", "@github.com/visionmedia/dox/tarball/master", entry, {})
+        assert (record.status, record.origin) == (UNKNOWN, "remote-tarball")
+
+    def test_a_url_key_is_a_remote_tarball_even_without_a_resolution(self):
+        assert split_key("5.4", "https://example.com/x-1.0.0.tgz", {"name": "x", "version": "1.0.0"}, {}).origin == "remote-tarball"
+
+    def test_a_non_mapping_resolution_is_ignored_not_a_crash(self):
+        assert split_key("5.4", "file:x", {"name": "x", "resolution": "garbage"}, {}).status == UNKNOWN
+        assert split_key("9.0", "x@1.0.0", {"resolution": "garbage"}, {}).status == NPM
+
+
+class TestNineFileAndGitSubClauses:
+    """pnpmkeys.py:332-343."""
+
+    def test_a_directory_with_a_version_is_still_not_npm(self):
+        entry = {"version": "1.0.0", "resolution": {"type": "directory", "directory": "../dir"}}
+        record = split_key("9.0", "x@file:../dir", entry, {})
+        assert (record.status, record.version, record.origin) == (NOT_NPM, None, "local-dir")
+
+    def test_a_bare_file_path_with_no_body_at_all_is_a_directory(self):
+        record = split_key("9.0", "x@file:../dir", {}, None)
+        assert (record.status, record.origin) == (NOT_NPM, "local-dir")
+
+    def test_a_tgz_is_a_tarball_by_key_or_by_resolution(self):
+        assert split_key("9.0", "x@file:vendor/pkg.tgz", {}, {}).origin == "local-tarball"
+        assert split_key("9.0", "x@file:vendor/pkg", {"resolution": {"tarball": "file:vendor/pkg.tgz"}}, {}).origin == "local-tarball"
+
+    @pytest.mark.parametrize("key,repo", [("x@ssh://git@host/r.git#abc", "ssh://git@host/r.git"),
+                                          ("x@https://github.com/o/r.git#abc", "https://github.com/o/r.git")])
+    def test_type_git_makes_a_git_origin_whatever_the_url_scheme(self, key, repo):
+        entry = {"version": "1.0.0", "resolution": {"type": "git", "repo": repo, "commit": "abc"}}
+        record = split_key("9.0", key, entry, {})
+        assert (record.status, record.origin) == (SOURCE, "git")
+
+    def test_a_codeload_url_is_git(self):
+        entry = {"version": "3.1.0", "resolution": {"tarball": "https://codeload.github.com/aylur/ags/tar.gz/e169694"}}
+        assert split_key("9.0", "ags@https://codeload.github.com/aylur/ags/tar.gz/e169694", entry, {}).origin == "git"
+
+    def test_jsr_is_known_by_its_tarball_host_too(self):
+        entry = {"resolution": {"tarball": "https://npm.jsr.io/~/11/@jsr/std__fs/1.0.24.tgz"}}
+        record = split_key("9.0", "std__fs@1.0.24", entry, {})
+        assert (record.status, record.origin) == (OTHER_REGISTRY, "jsr")
+
+
+class TestMetadata:
+    """pnpmkeys.py:250 (patched from the body alone) and :134 (nested groups)."""
+
+    def test_a_5x_patch_is_known_only_from_the_body(self):
+        key = "/sirv/2.0.2_w6q35pvk7bmykgqf2hieut43iq"
+        assert split_key("5.4", key, {"patched": "true"}, {}).patched is True
+        assert split_key("5.4", key, {}, {}).patched is False
+
+    def test_nested_groups_are_peeled_as_one(self):
+        assert suffix_groups("a@1.0.0(b@2.0.0(c@3.0.0))(d@4.0.0)") == ("a@1.0.0", ["b@2.0.0(c@3.0.0)", "d@4.0.0"])
+
+
+class TestTheRegexGuardsInTheV5AndV6Parsers:
+    """pnpmkeys.py:186-187 (`_NAME` half) and :214-215 (a line no existing test executes)."""
+
+    def test_v6_rejects_a_non_semver_version(self):
+        record = split_key("6.0", "/x@notsemver", {}, {})
+        assert (record.status, record.name, record.version) == (UNKNOWN, None, None)
+
+    @pytest.mark.parametrize("version,key", [("5.4", "/a b/1.0.0"), ("6.0", "/a b@1.0.0"), ("5.4", "/a@b/1.0.0")])
+    def test_a_name_with_whitespace_or_a_stray_at_sign_is_not_a_name(self, version, key):
+        assert split_key(version, key, {}, {}).status == UNKNOWN
 
 class TestTheScanPathStillReachesNothing:
     def test_a_scan_does_not_import_the_splitter(self):

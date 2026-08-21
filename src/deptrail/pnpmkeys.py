@@ -37,7 +37,9 @@ caller that sees ``unknown`` knows to leave the repository INDETERMINATE.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+
+from .lockfile import LockfileParseError
 
 # Semver as pnpm writes it. Build metadata is allowed by the grammar and absent from every
 # real key; see the module docstring for why that matters.
@@ -80,8 +82,14 @@ class KeyRecord:
     reason: str = ""
 
 
-class UnsupportedLockfileVersion(ValueError):
-    """A ``lockfileVersion`` this module has no grammar for."""
+class UnsupportedLockfileVersion(LockfileParseError):
+    """A ``lockfileVersion`` this module has no grammar for.
+
+    A ``LockfileParseError`` because that is the condition: a lockfile in a format this
+    tool does not understand. ``history.py`` turns that into an unreadable snapshot and
+    an INDETERMINATE repository; as a bare ``ValueError`` it walked past that handler
+    and took the scan down with it.
+    """
 
 
 def band_of(lockfile_version: object) -> str:
@@ -150,15 +158,17 @@ def _host_split(base: str) -> tuple[str | None, str] | None:
     """``(host, rest)`` for a registry-shaped key, ``None`` for a location."""
     if base.startswith("/"):
         return None, base[1:]
-    if False:
+    if base.startswith(_PROTOCOLS):
         return None
     host, separator, rest = base.partition("/")
     if not separator or not _HOST.fullmatch(host):
         return None
-    # A hostname has a dot in it, or is localhost. Without this, `chalk/5.6.1` would read
-    # as host `chalk` -- that shape never occurs, but the guard costs nothing.
-    if "." not in host and host.split("+")[0] != "localhost":
-        return None
+    # No "must contain a dot" rule. pnpm's own `dependency-path.parse` has none, and
+    # `encode-registry` writes `http://verdaccio:4873` as `verdaccio+4873` -- a Docker
+    # service name, ordinary in CI. An earlier version required a dot to keep a
+    # hypothetical `chalk/5.6.1` from reading as host `chalk`; that shape is one pnpm
+    # never writes, and the guard it justified demoted every dotless private registry to
+    # a tarball of unknown provenance. Two reviews found it independently.
     return host, rest
 
 
@@ -216,6 +226,13 @@ def _parse_v6_identity(key: str) -> tuple[str, str, str | None] | None:
     return name, version, host
 
 
+def _flag(value: object) -> bool:
+    """A YAML boolean as the reader delivers it -- a string, so ``"false"`` is false."""
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "yes", "on")
+    return bool(value)
+
+
 def _origin_of(key: str, entry: dict) -> str | None:
     resolution = entry.get("resolution") or {}
     if not isinstance(resolution, dict):
@@ -247,12 +264,21 @@ def _split_v5v6(key: str, entry: object) -> KeyRecord:
         _, groups = suffix_groups(key)
     except _Unreadable as error:
         return KeyRecord(UNKNOWN, None, None, None, None, reason=str(error))
-    patched = bool(body.get("patched")) or any(g.startswith("patch_hash=") for g in groups)
+    patched = _flag(body.get("patched")) or any(g.startswith("patch_hash=") for g in groups)
     peers = tuple(g for g in groups if not g.startswith("patch_hash="))
     body_name, body_version = body.get("name"), body.get("version")
 
     def record(status, name, version, version_from, origin, reason=""):
         return KeyRecord(status, name, version, version_from, origin, patched, peers, reason)
+
+    # The body outranks the key, so the body has to be something worth outranking it
+    # with. A `version:` that is a mapping or a list is not a version; `str()` of it was
+    # being written into the record, and a record with `"{'x': 1}"` where a version
+    # belongs never matches an advisory -- a clean verdict manufactured from garbage.
+    for label, value in (("name", body_name), ("version", body_version)):
+        if value is not None and not isinstance(value, str):
+            return record(UNKNOWN, None, None, None, None,
+                          f"body {label} is a {type(value).__name__}, not a string")
 
     if identity is not None:
         key_name, key_version, host = identity
@@ -312,6 +338,9 @@ def _split_v9(key: str, entry: object, packages: object) -> KeyRecord:
     package_body = table.get(base)
     package_body = package_body if isinstance(package_body, dict) else {}
     body_version = body.get("version") or package_body.get("version")
+    if body_version is not None and not isinstance(body_version, str):
+        return KeyRecord(UNKNOWN, name, None, None, None, patched, peers,
+                         f"recorded version is a {type(body_version).__name__}, not a string")
     resolution = body.get("resolution") or package_body.get("resolution") or {}
     if not isinstance(resolution, dict):
         resolution = {}
