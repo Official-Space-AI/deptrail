@@ -569,7 +569,15 @@ def _flow_depth(text: str, depth: int, number: int) -> int:
         character = text[position]
         if character in ("'", '"') and at_scalar_start:
             _, position = _scan_quoted(text, position, number)
-            at_scalar_start = False
+            # A quoted key may be followed by its colon with no space -- `{"a":"}"}` is
+            # valid YAML and PyYAML reads the value as "}". Treating the closing quote as
+            # the end of a scalar left that colon unrecognised, so the brace inside the
+            # value counted as a closer. Found by the independent codex review.
+            if text[position:position + 1] == ":":
+                position += 1
+                at_scalar_start = True
+            else:
+                at_scalar_start = False
             continue
         if character == "#" and (at_scalar_start or text[position - 1] == " "):
             raise YamlSubsetError(
