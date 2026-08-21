@@ -30,6 +30,7 @@ both were live here and neither failed a test:
 """
 from __future__ import annotations
 
+import inspect
 import os
 import pathlib
 import random
@@ -576,14 +577,21 @@ class TestItRefusesRatherThanCrashing:
     reads without complaint.
     """
 
-    @pytest.mark.parametrize("name,text", [
-        ("nested flow sequences", "a: " + "[" * 2000 + "]" * 2000 + "\n"),
-        ("nested flow mappings", "a: " + "{a: " * 2000 + "1" + "}" * 2000 + "\n"),
-        ("nested block mappings", "".join(" " * i + "k:\n" for i in range(400))),
-    ])
-    def test_nesting_past_the_bound_is_refused(self, name, text):
+    # Parametrised on the name alone, and the input built inside. pytest turns a
+    # parameter into part of the test id, GitHub Actions puts the id in an environment
+    # variable, and Windows caps those at 32,767 characters -- so passing the 8 KB of
+    # brackets directly fails on one platform only, at setup, with a ValueError that
+    # names neither the test nor the parser. That has now cost this project two CI runs.
+    DEEP = {
+        "nested flow sequences": lambda n: "a: " + "[" * n + "]" * n + "\n",
+        "nested flow mappings": lambda n: "a: " + "{a: " * n + "1" + "}" * n + "\n",
+        "nested block mappings": lambda n: "".join(" " * i + "k:\n" for i in range(n)),
+    }
+
+    @pytest.mark.parametrize("name", sorted(DEEP))
+    def test_nesting_past_the_bound_is_refused(self, name):
         with pytest.raises(YamlSubsetError) as caught:
-            load_documents(text)
+            load_documents(self.DEEP[name](2000))
         assert "deeper than" in str(caught.value), str(caught.value)
 
     def test_a_long_run_of_empty_sequence_items_stays_flat(self):
@@ -679,6 +687,32 @@ class TestFindingsFromTheDifferentialRuns:
         for bad in ('a: "\\u 123"\n', 'a: "\\u+123"\n', 'a: "\\u1_23"\n'):
             with pytest.raises(YamlSubsetError):
                 load(bad)
+
+
+class TestTheSuiteItself:
+    """One guard, for a trap this project has now fallen into twice."""
+
+    def test_no_parametrised_value_could_overflow_a_windows_test_id(self):
+        """pytest folds a parameter into the test id, GitHub Actions puts the id in an
+        environment variable, and Windows caps those at 32,767 characters.
+
+        A parameter carrying its own input therefore fails on one platform only, during
+        setup, with a `ValueError` naming neither the test nor the parser. Both times it
+        happened the fix was the same -- parametrise on a short name and build the input
+        inside the test -- so this checks the shape rather than trusting the memory of
+        it. It covers any parametrize added to this module later, not just today's.
+        """
+        module = sys.modules[__name__]
+        oversized = []
+        for _, cls in inspect.getmembers(module, inspect.isclass):
+            for _, function in inspect.getmembers(cls, inspect.isfunction):
+                for mark in getattr(function, "pytestmark", ()):
+                    if mark.name != "parametrize":
+                        continue
+                    for value in mark.args[1]:
+                        if len(repr(value)) > 400:
+                            oversized.append((function.__qualname__, len(repr(value))))
+        assert not oversized, oversized
 
 
 class TestZeroRuntimeDependencies:
