@@ -25,8 +25,9 @@ Judgment model (shaped by adversarial review — see PR #8):
   failures, shallow clones, and discovered-but-unwalkable paths all become
   warnings, and a repo with warnings and no exposures is INDETERMINATE, not
   CLEAN. A snapshot that parsed but left rows unread (``LockfileModel.unread``)
-  warns the same way, and cannot end an exposure interval either: the version
-  may still be pinned in a row nobody could read.
+  warns the same way -- once per snapshot, whatever the window -- and cannot end
+  an exposure interval either: the version may still be pinned in a row nobody
+  could read.
 - **A tree we cannot read is not a tree without exposure.** Only npm lockfiles
   are parsed. A tree locked with Yarn, pnpm, Bun or Deno is recorded in
   ``unread_trees`` and makes the repo INDETERMINATE —
