@@ -101,6 +101,8 @@ class TestRealLockfiles:
             "pnpm-v9-two-documents.yaml",
             "pnpm-v9-sequence-of-mappings.yaml",
             "pnpm-v9-block-scalar.yaml",
+            "pnpm-v9-header-lies.yaml",
+            "pnpm-v9-mixed-keys.yaml",
             "yarn-berry.lock",
             "yarn-berry-v4.lock",
         }

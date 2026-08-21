@@ -244,6 +244,71 @@ class TestTheBodyIsOnlyTrustedWhenItIsText:
         assert (record.version, record.version_from) == ("5.6.2", "packages-body")
 
 
+class TestABlankBodyIsNotAnIdentity:
+    """``version: ''`` outranked the key in 5.x/6.x and produced a row whose version is
+    the empty string, which no advisory names: a clean verdict from a malformed body."""
+
+    @pytest.mark.parametrize("value", ["''", '""', "'   '"])
+    def test_a_blank_body_version_is_unknown_before_nine(self, value):
+        entry = {"name": "chalk", "version": value.strip("'\"")}
+        record = split_key("6.0", "/chalk@5.6.1", entry)
+        assert record.status == UNKNOWN
+        assert record.reason == "body version is blank"
+
+    def test_a_blank_body_name_is_unknown_before_nine(self):
+        record = split_key("5.4", "/chalk/5.6.1", {"name": "", "version": "5.6.1"})
+        assert record.status == UNKNOWN and record.reason == "body name is blank"
+
+    def test_a_whitespace_recorded_version_is_unknown_in_nine(self):
+        record = split_key("9.0", "chalk@5.6.1", {"version": "  "}, {})
+        assert record.status == UNKNOWN and record.reason == "recorded version is blank"
+
+    def test_an_empty_recorded_version_in_nine_falls_back_to_the_key(self):
+        """``''`` is falsy, so 9.0 never read it as a version in the first place."""
+        record = split_key("9.0", "chalk@5.6.1", {"version": ""}, {})
+        assert (record.status, record.version, record.version_from) == (NPM, "5.6.1", "key")
+
+    @pytest.mark.parametrize("body, reason", [
+        ({"name": "chalk ", "version": "5.6.1"}, "body name 'chalk ' is not a name"),
+        ({"name": "not a name at all", "version": "5.6.1"}, "body name 'not a name at all' is not a name"),
+        ({"name": "(root)", "version": "5.6.1"}, "body name '(root)' is not a name"),
+        ({"name": "chalk", "version": "not a version"}, "body version 'not a version' is not a version"),
+        ({"name": "chalk\n", "version": "5.6.1"}, "body name 'chalk\\n' is not a name"),
+        ({"name": "chalk", "version": "5.6.1\n"}, "body version '5.6.1\\n' is not a version"),
+    ])
+    def test_a_body_that_is_not_an_identity_does_not_outrank_the_key(self, body, reason):
+        record = split_key("6.0", "/chalk@5.6.1", body)
+        assert (record.status, record.reason) == (UNKNOWN, reason)
+
+    def test_a_nine_recorded_version_that_is_not_semver_is_unknown(self):
+        record = split_key("9.0", "chalk@5.6.1", {"version": "not a version"}, {})
+        assert (record.status, record.reason) == (UNKNOWN, "recorded version 'not a version' is not a version")
+
+    def test_a_git_row_keeps_the_version_pnpm_recorded_even_when_it_is_a_git_spec(self):
+        """pnpm's own fixture ``fixtures-with-non-package-dep``: a repository with no
+        package.json version gets its git spec recorded as the version. The row is
+        ``source`` and never answers for a registry version, so the odd string costs
+        nothing; refusing it made the whole lockfile unreadable."""
+        key = "github.com/denolib/camelcase/aeb6b15f9c9957c8fa56f9731e914c4d8a6d2f2b"
+        body = {"resolution": {"tarball": "https://codeload.github.com/denolib/camelcase/tar.gz/"
+                                          "aeb6b15f9c9957c8fa56f9731e914c4d8a6d2f2b"},
+                "name": "camelcase",
+                "version": "denolib/camelcase#aeb6b15f9c9957c8fa56f9731e914c4d8a6d2f2b"}
+        record = split_key("5.4", key, body)
+        assert (record.status, record.name, record.version, record.origin) == (
+            SOURCE, "camelcase", "denolib/camelcase#aeb6b15f9c9957c8fa56f9731e914c4d8a6d2f2b", "git")
+        nine = split_key("9.0", "camelcase@https://codeload.github.com/denolib/camelcase/tar.gz/aeb6b15f",
+                         {}, {"camelcase@https://codeload.github.com/denolib/camelcase/tar.gz/aeb6b15f": body})
+        assert (nine.status, nine.version) == (SOURCE, body["version"])
+
+    @pytest.mark.parametrize("version, key", [("9.0", "chalk@5.6.1\n"), ("6.0", "/chalk@5.6.1\n"),
+                                              ("5.4", "/chalk/5.6.1\n")])
+    def test_a_key_with_a_trailing_newline_is_not_a_version(self, version, key):
+        """``$`` matches before a trailing newline; ``fullmatch`` does not."""
+        record = split_key(version, key, {}, {})
+        assert record.status == UNKNOWN
+
+
 class TestPatchedIsAStringBoolean:
     """The reader delivers `patched: true` as the string `"true"`; `bool("false")` is
     True. Real lockfiles only ever write `true` (241 rows, 106 files), so nothing was
@@ -343,14 +408,24 @@ class TestAgainstTheFixtureLockfiles:
         record = split_key(document["lockfileVersion"], first_key, packages[first_key], packages)
         assert (record.status, record.name, record.version) == (NPM, *expected)
 
+    # Two fixtures hold keys the declared grammar refuses on purpose: a 9.0 header over
+    # seven 6.x keys, and a 9.0 document with two legacy keys among eleven. The document
+    # reader (``pnpmlock``) decides what becomes of those; here they are pinned so the
+    # splitter keeps refusing them per key.
+    UNKNOWN_BY_DESIGN = {"pnpm-v9-header-lies.yaml": 7, "pnpm-v9-mixed-keys.yaml": 2}
+
     def test_every_key_in_every_fixture_splits_to_a_known_status(self):
         for path in sorted(FIXTURES.joinpath("yaml").glob("pnpm-*.yaml")):
+            unknown = 0
             for document in load_documents(path.read_text(encoding="utf-8")):
                 packages = document.get("packages") or {}
                 for section in (packages, document.get("snapshots") or {}):
                     for key, entry in section.items():
                         record = split_key(document["lockfileVersion"], key, entry, packages)
-                        assert record.status != UNKNOWN, (path.name, key, record.reason)
+                        if record.status == UNKNOWN:
+                            unknown += 1
+                            assert path.name in self.UNKNOWN_BY_DESIGN, (path.name, key, record.reason)
+            assert unknown == self.UNKNOWN_BY_DESIGN.get(path.name, 0), path.name
 
 
 # ---------------------------------------------------------------------------------------

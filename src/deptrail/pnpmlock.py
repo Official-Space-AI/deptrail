@@ -64,12 +64,16 @@ _LEGACY_GRAMMAR = "6.0"
 def parse_pnpm_lockfile(text: str) -> LockfileModel:
     """Every document in ``text``, merged into one model.
 
+    Each document is read under its own header; the merged model reports the last
+    one's, which is the project's. A key pinned by both documents is two rows, one per
+    install.
+
     Raises ``LockfileParseError`` when the text is not a pnpm lockfile this module can
     read at all: not YAML in the subset, no document, a document that is not a mapping,
     no ``lockfileVersion`` or one with no grammar, a ``packages:`` that is not a mapping.
     A row that will not read is not one of those; it lands in ``unread``.
     """
-    documents = load_documents(text)
+    documents = [d for d in load_documents(text) if d is not None]  # a trailing `---`
     if not documents:
         raise LockfileParseError("no YAML document in the lockfile")
     models = [_read_document(document, index) for index, document in enumerate(documents)]
@@ -98,7 +102,10 @@ def _read_document(document: object, index: int) -> LockfileModel:
     grammar = declared_version
     rows = _rows(grammar, packages, snapshots)
     if band == "v9" and rows and all(record.status == UNKNOWN for _, _, record in rows):
-        legacy = _rows(_LEGACY_GRAMMAR, packages, snapshots)
+        # The same keys, re-split: a row the 9.0 pass took from `snapshots:` stays a row,
+        # so that nothing the document holds goes missing on the way to `unread`.
+        legacy = [(key, entry, split_key(_LEGACY_GRAMMAR, key, entry))
+                  for key, entry, _ in rows]
         if any(record.status != UNKNOWN for _, _, record in legacy):
             grammar, rows = _LEGACY_GRAMMAR, legacy
 
@@ -168,6 +175,8 @@ def _rows(grammar: object, packages: dict,
             for key, entry in packages.items()]
     if band_of(grammar) == "v9":
         for key, entry in snapshots.items():
+            if key in packages:
+                continue
             record = split_key(grammar, key, entry, packages)
             if record.status == UNKNOWN or suffix_groups(key)[0] not in packages:
                 rows.append((key, entry, record))

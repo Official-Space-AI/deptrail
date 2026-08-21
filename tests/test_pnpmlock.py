@@ -144,6 +144,16 @@ class TestWhatARowBecomes:
         assert len(model.unread) == 1
         assert model.unread[0].startswith("/what@is@this: ")
 
+    def test_a_blank_body_version_is_unread_not_an_empty_version(self):
+        model = parse(V6_HEAD + """
+              /chalk@5.6.1:
+                resolution: {integrity: sha512-x}
+                name: chalk
+                version: ''
+            """)
+        assert model.packages == []
+        assert model.unread == ["/chalk@5.6.1: body version is blank"]
+
     def test_a_body_version_that_is_not_text_is_unread_not_a_version(self):
         model = parse(V6_HEAD + """
               /chalk@5.6.1:
@@ -219,6 +229,9 @@ class TestNineRowsComeFromPackagesAndEdgesFromSnapshots:
           loose-envify@1.4.0:
             resolution: {integrity: sha512-d}
 
+          scheduler@0.23.0:
+            resolution: {integrity: sha512-e}
+
         snapshots:
 
           trpc@1.0.0(react@18.3.1):
@@ -228,6 +241,7 @@ class TestNineRowsComeFromPackagesAndEdgesFromSnapshots:
           trpc@1.0.0(react@17.0.2):
             dependencies:
               react: 17.0.2
+              scheduler: 0.23.0
 
           react@18.3.1:
             dependencies:
@@ -238,19 +252,24 @@ class TestNineRowsComeFromPackagesAndEdgesFromSnapshots:
               loose-envify: 1.4.0
 
           loose-envify@1.4.0: {}
+          scheduler@0.23.0: {}
         """
 
     def test_one_row_per_packages_entry_however_many_peer_variants(self):
         model = parse(self.DOC)
         assert [(p.name, p.version) for p in model.packages] == [
-            ("trpc", "1.0.0"), ("react", "18.3.1"), ("react", "17.0.2"), ("loose-envify", "1.4.0")]
+            ("trpc", "1.0.0"), ("react", "18.3.1"), ("react", "17.0.2"), ("loose-envify", "1.4.0"),
+            ("scheduler", "0.23.0")]
         assert model.versions_of("react") == {"18.3.1", "17.0.2"}
 
     def test_edges_are_the_union_over_the_variants(self):
+        """Only the react@17 variant of trpc depends on scheduler; the edge is trpc's
+        whichever variant was installed, so it is kept."""
         model = parse(self.DOC)
-        assert model.declared["trpc"] == {"react"}
+        assert model.declared["trpc"] == {"react", "scheduler"}
         assert model.declared["react"] == {"loose-envify"}
         assert model.chain_to("loose-envify") == ["react", "loose-envify"]
+        assert model.chain_to("scheduler") == ["trpc", "scheduler"]
 
     def test_a_snapshot_whose_base_has_no_packages_entry_is_still_a_row(self):
         model = parse("""\
@@ -272,6 +291,21 @@ class TestNineRowsComeFromPackagesAndEdgesFromSnapshots:
         assert rows(model) == [("orphan", "2.0.0", NPM, "orphan@2.0.0(react@18.3.1)"),
                                ("react", "18.3.1", NPM, "react@18.3.1")]
         assert model.declared["orphan"] == {"react"}
+
+    def test_a_key_present_in_both_sections_is_one_row(self):
+        model = parse("""\
+            lockfileVersion: '9.0'
+
+            packages:
+
+              foo@1.0.0(bar@2.0.0):
+                resolution: {integrity: sha512-a}
+
+            snapshots:
+
+              foo@1.0.0(bar@2.0.0): {}
+            """)
+        assert rows(model) == [("foo", "1.0.0", NPM, "foo@1.0.0(bar@2.0.0)")]
 
     def test_a_packages_entry_that_carries_edges_is_read_too(self):
         """64 of 467,116 real 9.0 ``packages:`` entries have a dependencies block."""
@@ -350,6 +384,8 @@ class TestTheHeaderCanLie:
             """)
         assert model.packages == []
         assert len(model.unread) == 2
+        assert all("separator" in m or "implausible" in m for m in model.unread), \
+            "the reasons are the declared grammar's, not the legacy grammar's"
 
     def test_re_reading_happens_only_when_nothing_read_under_nine(self):
         model = parse("""\
@@ -369,6 +405,54 @@ class TestTheHeaderCanLie:
             """)
         assert rows(model) == [("chalk", "5.6.1", NPM, "chalk@5.6.1")]
         assert len(model.unread) == 1 and model.unread[0].startswith("/ansi-styles@6.2.1: ")
+
+    def test_re_reading_keeps_every_row_the_nine_pass_took_from_snapshots(self):
+        """Re-reading under 6.0 used to look at ``packages:`` only, so three rows that
+        the 9.0 pass had as unread were simply gone -- no row, no unread, a clean tree."""
+        model = parse("""\
+            lockfileVersion: '9.0'
+
+            packages:
+
+              /chalk@5.6.1:
+                resolution: {integrity: sha512-a}
+
+            snapshots:
+
+              /lodash@4.17.21:
+                dependencies:
+                  ms: 2.1.3
+
+              '@@@': {}
+
+              /ms@2.1.3: {}
+            """)
+        assert rows(model) == [("chalk", "5.6.1", NPM, "/chalk@5.6.1"),
+                               ("lodash", "4.17.21", NPM, "/lodash@4.17.21"),
+                               ("ms", "2.1.3", NPM, "/ms@2.1.3")]
+        assert model.declared["lodash"] == {"ms"}
+        assert len(model.unread) == 1 and model.unread[0].startswith("@@@: ")
+
+    def test_re_reading_needs_one_legacy_key_to_read_not_all_of_them(self):
+        """Requiring every key to read under the legacy grammar would leave a document
+        with one garbage key wholly unread, when 157 of its rows were there to be had."""
+        model = parse("""\
+            lockfileVersion: '9.0'
+
+            packages:
+
+              /chalk@5.6.1:
+                resolution: {integrity: sha512-a}
+
+              /ansi-styles@6.2.1:
+                resolution: {integrity: sha512-b}
+
+              what is this:
+                resolution: {integrity: sha512-c}
+            """)
+        assert model.versions_of("chalk") == {"5.6.1"}
+        assert model.versions_of("ansi-styles") == {"6.2.1"}
+        assert len(model.unread) == 1 and model.unread[0].startswith("what is this: ")
 
 
 class TestWhatTheProjectDependsOn:
@@ -614,6 +698,203 @@ class TestEdgesResolveToWhatTheyInstall:
         assert model.packages == []
 
 
+class TestShapesTheCorpusDoesNotHave:
+    """Each of these is a mutation of the reader that every real lockfile survived."""
+
+    def test_an_unreadable_snapshot_with_edges_does_not_declare_under_no_name(self):
+        model = parse("""\
+            lockfileVersion: '9.0'
+
+            packages:
+
+              chalk@5.6.1:
+                resolution: {integrity: sha512-a}
+
+            snapshots:
+
+              chalk@5.6.1: {}
+
+              '@@@':
+                dependencies:
+                  chalk: 5.6.1
+            """)
+        assert None not in model.declared
+        assert set(model.declared) == {ROOT, "chalk"}
+        assert len(model.unread) == 1
+
+    def test_an_edge_value_that_is_not_text_keeps_the_declared_name(self):
+        model = parse(V6_HEAD + """
+              /chalk@5.6.1:
+                resolution: {integrity: sha512-a}
+                dependencies:
+                  a: [1, 2]
+                  b: {x: 1}
+                  c: ~
+            """)
+        assert model.declared["chalk"] == {"a", "b", "c"}
+
+    def test_a_nine_alias_whose_value_is_a_snapshot_key_with_a_peer_suffix(self):
+        """The alias value carries the peer suffix, so it is a key of ``snapshots:`` and
+        not of ``packages:``; 20 of 176 sampled files have one."""
+        model = parse("""\
+            lockfileVersion: '9.0'
+
+            importers:
+
+              .:
+                dependencies:
+                  chalk:
+                    specifier: ^5.0.0
+                    version: 5.6.1
+
+            packages:
+
+              chalk@5.6.1:
+                resolution: {integrity: sha512-a}
+
+              safe-execa@0.1.2:
+                resolution: {integrity: sha512-b}
+
+              typescript@5.2.2:
+                resolution: {integrity: sha512-c}
+
+            snapshots:
+
+              chalk@5.6.1:
+                dependencies:
+                  execa: safe-execa@0.1.2(typescript@5.2.2)
+
+              safe-execa@0.1.2(typescript@5.2.2):
+                dependencies:
+                  typescript: 5.2.2
+
+              typescript@5.2.2: {}
+            """)
+        assert model.declared["chalk"] == {"safe-execa"}
+        assert model.chain_to("typescript") == ["chalk", "safe-execa", "typescript"]
+
+    def test_peer_dependencies_are_not_edges(self):
+        """A peer dependency is a constraint on whoever installs the package, not an
+        edge to an instance; reading it blamed a plugin that never installed react."""
+        model = parse("""\
+            lockfileVersion: '6.0'
+
+            importers:
+
+              .:
+                dependencies:
+                  aaa-plugin:
+                    specifier: ^1.0.0
+                    version: 1.0.0
+                  zzz-lib:
+                    specifier: ^1.0.0
+                    version: 1.0.0
+
+            packages:
+
+              /aaa-plugin@1.0.0:
+                resolution: {integrity: sha512-a}
+                peerDependencies:
+                  react: '*'
+
+              /zzz-lib@1.0.0:
+                resolution: {integrity: sha512-b}
+                dependencies:
+                  react: 18.3.1
+
+              /react@18.3.1:
+                resolution: {integrity: sha512-c}
+            """)
+        assert model.declared["aaa-plugin"] == set()
+        assert model.chain_to("react") == ["zzz-lib", "react"]
+
+    def test_config_dependencies_are_roots(self):
+        model = parse("""\
+            lockfileVersion: '9.0'
+
+            importers:
+
+              .:
+                configDependencies:
+                  '@acme/pnpm-config':
+                    specifier: 1.2.0
+                    version: 1.2.0
+
+            packages:
+
+              '@acme/pnpm-config@1.2.0':
+                resolution: {integrity: sha512-a}
+
+            snapshots:
+
+              '@acme/pnpm-config@1.2.0': {}
+            """)
+        assert model.root_deps == {"@acme/pnpm-config"}
+
+    def test_an_unbalanced_snapshot_key_is_unread(self):
+        model = parse("""\
+            lockfileVersion: '9.0'
+
+            packages:
+
+              chalk@5.6.1:
+                resolution: {integrity: sha512-a}
+
+            snapshots:
+
+              chalk@5.6.1: {}
+
+              'foo@1.0.0)':
+                dependencies:
+                  chalk: 5.6.1
+            """)
+        assert rows(model) == [("chalk", "5.6.1", NPM, "chalk@5.6.1")]
+        assert len(model.unread) == 1 and model.unread[0].startswith("foo@1.0.0): ")
+
+    def test_a_re_read_document_resolves_its_package_edges_under_the_grammar_it_was_read_with(self):
+        model = parse("""\
+            lockfileVersion: '9.0'
+
+            packages:
+
+              /chalk@5.6.1:
+                resolution: {integrity: sha512-a}
+                dependencies:
+                  execa: /safe-execa@0.1.2
+
+              /safe-execa@0.1.2:
+                resolution: {integrity: sha512-b}
+            """)
+        assert model.unread == []
+        assert model.declared["chalk"] == {"safe-execa"}
+
+    def test_optional_dependencies_are_edges_in_packages_and_in_importers(self):
+        model = parse("""\
+            lockfileVersion: '6.0'
+
+            importers:
+
+              .:
+                optionalDependencies:
+                  fsevents:
+                    specifier: ^2.3.0
+                    version: 2.3.3
+
+            packages:
+
+              /fsevents@2.3.3:
+                resolution: {integrity: sha512-a}
+                optionalDependencies:
+                  node-gyp-build: 4.8.0
+
+              /node-gyp-build@4.8.0:
+                resolution: {integrity: sha512-b}
+            """)
+        assert model.root_deps == {"fsevents"}
+        assert model.declared["fsevents"] == {"node-gyp-build"}
+        assert model.chain_to("node-gyp-build") == ["fsevents", "node-gyp-build"]
+
+
 class TestTwoDocuments:
     def test_both_documents_are_in_the_model(self):
         model = parse_pnpm_lockfile(FIXTURES.joinpath("pnpm-v9-two-documents.yaml").read_text())
@@ -695,6 +976,22 @@ class TestWhatIsRefused:
             parse_pnpm_lockfile(text)
         assert fragment in str(error.value)
 
+    def test_a_trailing_document_marker_is_not_a_document(self):
+        model = parse("""\
+            lockfileVersion: '9.0'
+
+            packages:
+
+              chalk@5.6.1:
+                resolution: {integrity: sha512-a}
+
+            snapshots:
+
+              chalk@5.6.1: {}
+            ---
+            """)
+        assert model.versions_of("chalk") == {"5.6.1"}
+
     def test_an_empty_packages_section_is_a_model_with_no_packages(self):
         model = parse("""\
             lockfileVersion: 5.4
@@ -709,6 +1006,29 @@ class TestAgainstTheFixtureLockfiles:
     each key of the row sections is either a package, an unread message, or a row that
     reads to a name without a version. Counts come from the raw document."""
 
+    @staticmethod
+    def expected_rows(document) -> tuple[list[str], int]:
+        """The row keys of one document and how many of them read to a name without a
+        version, computed from the raw document under the grammar the reader would use
+        (re-read under 6.0 when nothing reads under a declared 9.0)."""
+        version = document["lockfileVersion"]
+        packages = document.get("packages") or {}
+        snapshots = document.get("snapshots") or {}
+        keys = list(packages)
+        if str(version).startswith("9"):
+            keys += [k for k in snapshots if suffix_groups(k)[0] not in packages]
+
+        def records(grammar):
+            return [split_key(grammar, k, packages.get(k, snapshots.get(k)), packages) for k in keys]
+        found = records(version)
+        if str(version).startswith("9") and found and all(r.status == "unknown" for r in found):
+            legacy = records("6.0")
+            if any(r.status != "unknown" for r in legacy):
+                found = legacy
+        name_only = sum(1 for r in found
+                        if r.status != "unknown" and r.name is not None and r.version is None)
+        return keys, name_only
+
     @pytest.mark.parametrize("path", sorted(FIXTURES.glob("pnpm-*.yaml")), ids=lambda p: p.name)
     def test_every_key_is_accounted_for_exactly_once(self, path):
         text = path.read_text(encoding="utf-8")
@@ -716,20 +1036,58 @@ class TestAgainstTheFixtureLockfiles:
         keys: list[str] = []
         name_only = 0
         for document in load_documents(text):
-            packages = document.get("packages") or {}
-            snapshots = document.get("snapshots") or {}
-            keys += list(packages)
-            if str(document["lockfileVersion"]).startswith("9"):
-                keys += [k for k in snapshots if suffix_groups(k)[0] not in packages]
-            for key in keys:
-                record = split_key(document["lockfileVersion"], key,
-                                   packages.get(key, snapshots.get(key)), packages)
-                name_only += record.status != "unknown" and record.version is None
+            document_keys, document_name_only = self.expected_rows(document)
+            assert len(set(document_keys)) == len(document_keys)
+            keys += document_keys
+            name_only += document_name_only
         paths = [p.path for p in model.packages]
-        assert len(set(keys)) == len(keys)
         assert len(paths) + len(model.unread) + name_only == len(keys), path.name
         assert set(paths) <= set(keys)
         assert all(message.split(": ", 1)[0] in keys for message in model.unread)
+
+    def test_the_accounting_can_fail(self):
+        """A two-document file where the first document holds a name-only row, and a
+        lying header over a directory row: the two shapes that made an earlier version
+        of the count wrong while the model was right."""
+        text = textwrap.dedent("""\
+            ---
+            lockfileVersion: '9.0'
+
+            packages:
+
+              local-tool@file:../local-tool:
+                resolution: {directory: ../local-tool, type: directory}
+
+              pnpm@12.0.0:
+                resolution: {integrity: sha512-a}
+
+            snapshots:
+
+              local-tool@file:../local-tool: {}
+              pnpm@12.0.0: {}
+            ---
+            lockfileVersion: '9.0'
+
+            packages:
+
+              /chalk@5.6.1:
+                resolution: {integrity: sha512-b}
+
+              file:../local-rules:
+                resolution: {directory: ../local-rules, type: directory}
+                name: local-rules
+            """)
+        model = parse_pnpm_lockfile(text)
+        assert rows(model) == [("chalk", "5.6.1", NPM, "/chalk@5.6.1"), ("pnpm", "12.0.0", NPM, "pnpm@12.0.0")]
+        assert model.unread == []
+        assert {"local-tool", "local-rules"} <= set(model.declared)
+        keys, name_only = [], 0
+        for document in load_documents(text):
+            document_keys, document_name_only = self.expected_rows(document)
+            keys += document_keys
+            name_only += document_name_only
+        assert (len(keys), name_only) == (4, 2)
+        assert len(model.packages) + len(model.unread) + name_only == len(keys)
 
     @pytest.mark.parametrize("name, package, versions", [
         ("pnpm-v5.4.yaml", "@algolia/autocomplete-core", {"1.6.3"}),
