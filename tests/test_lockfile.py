@@ -114,19 +114,36 @@ class TestOriginDecidesWhatAnAdvisoryCanMatch:
         for package in parse_lockfile(load("v3")).packages:
             assert package.origin == NPM
 
-    def test_a_source_row_of_the_same_name_and_version_does_not_answer(self):
+    def test_a_source_row_stays_in_the_inventory_and_does_not_answer(self):
+        # The real rows share the version; the tarball here says 2.0.1 so that the
+        # assertion can tell the filter from its absence.
         model = _model(InstalledPackage("ci-info", "2.0.0", "ci-info@2.0.0"),
-                       InstalledPackage("ci-info", "2.0.0", "ci-info@https://codeload/...",
+                       InstalledPackage("ci-info", "2.0.1", "ci-info@https://codeload/...",
                                         origin=SOURCE))
         assert model.versions_of("ci-info") == {"2.0.0"}
         assert len(model.packages) == 2, "the tarball stays in the inventory"
+        assert [p.version for p in model.instances_of("ci-info")] == ["2.0.0"]
 
-    @pytest.mark.parametrize("origin", [SOURCE, OTHER_REGISTRY, NOT_NPM])
-    def test_a_name_installed_only_from_elsewhere_has_no_npm_versions(self, origin):
+    @pytest.mark.parametrize("origin", [SOURCE, NOT_NPM])
+    def test_a_name_installed_only_from_git_or_as_a_runtime_has_no_versions(self, origin):
         model = _model(InstalledPackage("ci-info", "2.0.0", "k", origin=origin),
                        declared={"app": {"ci-info"}}, root_deps={"app"})
         assert model.versions_of("ci-info") == set()
         assert model.chain_to("ci-info") is None
+
+    def test_a_row_from_another_registry_answers_because_it_may_proxy_npmjs(self):
+        model = _model(InstalledPackage("semver", "7.6.3", "semver@verdaccio:7.6.3",
+                                        origin=OTHER_REGISTRY),
+                       declared={"app": {"semver"}}, root_deps={"app"})
+        assert model.versions_of("semver") == {"7.6.3"}
+        assert model.chain_to("semver") == ["app", "semver"]
+
+    @pytest.mark.parametrize("origin", ["registry", "git", "local-dir", "", "unknown"])
+    def test_an_origin_outside_the_vocabulary_is_refused_at_construction(self, origin):
+        """``pnpmkeys.KeyRecord.origin`` holds a different vocabulary; a parser that
+        copies it across would otherwise build a model in which nothing answers."""
+        with pytest.raises(ValueError, match="origin"):
+            InstalledPackage("a", "1.0.0", "a@1.0.0", origin=origin)
 
     def test_the_same_name_from_two_origins_keeps_the_npm_versions_apart(self):
         model = _model(InstalledPackage("vue", "3.5.13", "vue@3.5.13"),
@@ -157,6 +174,13 @@ class TestTheDeclaredVersionIsText:
         model = parse_lockfile('{"lockfileVersion": %s, "packages": {"": {}}}' % literal)
         assert model.lockfile_version == text
         assert isinstance(model.lockfile_version, str)
+
+    @pytest.mark.parametrize("literal", ['"three"', '"6.0"', '"5.3-inlineSpecifiers"'])
+    def test_what_int_refuses_is_still_refused(self, literal):
+        """Text the field can now hold is not text the npm parser accepts: a
+        lockfileVersion npm never wrote is not an npm lockfile."""
+        with pytest.raises(LockfileParseError):
+            parse_lockfile('{"lockfileVersion": %s, "packages": {"": {}}}' % literal)
 
     def test_an_npm_lockfile_without_the_field_is_read_as_2(self):
         assert parse_lockfile('{"packages": {"": {}}}').lockfile_version == "2"
