@@ -1,9 +1,12 @@
-"""Parser for npm lockfiles (lockfileVersion 1, 2, 3) into one normalized model.
+"""The normalized lockfile model, and the parser for npm lockfiles (lockfileVersion 1, 2, 3).
 
 The forensic engine only needs two answers from a lockfile snapshot:
   1. which versions of a package were pinned at that point in history, and
   2. through which dependency chain the package entered the tree.
 Everything else in the lockfile is deliberately ignored.
+
+``LockfileModel`` is what every lockfile dialect is read into; the npm parser lives here
+because it was the first, and the pnpm one (``pnpmlock``) builds the same model.
 """
 from __future__ import annotations
 
@@ -11,6 +14,17 @@ import json
 from dataclasses import dataclass, field
 
 ROOT = "(root)"
+
+# Where an installed package came from, which decides whether its (name, version) is an
+# identity an npm advisory can be about. A git tarball whose package.json says 2.0.0 is
+# not the registry's 2.0.0: reporting an advisory against it is a claim about a GitHub
+# tarball, and merging the two rows did exactly that (``ci-info`` in ``vercel/next.js``).
+# Dropping such rows instead is also wrong -- a pinned git tarball would vanish from the
+# inventory -- so they stay, labelled, and ``versions_of`` leaves them out.
+NPM = "npm"                        # an npmjs identity: match advisories on (name, version)
+OTHER_REGISTRY = "other-registry"  # a real identity in another namespace, such as JSR
+SOURCE = "source"                  # a real name and version, but built from git or a tarball
+NOT_NPM = "not-npm"                # cannot be an advisory target: a local directory, a runtime
 
 
 class LockfileParseError(ValueError):
@@ -24,21 +38,37 @@ class InstalledPackage:
     name: str
     version: str
     path: str  # tree location, e.g. "node_modules/a/node_modules/b"; "" is the root project
+    origin: str = NPM  # one of NPM, OTHER_REGISTRY, SOURCE, NOT_NPM; see the comment above
 
 
 @dataclass
 class LockfileModel:
     """Normalized view of a lockfile snapshot, independent of lockfileVersion."""
 
-    lockfile_version: int
+    # The ``lockfileVersion`` the file declares, as text: npm writes integers, pnpm writes
+    # ``5.4``, ``6.0`` and once ``5.3-inlineSpecifiers``, and nothing reads this field
+    # as a number.
+    lockfile_version: str
     root_name: str
     root_deps: set[str]
     packages: list[InstalledPackage]
     # declarer package name -> names it declares as dependencies (name-level graph)
     declared: dict[str, set[str]] = field(default_factory=dict)
+    # Rows the parser found but could not read into a package, one message each. A
+    # row that is not read is a version that may have been installed and is not shown
+    # here, so a model with anything in ``unread`` must not be taken as a clean tree.
+    # Raising instead would hide every row that *was* readable; dropping the row would
+    # call the tree clean.
+    unread: list[str] = field(default_factory=list)
 
     def versions_of(self, name: str) -> set[str]:
-        return {p.version for p in self.packages if p.name == name}
+        """Versions of ``name`` installed from the npm registry.
+
+        Only ``NPM`` rows answer: an advisory names a registry artifact, and a package
+        of the same name and version built from git or fetched from another registry is
+        a different artifact. The other rows are still in ``packages`` for inventory.
+        """
+        return {p.version for p in self.packages if p.name == name and p.origin == NPM}
 
     def chain_to(self, name: str) -> list[str] | None:
         """Shortest name-level dependency chain from a direct dependency down to `name`.
@@ -122,7 +152,8 @@ def _declared_names(entry: dict) -> set[str]:
 
 
 def _parse_packages_format(data: dict) -> LockfileModel:
-    version = int(data.get("lockfileVersion", 2))
+    # npm writes an integer; anything ``int()`` refuses is not an npm lockfile.
+    version = str(int(data.get("lockfileVersion", 2)))
     packages_block: dict = data["packages"]
     root_entry = packages_block.get("", {})
     root_name = data.get("name") or root_entry.get("name") or "(unnamed)"
@@ -184,7 +215,7 @@ def _parse_v1(data: dict) -> LockfileModel:
     walk(data["dependencies"], "")
     root_deps = top_level - required_by_someone or top_level
     return LockfileModel(
-        lockfile_version=1,
+        lockfile_version="1",
         root_name=data.get("name") or "(unnamed)",
         root_deps=root_deps,
         packages=installed,

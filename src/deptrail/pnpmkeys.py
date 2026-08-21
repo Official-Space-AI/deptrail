@@ -39,7 +39,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from .lockfile import LockfileParseError
+from .lockfile import NOT_NPM, NPM, OTHER_REGISTRY, SOURCE, LockfileParseError
 
 # Semver as pnpm writes it. Build metadata is allowed by the grammar and absent from every
 # real key; see the module docstring for why that matters.
@@ -53,11 +53,9 @@ _GIT_HOSTS = ("github.com/", "gitlab.com/", "bitbucket.org/", "git.sr.ht/",
               "codeload.github.com/")
 _PROTOCOL = re.compile(r"^([a-z][a-z0-9+.-]*):(.*)$")
 
-# What a row is, from the point of view of "was this compromised version installed".
-NPM = "npm"                      # an npmjs identity: match advisories on (name, version)
-OTHER_REGISTRY = "other-registry"  # a real identity in another namespace, such as JSR
-SOURCE = "source"                # a real name and version, but built from git or a tarball
-NOT_NPM = "not-npm"              # cannot be an advisory target: a local directory, a runtime
+# What a row is, from the point of view of "was this compromised version installed". The
+# four that describe a readable row are the model's ``InstalledPackage.origin`` vocabulary
+# and are defined there; ``unknown`` never becomes a package, so it lives here.
 UNKNOWN = "unknown"              # unreadable; the caller must not call the tree clean
 
 
