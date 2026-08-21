@@ -27,9 +27,9 @@ SOURCE = "source"                  # a real name and version, but built from git
 NOT_NPM = "not-npm"                # not a package artifact at all: a runtime such as node
 # The origins an advisory can be about. A registry that is not npmjs may be a proxy of it
 # (Verdaccio and Nexus serve the npmjs tarball under the npmjs name), and a JSR name can
-# never collide with an npmjs one, so a match on such a row is reported and the reader
-# can see the origin. A tarball built from git or a runtime is never the registry's
-# artifact, whatever its version says.
+# never collide with an npmjs one, so a match on such a row is reported -- the report
+# does not yet say which origin it came from (#83). A tarball built from git or a runtime
+# is never the registry's artifact, whatever its version says.
 REGISTRY_ORIGINS = frozenset({NPM, OTHER_REGISTRY})
 _ORIGINS = frozenset({NPM, OTHER_REGISTRY, SOURCE, NOT_NPM})
 
