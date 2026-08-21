@@ -24,7 +24,9 @@ Judgment model (shaped by adversarial review — see PR #8):
 - **Unreadable evidence is never silence.** Snapshot read failures, parse
   failures, shallow clones, and discovered-but-unwalkable paths all become
   warnings, and a repo with warnings and no exposures is INDETERMINATE, not
-  CLEAN.
+  CLEAN. A snapshot that parsed but left rows unread (``LockfileModel.unread``)
+  warns the same way, and cannot end an exposure interval either: the version
+  may still be pinned in a row nobody could read.
 - **A tree we cannot read is not a tree without exposure.** Only npm lockfiles
   are parsed. A tree locked with Yarn, pnpm, Bun or Deno is recorded in
   ``unread_trees`` and makes the repo INDETERMINATE —
@@ -496,17 +498,24 @@ def _read_snapshot(repo: Path, sha: str, path: str,
         finding.warnings.append(f"{path}@{sha[:8]}: snapshot unreadable ({message})")
         return UNREADABLE
     try:
-        return parse_lockfile(text)
+        model = parse_lockfile(text)
     except LockfileParseError as e:
         finding.warnings.append(f"{path}@{sha[:8]}: unreadable snapshot ({e})")
         return UNREADABLE
+    if model.unread:
+        # The readable rows are still judged; the warning keeps the repository from
+        # being cleared on their strength alone.
+        finding.warnings.append(
+            f"{path}@{sha[:8]}: {len(model.unread)} package row(s) could not be read, "
+            f"the first being {model.unread[0]}")
+    return model
 
 
 def _chain_for(model: LockfileModel, package: str, version: str) -> tuple[str, ...]:
     """Evidence chain for one concrete version: physical nesting when the
     instance is nested, name-level shortest chain otherwise."""
     instance = next(
-        (p for p in model.packages if p.name == package and p.version == version), None
+        (p for p in model.instances_of(package) if p.version == version), None
     )
     if instance and instance.path.count("node_modules/") > 1:
         segments = [s.strip("/") for s in instance.path.split("node_modules/") if s]
@@ -570,7 +579,7 @@ def _scan_ref_chain(repo: Path, path: str, ref: str, chain: list[Commit],
                 until = successor.late
                 break
             later = snapshot(successor)
-            if later is UNREADABLE:
+            if later is UNREADABLE or (later is not ABSENT and later.unread):
                 continue  # cannot claim the pin ended here
             if later is ABSENT or not (
                 later.versions_of(query.package) & query.malicious_versions
