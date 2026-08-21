@@ -217,7 +217,7 @@ class TestTheScanPathStillReachesNothing:
             "from deptrail.cli import main\n"
             "main(['demo', '--workdir', sys.argv[1]])\n"
             "leaked = sorted(m for m in sys.modules if m in "
-            "{'deptrail.osv', 'deptrail.fetch', 'deptrail.registry'} "
+            "{'deptrail.osv', 'deptrail.fetch', 'deptrail.registry', 'deptrail.pnpmkeys'} "
             "or m.startswith('urllib.request'))\n"
             "sys.exit('imported: ' + ', '.join(leaked) if leaked else 0)\n"
         )
