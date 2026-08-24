@@ -1025,6 +1025,23 @@ class TestEnvironmentSecrets:
                                   secrets=lambda p, n: ("REPO_ONLY",))
         assert any("environment(s) github-pages" in n for n in report.rotation_notes)
 
+    def test_a_folded_url_before_the_name_does_not_break_the_chain(self, tmp_path, plan):
+        """``url: >-`` with the expression on its own line is the Pages idiom for a
+        computed URL; the continuation line is neither a key nor blank, and it must
+        not cost the block its ``name:``.
+        """
+        workflow = ("name: Pages\non: [push]\njobs:\n  deploy:\n"
+                    "    environment:\n      url: >-\n"
+                    "        ${{ steps.deployment.outputs.page_url }}\n"
+                    "      name: github-pages\n"
+                    "    steps:\n      - run: npm ci\n      - run: deploy\n"
+                    "        env:\n          T: ${{ secrets.PROD_TOKEN }}\n")
+        repo = make_repo(tmp_path, "api", [("2025-11-25T10:00:00+00:00", "5.6.1")],
+                         workflow=workflow)
+        report = scan_organization([("api", repo)], plan, runs=runs_with(head(repo)),
+                                  secrets=lambda p, n: ("REPO_ONLY",))
+        assert any("environment(s) github-pages" in n for n in report.rotation_notes)
+
     def test_a_nameless_block_does_not_borrow_a_name_from_another_mapping(self, tmp_path, plan):
         """A block without ``name:`` must yield no environment — not the first
         ``name:`` the scan walks into after dedenting, which here is the job's

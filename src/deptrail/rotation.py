@@ -57,15 +57,19 @@ LOCAL_USES = re.compile(r"uses:\s*[\"']?(\./[^\s\"']+\.ya?ml)")
 # a different mapping — a job's display name, or the next job's. Whitespace-only
 # lines are allowed through, because the comment stripper above turns a full-line
 # comment inside the block into one, and a comment must not make the environment
-# vanish from the report. ``\r?`` keeps CRLF blobs readable. The block pattern
-# reads the ``name:`` entry wherever it sits in the block (``url:`` may come
-# first); the next-line pattern keeps a form the old ``\s*`` caught by accident —
+# vanish from the report. ``\r?`` keeps CRLF blobs readable, and ``\r`` is kept
+# out of the content class so a line parses exactly one way. A content line is
+# any deeper non-blank line that is not ``name:`` — not just ``key: value`` — so
+# a folded or literal scalar (``url: >-`` then an indented ``${{ … }}``) cannot
+# break the chain and silently drop the environment. The block pattern reads the
+# ``name:`` entry wherever it sits in the block (``url:`` may come first); the
+# next-line pattern keeps a form the old ``\s*`` caught by accident —
 # a plain scalar continued on the following line is the same string to YAML — and
 # what separates it from the block form is that its line is not a ``key:`` line.
 ENVIRONMENT_SCALAR = re.compile(r"(?m)^[ \t]*environment:[ \t]*[\"']?([A-Za-z0-9._-]+)")
 ENVIRONMENT_BLOCK = re.compile(
     r"(?m)^([ \t]*)environment:[ \t]*\r?\n"
-    r"(?:(?:\1[ \t]+(?!name:)[A-Za-z_-]+:[^\n]*|[ \t]*)\r?\n)*"
+    r"(?:(?:\1[ \t]+(?!name:)(?=\S)[^\r\n]*|[ \t]*)\r?\n)*"
     r"\1[ \t]+name:[ \t]*[\"']?(?P<name>[A-Za-z0-9._-]+)")
 ENVIRONMENT_NEXT_LINE = re.compile(
     r"(?m)^([ \t]*)environment:[ \t]*\r?\n"
