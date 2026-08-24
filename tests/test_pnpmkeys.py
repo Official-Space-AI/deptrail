@@ -641,16 +641,15 @@ class TestTheRegexGuardsInTheV5AndV6Parsers:
     def test_a_name_with_whitespace_or_a_stray_at_sign_is_not_a_name(self, version, key):
         assert split_key(version, key, {}, {}).status == UNKNOWN
 
-class TestTheScanPathStillReachesNothing:
-    def test_a_scan_does_not_import_the_splitter(self):
-        """Nothing wires this in yet; when something does, it must be the lockfile
-        parser and not the scan path importing it for free."""
+class TestTheScanPathReachesThisThroughTheParser:
+    def test_the_history_walker_imports_the_splitter(self):
+        """The scan judges pnpm trees, so the walker has to pull this in -- through the
+        document parser, which is the only importer this module is supposed to have."""
         script = (
-            "import sys, tempfile\n"
+            "import sys\n"
             f"sys.path[:0] = {sys.path!r}\n"
-            "from deptrail.cli import main\n"
-            "with tempfile.TemporaryDirectory() as d: main(['demo', '--workdir', d])\n"
-            "sys.exit('imported' if 'deptrail.pnpmkeys' in sys.modules else 0)\n"
+            "import deptrail.history\n"
+            "sys.exit(0 if 'deptrail.pnpmkeys' in sys.modules else 'not imported')\n"
         )
         result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
         assert result.returncode == 0, result.stdout.strip() or result.stderr.strip()

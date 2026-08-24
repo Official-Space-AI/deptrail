@@ -328,6 +328,152 @@ YARN_LOCK = """\
 """
 
 
+PNPM_HEAD = """\
+lockfileVersion: '9.0'
+
+importers:
+
+  .:
+    dependencies:
+      express:
+        specifier: ^4.19.0
+        version: 4.19.2
+
+packages:
+
+  express@4.19.2:
+    resolution: {integrity: sha512-a}
+
+  debug@4.3.5:
+    resolution: {integrity: sha512-b}
+"""
+
+
+def pnpm_lock(chalk_version: str | None) -> str:
+    """The pnpm twin of ``lock_json``: express -> debug -> chalk, chalk optional."""
+    if chalk_version is None:
+        return PNPM_HEAD + """
+snapshots:
+
+  express@4.19.2:
+    dependencies:
+      debug: 4.3.5
+
+  debug@4.3.5: {}
+"""
+    return PNPM_HEAD + f"""
+  chalk@{chalk_version}:
+    resolution: {{integrity: sha512-c}}
+
+snapshots:
+
+  express@4.19.2:
+    dependencies:
+      debug: 4.3.5
+
+  debug@4.3.5:
+    dependencies:
+      chalk: {chalk_version}
+
+  chalk@{chalk_version}: {{}}
+"""
+
+
+class TestPnpmTrees:
+    """pnpm-lock.yaml is parsed and judged like npm's lockfiles (#17 part 2c)."""
+
+    @staticmethod
+    def pnpm_repo(tmp_path, name, states):
+        repo = tmp_path / name
+        repo.mkdir()
+        git(repo, "init", "-q")
+        for i, (date, version) in enumerate(states):
+            (repo / "pnpm-lock.yaml").write_text(pnpm_lock(version))
+            git(repo, "add", "-A")
+            git(repo, "commit", "-qm", f"chore: state {i}", date=date)
+        return repo
+
+    def test_a_pinned_bad_version_is_an_exposure_with_its_chain(self, tmp_path):
+        repo = self.pnpm_repo(tmp_path, "pnpm-exposed", [
+            ("2025-11-25T12:00:00+00:00", "5.6.1"),
+        ])
+        finding = scan_repo(repo, WINDOW)
+        assert finding.verdict is Verdict.EXPOSED
+        assert finding.unread_trees == [] and finding.warnings == []
+        exposure = finding.exposures[0]
+        assert exposure.lockfile_path == "pnpm-lock.yaml"
+        assert exposure.chain == ("express", "debug", "chalk")
+        assert exposure.still_pinned
+
+    def test_a_version_bump_ends_the_interval(self, tmp_path):
+        repo = self.pnpm_repo(tmp_path, "pnpm-bumped", [
+            ("2025-11-25T12:00:00+00:00", "5.6.1"),
+            ("2025-11-26T12:00:00+00:00", "5.6.0"),
+        ])
+        finding = scan_repo(repo, WINDOW)
+        assert finding.exposed
+        assert finding.exposures[0].until == _parse_iso("2025-11-26T12:00:00+00:00")
+
+    def test_a_clean_pnpm_tree_is_clean(self, tmp_path):
+        repo = self.pnpm_repo(tmp_path, "pnpm-clean", [
+            ("2025-11-25T12:00:00+00:00", "5.6.0"),
+        ])
+        finding = scan_repo(repo, WINDOW)
+        assert finding.verdict is Verdict.CLEAN
+
+    def test_a_lockfile_that_will_not_parse_warns_and_is_not_clean(self, tmp_path):
+        repo = tmp_path / "pnpm-broken"
+        repo.mkdir()
+        git(repo, "init", "-q")
+        (repo / "pnpm-lock.yaml").write_text("lockfileVersion: [\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "bad", date="2025-11-25T12:00:00+00:00")
+        finding = scan_repo(repo, WINDOW)
+        assert finding.verdict is Verdict.INDETERMINATE
+        assert finding.warnings and "unreadable" in finding.warnings[0]
+        assert finding.unread_trees == []
+
+    def test_a_row_the_splitter_refuses_keeps_the_tree_from_reading_clean(self, tmp_path):
+        repo = tmp_path / "pnpm-partly"
+        repo.mkdir()
+        git(repo, "init", "-q")
+        (repo / "pnpm-lock.yaml").write_text(pnpm_lock("5.6.0") + """
+  /stray@1.0.0:
+    resolution: {integrity: sha512-s}
+""")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "lock", date="2025-11-25T12:00:00+00:00")
+        finding = scan_repo(repo, WINDOW)
+        assert finding.verdict is Verdict.INDETERMINATE
+        assert len(finding.warnings) == 1
+        assert "1 package row(s) could not be read" in finding.warnings[0]
+        assert "/stray@1.0.0" in finding.warnings[0]
+
+    def test_an_empty_pnpm_lockfile_pinned_nothing_and_is_clean(self, tmp_path):
+        repo = tmp_path / "pnpm-empty"
+        repo.mkdir()
+        git(repo, "init", "-q")
+        (repo / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "lock", date="2025-11-25T12:00:00+00:00")
+        finding = scan_repo(repo, WINDOW)
+        assert finding.verdict is Verdict.CLEAN
+
+    def test_npm_and_pnpm_lockfiles_in_one_repository_both_testify(self, tmp_path):
+        """Neither shadows the other: each is what its own tool installed."""
+        repo = tmp_path / "both"
+        repo.mkdir()
+        git(repo, "init", "-q")
+        (repo / "package-lock.json").write_text(lock_json("5.6.1"))
+        (repo / "pnpm-lock.yaml").write_text(pnpm_lock("5.6.1"))
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "both", date="2025-11-25T12:00:00+00:00")
+        finding = scan_repo(repo, WINDOW)
+        assert finding.lockfiles_seen == 2
+        assert {e.lockfile_path for e in finding.exposures} == {
+            "package-lock.json", "pnpm-lock.yaml"}
+
+
 class TestUnreadableTrees:
     """A tree we cannot read must never be reported as a tree without exposure.
 
@@ -360,16 +506,17 @@ class TestUnreadableTrees:
         # An unread tree is not a lost warning: nothing suggests exposure either.
         assert finding.warnings == []
 
-    def test_pnpm_lockfile_is_indeterminate_not_clean(self, tmp_path):
-        repo = tmp_path / "pnpm"
+    def test_a_pnpm_v3_shrinkwrap_is_still_only_recognised(self, tmp_path):
+        repo = tmp_path / "pnpm3"
         repo.mkdir()
         git(repo, "init", "-q")
-        (repo / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n")
+        (repo / "shrinkwrap.yaml").write_text("shrinkwrapVersion: 3\n")
         git(repo, "add", "-A")
         git(repo, "commit", "-qm", "lock", date="2025-11-25T12:00:00+00:00")
         finding = scan_repo(repo, WINDOW)
         assert finding.verdict is Verdict.INDETERMINATE
-        assert [t.path for t in finding.unread_trees] == ["pnpm-lock.yaml"]
+        assert [t.path for t in finding.unread_trees] == ["shrinkwrap.yaml"]
+        assert "pnpm (v3 and earlier)" in finding.unread_trees[0].reason
 
     def test_repository_that_is_not_a_node_project_is_clean(self, tmp_path):
         # The honest opposite: nothing to read because there was nothing to read.
@@ -783,7 +930,7 @@ class TestRowsTheParserCouldNotRead:
             if '"x-unread"' in text:
                 model.unread.append("weird@key: no name@version separator")
             return model
-        monkeypatch.setattr(history, "parse_lockfile", parse)
+        monkeypatch.setitem(history.PARSED_LOCKFILES, "package-lock.json", parse)
 
     @staticmethod
     def lock_with_unread_rows(chalk_version):
@@ -847,7 +994,7 @@ class TestRowsTheParserCouldNotRead:
                 "chalk", "5.6.1", "node_modules/tarball-parent/node_modules/chalk",
                 origin=SOURCE))
             return model
-        monkeypatch.setattr(history, "parse_lockfile", parse)
+        monkeypatch.setitem(history.PARSED_LOCKFILES, "package-lock.json", parse)
         repo = make_repo(tmp_path, "two-chalks", [("2025-11-25T12:00:00+00:00", "5.6.1")])
         finding = scan_repo(repo, WINDOW)
         assert finding.exposed

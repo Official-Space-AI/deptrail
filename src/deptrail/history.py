@@ -28,8 +28,9 @@ Judgment model (shaped by adversarial review — see PR #8):
   warns the same way -- once per snapshot, whatever the window -- and cannot end
   an exposure interval either: the version may still be pinned in a row nobody
   could read.
-- **A tree we cannot read is not a tree without exposure.** Only npm lockfiles
-  are parsed. A tree locked with Yarn, pnpm, Bun or Deno is recorded in
+- **A tree we cannot read is not a tree without exposure.** Only lockfiles a
+  parser exists for are read: npm's two, and ``pnpm-lock.yaml``. A tree locked
+  with Yarn, Bun or Deno is recorded in
   ``unread_trees`` and makes the repo INDETERMINATE —
   reporting CLEAN there would answer a question nobody could have looked at
   (found by replaying such repositories).
@@ -43,7 +44,8 @@ Judgment model (shaped by adversarial review — see PR #8):
 - **Only the lockfile npm would have read testifies.** When a directory holds
   both ``npm-shrinkwrap.json`` and ``package-lock.json``, npm ignores the latter,
   so at those commits so do we; scanning both invents exposure from a file that
-  was never installed.
+  was never installed. ``pnpm-lock.yaml`` neither shadows nor is shadowed: it is
+  another tool's install, and both installs ran.
 
 The attack window is inclusive on both ends; held intervals are half-open
 ``[since, until)``.
@@ -58,17 +60,25 @@ from enum import Enum
 from pathlib import Path
 
 from .lockfile import LockfileModel, LockfileParseError, parse_lockfile
+from .pnpmlock import parse_pnpm_lockfile
 
 # npm writes one of these two, and a published package ships the second; both use
 # the same schema, so one parser reads either.
 NPM_LOCKFILES = ("package-lock.json", "npm-shrinkwrap.json")
+# The lockfiles this tool reads, and the parser for each. The basename decides: no
+# tool writes another's filename, and a file whose content lies about it fails its
+# parser and becomes a warning, never a wrong model.
+PARSED_LOCKFILES = {
+    "package-lock.json": parse_lockfile,
+    "npm-shrinkwrap.json": parse_lockfile,
+    "pnpm-lock.yaml": parse_pnpm_lockfile,
+}
 # Lockfiles we can recognise but not parse yet (issue #17), and the tool that
 # writes each. Finding one means that tree's installed versions are unknown to us.
 # Every package manager that installs from the npm registry belongs here, because
 # a name missing from this table is a repository this tool would call clean.
 FOREIGN_LOCKFILES = {
     "yarn.lock": "Yarn",
-    "pnpm-lock.yaml": "pnpm",
     "shrinkwrap.yaml": "pnpm (v3 and earlier)",
     "bun.lock": "Bun",
     "bun.lockb": "Bun",
@@ -328,14 +338,14 @@ def discovered_lockfiles(repo: Path) -> tuple[list[str], list[str]]:
     Both come from one history walk, because walking twice doubles the cost of
     the most expensive part of a scan.
     """
-    found = _paths_with_basename(repo, (*NPM_LOCKFILES, *FOREIGN_LOCKFILES))
-    npm = [p for p in found if posixpath.basename(p) in set(NPM_LOCKFILES)]
+    found = _paths_with_basename(repo, (*PARSED_LOCKFILES, *FOREIGN_LOCKFILES))
+    parsed = [p for p in found if posixpath.basename(p) in PARSED_LOCKFILES]
     foreign = [p for p in found if posixpath.basename(p) in FOREIGN_LOCKFILES]
-    return npm, foreign
+    return parsed, foreign
 
 
 def lockfile_paths(repo: Path) -> list[str]:
-    """Every npm lockfile path in this repository's history."""
+    """Every parseable lockfile path in this repository's history."""
     return discovered_lockfiles(repo)[0]
 
 
@@ -499,7 +509,7 @@ def _read_snapshot(repo: Path, sha: str, path: str,
         finding.warnings.append(f"{path}@{sha[:8]}: snapshot unreadable ({message})")
         return UNREADABLE
     try:
-        model = parse_lockfile(text)
+        model = PARSED_LOCKFILES[posixpath.basename(path)](text)
     except LockfileParseError as e:
         finding.warnings.append(f"{path}@{sha[:8]}: unreadable snapshot ({e})")
         return UNREADABLE
@@ -659,7 +669,7 @@ def scan_repo(repo: Path, query: WindowQuery) -> RepoFinding:
         any_history = False
         # npm ignores package-lock.json entirely when a shrinkwrap sits beside it,
         # so judging both independently would invent an exposure from a file npm
-        # never read.
+        # never read. pnpm-lock.yaml is outside this: it is another tool's install.
         shadowed_by = None
         if posixpath.basename(path) == "package-lock.json":
             sibling = posixpath.join(posixpath.dirname(path), "npm-shrinkwrap.json")
