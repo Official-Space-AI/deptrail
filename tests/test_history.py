@@ -646,7 +646,7 @@ class TestYarnTrees:
         assert finding.unread_trees == []
         assert finding.verdict is Verdict.CLEAN
 
-    def test_a_yarn_one_era_covering_the_window_is(self, tmp_path):
+    def test_a_yarn_one_era_covering_the_window_is_held_against_the_tree(self, tmp_path):
         repo = self.yarn_repo(tmp_path, "migrated-late", [
             ("2025-11-24T12:00:00+00:00", YARN_LOCK),
             ("2025-11-26T12:00:00+00:00", berry_lock("5.6.0")),
@@ -663,6 +663,67 @@ class TestYarnTrees:
         finding = scan_repo(repo, WINDOW)
         assert finding.exposed
         assert finding.exposures[0].until is None, "a blob we cannot read proves nothing"
+
+    def test_a_berry_file_with_a_stray_v1_header_is_still_read(self, tmp_path):
+        """Routing on the header alone skipped a readable file's evidence wholesale."""
+        repo = self.yarn_repo(tmp_path, "stray-header", [
+            ("2025-11-25T12:00:00+00:00",
+             "# yarn lockfile v1\n" + berry_lock("5.6.1")),
+        ])
+        finding = scan_repo(repo, WINDOW)
+        assert finding.verdict is Verdict.EXPOSED
+        assert finding.unread_trees == []
+
+    def test_a_pre_window_sibling_cannot_discharge_an_in_window_dialect(self, tmp_path):
+        """The segment ends at the first *descendant* whose snapshot differs. A
+        pre-window Berry attempt on a sibling branch is not a descendant of the
+        in-window Yarn 1 commit; letting it close the segment discharged the witness
+        and read the repository CLEAN. The rebased-looking author/committer split on
+        the v1 commit pins the emission order that made that reachable."""
+        repo = tmp_path / "sibling"
+        repo.mkdir()
+        git(repo, "init", "-q")
+        (repo / "yarn.lock").write_text(YARN_LOCK)
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "base v1", date="2025-11-01T12:00:00+00:00")
+        git(repo, "checkout", "-q", "-b", "berry-try")
+        (repo / "yarn.lock").write_text(berry_lock("5.6.0"))
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "try berry", date="2025-11-20T12:00:00+00:00")
+        git(repo, "checkout", "-q", "main")
+        (repo / "yarn.lock").write_text(YARN_LOCK + "\n# still yarn 1\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "v1 in window",
+            author_date="2025-11-25T12:00:00+00:00")  # committer date = now: rebased shape
+        import subprocess
+        subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t",
+                        "merge", "-q", "--no-ff", "--no-commit", "berry-try"],
+                       capture_output=True)  # both sides touched the file: conflict expected
+        (repo / "yarn.lock").write_text(YARN_LOCK + "\n# still yarn 1\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "merge, v1 wins", date="2025-11-28T12:00:00+00:00")
+        finding = scan_repo(repo, WINDOW)
+        assert finding.verdict is Verdict.INDETERMINATE
+        assert [t.path for t in finding.unread_trees] == ["yarn.lock"]
+
+    def test_the_witness_is_the_first_in_window_sighting(self, tmp_path):
+        """org.py fetches workflow evidence at exactly this commit, so which sighting
+        the witness names is load-bearing, not cosmetic."""
+        import subprocess
+        repo = self.yarn_repo(tmp_path, "two-sightings", [
+            ("2025-11-24T12:00:00+00:00", YARN_LOCK),
+        ])
+        first = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                               check=True, capture_output=True, text=True).stdout.strip()
+        (repo / "yarn.lock").write_text(YARN_LOCK + "\n# updated\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "still v1", date="2025-11-25T12:00:00+00:00")
+        (repo / "yarn.lock").write_text(berry_lock("5.6.0"))
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "berry", date="2025-11-26T12:00:00+00:00")
+        finding = scan_repo(repo, WINDOW)
+        assert [t.path for t in finding.unread_trees] == ["yarn.lock"]
+        assert finding.unread_trees[0].commit == first
 
     def test_a_yarn_lock_that_is_neither_format_warns(self, tmp_path):
         repo = self.yarn_repo(tmp_path, "garbage", [

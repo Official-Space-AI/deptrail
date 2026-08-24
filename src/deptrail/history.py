@@ -80,12 +80,18 @@ def _read_yarn_lock(text: str) -> LockfileModel:
 
     The two signals are total on 2,743 real blobs from three full repository
     histories: 557 carry Yarn 1's header, 2,186 carry Berry's ``__metadata``, none
-    carry neither. Anything else falls through to the Berry parser's refusal, which
-    is the honest outcome for a file that claims to be a yarn.lock and is not.
+    carry neither. The Berry parse is tried first, so a Berry file that *also*
+    carries the v1 header in a stray comment is still read -- routing on the header
+    alone would have skipped its evidence wholesale. Only what Berry refuses and the
+    header claims is Yarn 1; anything else keeps the refusal, the honest outcome for
+    a file that claims to be a yarn.lock and is not.
     """
-    if "# yarn lockfile v1" in text[:400]:
-        raise Yarn1Lockfile("Yarn 1 lockfiles are not parsed yet")
-    return parse_yarn_berry_lockfile(text)
+    try:
+        return parse_yarn_berry_lockfile(text)
+    except LockfileParseError:
+        if "# yarn lockfile v1" in text[:400]:
+            raise Yarn1Lockfile("Yarn 1 lockfiles are not parsed yet") from None
+        raise
 
 # The lockfiles this tool reads, and the parser for each. The basename decides: no
 # tool writes another's filename, and a file whose content lies about it fails its
