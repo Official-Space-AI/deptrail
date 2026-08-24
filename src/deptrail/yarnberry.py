@@ -39,7 +39,16 @@ snapshots; the vendored YAML reader read all of them (0 refusals):
   descriptor index, and all 57,527 others -- overridden ranges, ``catalog:``,
   ``link:``, ``portal:``, ``condition:`` ranges -- by an entry answering to the name.
   An edge neither answers is therefore unread evidence, and the check flags zero of
-  the 2,186 real files.
+  the 2,186 real files. A cut can also leave a *closed* prefix -- an alphabetical run
+  such as ``@algolia/*`` referencing only itself -- which no edge check can see; what
+  catches it is that every one of the 2,186 real files holds at least one
+  workspace entry, so a document without one is missing its project, and says so.
+  What stays invisible after both: a cut whose every lost entry leaves a same-name
+  survivor (``zod@npm:4.4.3`` cut while ``zod@npm:3.25.76`` survives). Requiring the
+  survivor to *satisfy* the range was measured and refused -- 1,506 complete files
+  (69%) violate it, because ``resolutions:`` overrides cross majors and workspace
+  stubs answer to real names at ``0.0.0-use.local``; a range check cannot tell an
+  override from a hole.
 
 A row that cannot be read lands in ``LockfileModel.unread`` with its reason, never
 dropped: a dropped row is a version the report calls absent.
@@ -72,6 +81,11 @@ def parse_yarn_berry_lockfile(text: str) -> LockfileModel:
     metadata = document.get("__metadata")
     if not isinstance(metadata, dict):
         raise LockfileParseError("no __metadata block, so not a Berry lockfile")
+    declared_version = metadata.get("version")
+    if not isinstance(declared_version, str) or not declared_version.strip():
+        # A cut right after ``version:`` parses to None; an empty header is not a
+        # lockfile that pinned nothing, it is a header with its file missing.
+        raise LockfileParseError(f"__metadata carries no version ({declared_version!r})")
 
     entries: list[tuple[str, dict]] = []
     unread: list[str] = []
@@ -83,7 +97,11 @@ def parse_yarn_berry_lockfile(text: str) -> LockfileModel:
             continue
         entries.append((key, entry))
 
-    # descriptor -> the resolution that answered it, for edge resolution below.
+    # descriptor -> the resolution that answered it, for edge resolution below. A
+    # ``condition:`` range can itself contain a comma, so that key shreds into index
+    # entries nothing looks up (measured harmless: condition ranges are spelled with
+    # spaces where edges are not); a descriptor repeated across keys keeps the last
+    # answer, which only edge *naming* could ever notice.
     answered: dict[str, str] = {}
     for key, entry in entries:
         for descriptor in key.split(","):
@@ -92,6 +110,7 @@ def parse_yarn_berry_lockfile(text: str) -> LockfileModel:
     installed: list[InstalledPackage] = []
     declared: dict[str, set[str]] = {ROOT: set()}
     root_deps: set[str] = set()
+    project_entries = 0
     for key, entry in entries:
         resolution = entry["resolution"]
         name, protocol, reference = _locator(resolution)
@@ -113,9 +132,19 @@ def parse_yarn_berry_lockfile(text: str) -> LockfileModel:
             unread.append(f"{key}: resolution {resolution!r} wraps no locator")
             continue
 
+        dependencies = entry.get("dependencies")
+        if "dependencies" in entry and not isinstance(dependencies, dict):
+            # A cut right after ``dependencies:`` parses the block to None; the edges
+            # that stood there are evidence this snapshot no longer holds.
+            unread.append(f"{key}: its dependencies block did not parse to a mapping")
+        elif isinstance(dependencies, dict):
+            for edge_name, range_ in dependencies.items():
+                if range_ is None or not isinstance(range_, str):
+                    unread.append(f"{key}: the dependency {edge_name!r} carries no range")
         edges = _edges(entry, answered)
         declared.setdefault(name, set()).update(edges)
         if protocol in _PROJECT:
+            project_entries += 1
             root_deps |= edges
             continue
         if protocol == "condition":
@@ -128,7 +157,8 @@ def parse_yarn_berry_lockfile(text: str) -> LockfileModel:
             continue
         if protocol == "npm":
             origin = NPM
-        elif protocol in ("https", "http", "git+https", "git+ssh", "git", "github-shorthand"):
+        elif protocol in ("https", "http", "git+https", "git+ssh", "git", "ssh",
+                          "github-shorthand"):
             origin = SOURCE
         elif protocol == "npm-runtime":  # never observed; kept explicit for the reader
             origin = NOT_NPM
@@ -139,13 +169,20 @@ def parse_yarn_berry_lockfile(text: str) -> LockfileModel:
                                           path=resolution, origin=origin))
 
     declared[ROOT] |= root_deps
+    if entries and not project_entries:
+        # Every one of the 2,186 measured files holds at least one workspace entry
+        # (Berry writes the project itself into its lockfile), so a document without
+        # one is a prefix whose project -- and everything alphabetically after the
+        # surviving run -- is gone, even when the survivors' edges all answer.
+        unread.append("the document holds no workspace entry; every Berry lockfile "
+                      "records its own project, so the rest of this one is missing")
     # Only when nothing else already keeps this snapshot from reading clean, as in
     # the pnpm reader: with unread rows the walker warns and holds intervals open
     # regardless, and a missing answer is then likelier one of those rows.
     if not unread:
         unread += _edges_without_entries(entries, answered, declared)
     return LockfileModel(
-        lockfile_version=str(metadata.get("version")),
+        lockfile_version=declared_version.strip(),
         root_name="(unnamed)",
         root_deps=root_deps,
         packages=installed,
