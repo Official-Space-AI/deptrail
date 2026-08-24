@@ -162,8 +162,9 @@ deptrail scan --ioc incident.json --org my-org --format html --output report.htm
 deptrail feeds                                          # bundled advisories
 ```
 
-The [GitHub CLI](https://cli.github.com/) is the one external prerequisite,
-and which scans touch it follows the flags, not intuition: `--org` always
+Every scan shells out to `git` for the history walk, so Git is a prerequisite
+everywhere; the [GitHub CLI](https://cli.github.com/) is the other external
+tool, and which scans touch it follows the flags, not intuition: `--org` always
 needs it, `--no-ci` included, because the organization's repository list
 itself comes from `gh repo list`; CI runs and secret names are read through
 it when the scan knows which GitHub repository a clone is — `--org`, or
