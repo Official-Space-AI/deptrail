@@ -963,6 +963,37 @@ class TestEnvironmentSecrets:
         assert {i.secret for i in report.rotation_items} == {"PROD_TOKEN"}
         assert any("environment(s) production" in n for n in report.rotation_notes)
 
+    def test_block_form_names_the_environment_not_the_mapping_key(self, tmp_path, plan):
+        """#91: on ``environment:`` followed by an indented ``name:`` — the shape the
+        Pages starter workflow ships — the old pattern's ``\\s*`` crossed the line
+        end and reported an environment called ``name``. Found on a real scan of a
+        September 2025 repository whose only environment is ``github-pages``.
+        """
+        workflow = ("name: Pages\non: [push]\njobs:\n  deploy:\n"
+                    "    environment:\n      name: github-pages\n"
+                    "      url: ${{ steps.deployment.outputs.page_url }}\n"
+                    "    steps:\n      - run: npm ci\n      - run: deploy\n"
+                    "        env:\n          T: ${{ secrets.PROD_TOKEN }}\n")
+        repo = make_repo(tmp_path, "api", [("2025-11-25T10:00:00+00:00", "5.6.1")],
+                         workflow=workflow)
+        report = scan_organization([("api", repo)], plan, runs=runs_with(head(repo)),
+                                  secrets=lambda p, n: ("REPO_ONLY",))
+        assert any("environment(s) github-pages" in n for n in report.rotation_notes)
+        assert not any("environment(s) name" in n for n in report.rotation_notes)
+
+    def test_block_form_reads_name_after_url(self, tmp_path, plan):
+        """``url:`` before ``name:`` is legal YAML and must not hide the environment."""
+        workflow = ("name: Pages\non: [push]\njobs:\n  deploy:\n"
+                    "    environment:\n      url: https://x.test\n"
+                    "      name: prod-eu\n"
+                    "    steps:\n      - run: npm ci\n      - run: deploy\n"
+                    "        env:\n          T: ${{ secrets.PROD_TOKEN }}\n")
+        repo = make_repo(tmp_path, "api", [("2025-11-25T10:00:00+00:00", "5.6.1")],
+                         workflow=workflow)
+        report = scan_organization([("api", repo)], plan, runs=runs_with(head(repo)),
+                                  secrets=lambda p, n: ("REPO_ONLY",))
+        assert any("environment(s) prod-eu" in n for n in report.rotation_notes)
+
 
 THREE = dict(ADVISORY, packages=[
     {"name": "chalk", "versions": ["5.6.1"], "sources": ["https://a.test"]},

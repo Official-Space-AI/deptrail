@@ -47,7 +47,16 @@ LOCAL_USES = re.compile(r"uses:\s*[\"']?(\./[^\s\"']+\.ya?ml)")
 # Environment secrets resolve through the same ``secrets.NAME`` syntax but are not
 # returned by a repository secret listing, so an environment has to be named in
 # the report or its credentials would silently miss the REPO_WIDE fallback.
-ENVIRONMENT = re.compile(r"(?m)^\s*environment:\s*[\"']?([A-Za-z0-9._-]+)")
+# The scalar pattern must not cross the line end: ``\s`` matches newlines, and on
+# the block form (``environment:`` then an indented ``name:``, which is what the
+# Pages starter workflow ships) a value-side ``\s*`` walked onto the next line and
+# named the mapping key ``name`` as the environment (#91). The block pattern reads
+# the ``name:`` entry wherever it sits in the block, because ``url:`` may come first.
+ENVIRONMENT_SCALAR = re.compile(r"(?m)^[ \t]*environment:[ \t]*[\"']?([A-Za-z0-9._-]+)")
+ENVIRONMENT_BLOCK = re.compile(
+    r"(?m)^[ \t]*environment:[ \t]*\n"
+    r"(?:[ \t]+(?!name:)[A-Za-z_-]+:[^\n]*\n)*"
+    r"[ \t]+name:[ \t]*[\"']?([A-Za-z0-9._-]+)")
 REMOTE_USES = re.compile(r"uses:\s*[\"']?([A-Za-z0-9._-]+/[A-Za-z0-9._-]+/\.github/workflows/[^\s\"']+)")
 # Forms that hand a job every secret it could see, so nothing can be narrowed:
 # passing them on to a called workflow, serialising the whole context, or
@@ -265,7 +274,8 @@ def environments_in_workflows(repo: Path, sha: str, paths: tuple[str, ...],
             body = COMMENT.sub("", _git_text(repo, "show", f"{sha}:{path}"))
         except GitError:
             continue
-        found.update(ENVIRONMENT.findall(body))
+        found.update(ENVIRONMENT_SCALAR.findall(body))
+        found.update(ENVIRONMENT_BLOCK.findall(body))
     return tuple(sorted(found))
 
 
