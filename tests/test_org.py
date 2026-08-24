@@ -333,7 +333,7 @@ class TestUnreadableTrees:
         (repo / ".github/workflows/ci.yml").write_text(CI_WORKFLOW)
         target = repo / where
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text('"chalk@^5.6.0":\n  version "5.6.1"\n')
+        target.write_text("# yarn lockfile v1\n" '"chalk@^5.6.0":\n  version "5.6.1"\n')
         git(repo, "add", "-A")
         git(repo, "commit", "-qm", "lock", date="2025-11-25T10:00:00+00:00")
         return repo
@@ -364,7 +364,7 @@ class TestUnreadableTrees:
         assert "no exposure found in what could be read" in text
         assert "cannot prove absence" in text
         # The reason belongs under its own heading, printed once.
-        assert text.count("Yarn lockfiles are not parsed yet") == 1
+        assert text.count("Yarn 1 lockfiles are not parsed yet") == 1
 
     def test_a_workflow_naming_the_directory_beats_the_heuristic(self, tmp_path, plan):
         # An application that really lives under examples/ must not be filed away
@@ -380,7 +380,7 @@ class TestUnreadableTrees:
         )
         (repo / "examples/production").mkdir(parents=True)
         (repo / "examples/production/yarn.lock").write_text(
-            '"chalk@^5.6.0":\n  version "5.6.1"\n')
+            "# yarn lockfile v1\n" '"chalk@^5.6.0":\n  version "5.6.1"\n')
         git(repo, "add", "-A")
         git(repo, "commit", "-qm", "deploy the example",
             date="2025-11-25T10:00:00+00:00")
@@ -406,7 +406,7 @@ class TestUnreadableTrees:
             ("2025-11-25T10:00:00+00:00", "5.6.1"),
         ])
         (repo / "mobile").mkdir()
-        (repo / "mobile/yarn.lock").write_text('"chalk@^5.6.0":\n  version "5.6.1"\n')
+        (repo / "mobile/yarn.lock").write_text("# yarn lockfile v1\n" '"chalk@^5.6.0":\n  version "5.6.1"\n')
         git(repo, "add", "-A")
         git(repo, "commit", "-qm", "mobile", date="2025-11-25T11:00:00+00:00")
         report = scan_organization([("api", repo)], plan,

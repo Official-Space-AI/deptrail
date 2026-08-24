@@ -54,7 +54,7 @@ rotate (3 credential(s))
                 chalk@5.6.1)
 
 not judged (no lockfile this tool can read)
-  mobile-app: yarn.lock: Yarn lockfiles are not parsed yet, so the versions this tree installed were not judged
+  mobile-app: yarn.lock: Yarn 1 lockfiles are not parsed yet, so the versions this tree installed while it was Yarn 1 were not judged
 
 this scan cannot prove absence of exposure
 ```
@@ -189,11 +189,13 @@ the scan could not run at all — a green check must never mean "we could not lo
 What the tool cannot do, it says out loud — a scan that could not look must never
 read as a scan that found nothing.
 
-- **npm and pnpm lockfiles.** `package-lock.json`, `npm-shrinkwrap.json` and
-  `pnpm-lock.yaml` (every `lockfileVersion` pnpm has written) are parsed. A tree
-  locked with Yarn, Bun, Deno or pnpm 3's `shrinkwrap.yaml` is reported as **not judged**, exits `2`, and
-  produces no rotation list — neither cleared nor accused
-  ([#17](https://github.com/Official-Space-AI/deptrail/issues/17)).
+- **npm, pnpm and Yarn Berry lockfiles.** `package-lock.json`, `npm-shrinkwrap.json`,
+  `pnpm-lock.yaml` (every `lockfileVersion` pnpm has written) and `yarn.lock` in its
+  Berry format (every `__metadata` version Yarn 2+ has written; the content decides,
+  per commit, because real histories switch formats mid-stream) are parsed. A tree
+  locked with Yarn 1, Bun, Deno or pnpm 3's `shrinkwrap.yaml` is reported as
+  **not judged**, exits `2`, and produces no rotation list — neither cleared nor
+  accused ([#17](https://github.com/Official-Space-AI/deptrail/issues/17)).
 - **A `package.json` with no lockfile is not yet reported.** Such a tree resolves
   ranges fresh at install time, so what it installed is unknown, but deciding
   *which* lockfile governed *which* directory *when* needs npm's workspace rules and
