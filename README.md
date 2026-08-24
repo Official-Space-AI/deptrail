@@ -62,7 +62,7 @@ this scan cannot prove absence of exposure
 Four repositories, four different answers. `api-server` holds a third secret the CI
 workflow never reads, so it is not on the list. `web-frontend` never held the
 version while the registry served it, so it is absent from the report entirely.
-`mobile-app` is locked with Yarn, which this version cannot parse — so it is named
+`mobile-app` is locked with Yarn 1, which this version cannot parse — so it is named
 as unread rather than cleared, and it raises no credentials, because nothing about
 it suggests one.
 

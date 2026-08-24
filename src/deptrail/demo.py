@@ -4,7 +4,7 @@ The demo has to answer the question the whole tool exists for, without a GitHub
 token, without network access, and without waiting: four repositories with real
 git history, one of which held a compromised version while the registry served
 it, plus the CI run records that decide whether the install actually ran. The
-fourth is locked with Yarn, so the demo also shows what the tool says when it
+fourth is locked with Yarn 1, so the demo also shows what the tool says when it
 cannot read a project at all — the answer a responder gets most often.
 
 Run records are synthesised rather than fetched, and the advisory ships with the
@@ -117,7 +117,7 @@ LAYOUT = (
         {".github/workflows/docs.yml": DOCS_WORKFLOW},
         (("2025-11-25T12:00:00+00:00", "5.6.1"),),  # exposed, but CI installs nothing
     ),
-    # Locked with Yarn, which this version cannot parse: the demo has to show the
+    # Locked with Yarn 1, which this version cannot parse: the demo has to show the
     # answer a responder gets when the tool cannot see, because that answer is
     # neither "clean" nor "rotate everything".
     DemoRepo(

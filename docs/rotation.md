@@ -85,7 +85,7 @@ installable. Nothing was seen,
 and nothing was hidden from us either: no version, no window overlap, no run. Such a
 tree is listed under **not judged** with the file that caused it, the report refuses
 to prove absence, and the run exits `2`. It raises no credentials, because grading it
-`POSSIBLE` would hand every Yarn user a list of their entire secret store — a false
+`POSSIBLE` would hand every Yarn 1 user a list of their entire secret store — a false
 alarm, not caution.
 
 A tree with *no* lockfile at all belongs in this category too and is not yet reported;
