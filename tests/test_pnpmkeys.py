@@ -643,8 +643,8 @@ class TestTheRegexGuardsInTheV5AndV6Parsers:
 
 class TestTheScanPathReachesThisThroughTheParser:
     def test_the_history_walker_imports_the_splitter(self):
-        """The scan judges pnpm trees, so the walker has to pull this in -- through the
-        document parser, which is the only importer this module is supposed to have."""
+        """The scan judges pnpm trees, so the walker has to pull this in. (Through the
+        document parser is the intent; what is pinned here is that the wiring exists.)"""
         script = (
             "import sys\n"
             f"sys.path[:0] = {sys.path!r}\n"

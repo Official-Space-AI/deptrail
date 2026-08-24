@@ -698,6 +698,73 @@ class TestEdgesResolveToWhatTheyInstall:
         assert model.packages == []
 
 
+class TestATruncatedDocumentIsNotACleanOne:
+    """YAML is prefix-valid where JSON is not: a lockfile cut after its importer block
+    still parses, with the pins recorded and the rows gone. Both independent reviews
+    of the history wiring found the same false CLEAN."""
+
+    def test_a_document_with_pins_and_no_rows_is_unread_not_empty(self):
+        model = parse("""\
+            lockfileVersion: '9.0'
+
+            importers:
+
+              .:
+                dependencies:
+                  chalk:
+                    specifier: ^5.0.0
+                    version: 5.6.1
+                  '@acme/ui':
+                    specifier: workspace:*
+                    version: link:packages/ui
+            """)
+        assert model.packages == []
+        assert model.unread == ["chalk: the importers resolve it to '5.6.1' and the "
+                                "document has no row for it"]
+
+    def test_a_document_cut_in_the_middle_of_its_rows_names_what_is_missing(self):
+        model = parse("""\
+            lockfileVersion: 5.4
+
+            importers:
+
+              .:
+                dependencies:
+                  express: 4.19.2
+                  chalk: 5.6.1
+                specifiers:
+                  express: ^4.19.0
+                  chalk: ^5.0.0
+
+            packages:
+
+              /express/4.19.2:
+                resolution: {integrity: sha512-a}
+            """)
+        assert rows(model) == [("express", "4.19.2", NPM, "/express/4.19.2")]
+        assert model.unread == ["chalk: the importers resolve it to '5.6.1' and the "
+                                "document has no row for it"]
+
+    def test_a_document_that_already_has_unread_rows_does_not_double_report(self):
+        model = parse("""\
+            lockfileVersion: '9.0'
+
+            importers:
+
+              .:
+                dependencies:
+                  chalk:
+                    specifier: ^5.0.0
+                    version: 5.6.1
+
+            packages:
+
+              '@@@':
+                resolution: {integrity: sha512-a}
+            """)
+        assert len(model.unread) == 1 and model.unread[0].startswith("@@@: ")
+
+
 class TestShapesTheCorpusDoesNotHave:
     """Each of these is a mutation of the reader that every real lockfile survived."""
 
@@ -1041,9 +1108,11 @@ class TestAgainstTheFixtureLockfiles:
             keys += document_keys
             name_only += document_name_only
         paths = [p.path for p in model.packages]
-        assert len(paths) + len(model.unread) + name_only == len(keys), path.name
+        row_unread = [m for m in model.unread if m.split(": ", 1)[0] in keys]
+        pin_unread = [m for m in model.unread if "the importers resolve it to" in m]
+        assert sorted(row_unread + pin_unread) == sorted(model.unread), path.name
+        assert len(paths) + len(row_unread) + name_only == len(keys), path.name
         assert set(paths) <= set(keys)
-        assert all(message.split(": ", 1)[0] in keys for message in model.unread)
 
     def test_the_accounting_can_fail(self):
         """A two-document file where the first document holds a name-only row, and a

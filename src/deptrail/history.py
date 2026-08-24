@@ -30,7 +30,7 @@ Judgment model (shaped by adversarial review — see PR #8):
   could read.
 - **A tree we cannot read is not a tree without exposure.** Only lockfiles a
   parser exists for are read: npm's two, and ``pnpm-lock.yaml``. A tree locked
-  with Yarn, Bun or Deno is recorded in
+  with Yarn, Bun, Deno or pnpm 3's ``shrinkwrap.yaml`` is recorded in
   ``unread_trees`` and makes the repo INDETERMINATE —
   reporting CLEAN there would answer a question nobody could have looked at
   (found by replaying such repositories).
@@ -62,12 +62,12 @@ from pathlib import Path
 from .lockfile import LockfileModel, LockfileParseError, parse_lockfile
 from .pnpmlock import parse_pnpm_lockfile
 
-# npm writes one of these two, and a published package ships the second; both use
-# the same schema, so one parser reads either.
-NPM_LOCKFILES = ("package-lock.json", "npm-shrinkwrap.json")
 # The lockfiles this tool reads, and the parser for each. The basename decides: no
 # tool writes another's filename, and a file whose content lies about it fails its
-# parser and becomes a warning, never a wrong model.
+# parser and becomes a warning, never a wrong model. npm writes the first two -- a
+# published package ships the second -- with one schema, so one parser reads either.
+# A parsed lockfile is walked whatever the attack window, as npm's always were; only
+# the foreign ones below are window-gated.
 PARSED_LOCKFILES = {
     "package-lock.json": parse_lockfile,
     "npm-shrinkwrap.json": parse_lockfile,

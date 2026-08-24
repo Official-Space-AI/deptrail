@@ -420,6 +420,24 @@ class TestPnpmTrees:
         ])
         finding = scan_repo(repo, WINDOW)
         assert finding.verdict is Verdict.CLEAN
+        assert finding.lockfiles_seen == 1, "clean because judged, not because unseen"
+
+    def test_a_truncated_lockfile_cannot_end_the_interval_or_read_clean(self, tmp_path):
+        """YAML is prefix-valid: a lockfile cut after its importer block still parses,
+        with the pins recorded and every row gone. Reading that as "pins nothing"
+        closed the interval below at the truncating commit, silently."""
+        repo = self.pnpm_repo(tmp_path, "pnpm-truncated", [
+            ("2025-11-25T12:00:00+00:00", "5.6.1"),
+        ])
+        (repo / "pnpm-lock.yaml").write_text(PNPM_HEAD.split("packages:")[0])
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "truncate", date="2025-11-26T12:00:00+00:00")
+        finding = scan_repo(repo, WINDOW)
+        assert finding.exposed
+        assert finding.exposures[0].until is None, "the truncated snapshot proves nothing"
+        assert finding.exposures[0].still_pinned
+        assert len(finding.warnings) == 1
+        assert "the importers resolve it to" in finding.warnings[0]
 
     def test_a_lockfile_that_will_not_parse_warns_and_is_not_clean(self, tmp_path):
         repo = tmp_path / "pnpm-broken"
@@ -458,6 +476,33 @@ class TestPnpmTrees:
         git(repo, "commit", "-qm", "lock", date="2025-11-25T12:00:00+00:00")
         finding = scan_repo(repo, WINDOW)
         assert finding.verdict is Verdict.CLEAN
+        assert finding.lockfiles_seen == 1, "clean because judged, not because unseen"
+
+    def test_a_shrinkwrap_beside_it_does_not_silence_a_pnpm_lockfile(self, tmp_path):
+        """npm's precedence rule is npm's: a shrinkwrap silences package-lock.json
+        because npm itself ignores that file, and nothing else."""
+        repo = tmp_path / "shrinkwrap-beside-pnpm"
+        repo.mkdir()
+        git(repo, "init", "-q")
+        (repo / "npm-shrinkwrap.json").write_text(lock_json("5.6.0"))
+        (repo / "pnpm-lock.yaml").write_text(pnpm_lock("5.6.1"))
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "both", date="2025-11-25T12:00:00+00:00")
+        finding = scan_repo(repo, WINDOW)
+        assert {e.lockfile_path for e in finding.exposures} == {"pnpm-lock.yaml"}
+
+    def test_a_nested_pnpm_lockfile_is_judged_by_its_basename(self, tmp_path):
+        repo = tmp_path / "pnpm-nested"
+        repo.mkdir()
+        (repo / "packages/api").mkdir(parents=True)
+        git(repo, "init", "-q")
+        (repo / "packages/api/pnpm-lock.yaml").write_text(pnpm_lock("5.6.1"))
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "nested", date="2025-11-25T12:00:00+00:00")
+        finding = scan_repo(repo, WINDOW)
+        assert finding.verdict is Verdict.EXPOSED
+        assert finding.exposures[0].lockfile_path == "packages/api/pnpm-lock.yaml"
+        assert finding.warnings == []
 
     def test_npm_and_pnpm_lockfiles_in_one_repository_both_testify(self, tmp_path):
         """Neither shadows the other: each is what its own tool installed."""
