@@ -994,6 +994,21 @@ class TestEnvironmentSecrets:
                                   secrets=lambda p, n: ("REPO_ONLY",))
         assert any("environment(s) prod-eu" in n for n in report.rotation_notes)
 
+    def test_next_line_scalar_still_names_the_environment(self, tmp_path, plan):
+        """``environment:`` with the bare value on the following line is the same
+        string to YAML, and the old pattern caught it by accident — the fix must
+        not trade that spelling away for the block form.
+        """
+        workflow = ("name: CI\non: [push]\njobs:\n  ship:\n"
+                    "    environment:\n      production\n"
+                    "    steps:\n      - run: npm ci\n      - run: deploy\n"
+                    "        env:\n          T: ${{ secrets.PROD_TOKEN }}\n")
+        repo = make_repo(tmp_path, "api", [("2025-11-25T10:00:00+00:00", "5.6.1")],
+                         workflow=workflow)
+        report = scan_organization([("api", repo)], plan, runs=runs_with(head(repo)),
+                                  secrets=lambda p, n: ("REPO_ONLY",))
+        assert any("environment(s) production" in n for n in report.rotation_notes)
+
 
 THREE = dict(ADVISORY, packages=[
     {"name": "chalk", "versions": ["5.6.1"], "sources": ["https://a.test"]},

@@ -52,11 +52,18 @@ LOCAL_USES = re.compile(r"uses:\s*[\"']?(\./[^\s\"']+\.ya?ml)")
 # Pages starter workflow ships) a value-side ``\s*`` walked onto the next line and
 # named the mapping key ``name`` as the environment (#91). The block pattern reads
 # the ``name:`` entry wherever it sits in the block, because ``url:`` may come first.
+# The next-line pattern keeps a form the old ``\s*`` caught by accident: a plain
+# scalar continued on the following line (``environment:`` then an indented bare
+# ``production``) is valid YAML for the same string, and dropping it would silence
+# the environment caveat for that spelling — the token must not be a ``key:`` line,
+# which is what separates it from the block form.
 ENVIRONMENT_SCALAR = re.compile(r"(?m)^[ \t]*environment:[ \t]*[\"']?([A-Za-z0-9._-]+)")
 ENVIRONMENT_BLOCK = re.compile(
     r"(?m)^[ \t]*environment:[ \t]*\n"
     r"(?:[ \t]+(?!name:)[A-Za-z_-]+:[^\n]*\n)*"
     r"[ \t]+name:[ \t]*[\"']?([A-Za-z0-9._-]+)")
+ENVIRONMENT_NEXT_LINE = re.compile(
+    r"(?m)^[ \t]*environment:[ \t]*\n[ \t]+[\"']?([A-Za-z0-9._-]+)[\"']?[ \t]*$")
 REMOTE_USES = re.compile(r"uses:\s*[\"']?([A-Za-z0-9._-]+/[A-Za-z0-9._-]+/\.github/workflows/[^\s\"']+)")
 # Forms that hand a job every secret it could see, so nothing can be narrowed:
 # passing them on to a called workflow, serialising the whole context, or
@@ -276,6 +283,7 @@ def environments_in_workflows(repo: Path, sha: str, paths: tuple[str, ...],
             continue
         found.update(ENVIRONMENT_SCALAR.findall(body))
         found.update(ENVIRONMENT_BLOCK.findall(body))
+        found.update(ENVIRONMENT_NEXT_LINE.findall(body))
     return tuple(sorted(found))
 
 
