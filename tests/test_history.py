@@ -680,22 +680,24 @@ class TestYarnTrees:
         in-window Yarn 1 commit; letting it close the segment discharged the witness
         and read the repository CLEAN. The rebased-looking author/committer split on
         the v1 commit pins the emission order that made that reachable."""
+        import subprocess
         repo = tmp_path / "sibling"
         repo.mkdir()
         git(repo, "init", "-q")
         (repo / "yarn.lock").write_text(YARN_LOCK)
         git(repo, "add", "-A")
         git(repo, "commit", "-qm", "base v1", date="2025-11-01T12:00:00+00:00")
+        default = subprocess.run(["git", "-C", str(repo), "rev-parse", "--abbrev-ref", "HEAD"],
+                                 check=True, capture_output=True, text=True).stdout.strip()
         git(repo, "checkout", "-q", "-b", "berry-try")
         (repo / "yarn.lock").write_text(berry_lock("5.6.0"))
         git(repo, "add", "-A")
         git(repo, "commit", "-qm", "try berry", date="2025-11-20T12:00:00+00:00")
-        git(repo, "checkout", "-q", "main")
+        git(repo, "checkout", "-q", default)
         (repo / "yarn.lock").write_text(YARN_LOCK + "\n# still yarn 1\n")
         git(repo, "add", "-A")
         git(repo, "commit", "-qm", "v1 in window",
             author_date="2025-11-25T12:00:00+00:00")  # committer date = now: rebased shape
-        import subprocess
         subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t",
                         "merge", "-q", "--no-ff", "--no-commit", "berry-try"],
                        capture_output=True)  # both sides touched the file: conflict expected
