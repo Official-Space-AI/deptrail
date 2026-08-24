@@ -95,8 +95,8 @@ class TestDemo:
             "scan_complete": False, "worst_grade": "CONFIRMED",
         }
         assert payload["not_judged"] == [
-            "mobile-app: yarn.lock: Yarn lockfiles are not parsed yet, so the versions "
-            "this tree installed were not judged"
+            "mobile-app: yarn.lock: Yarn 1 lockfiles are not parsed yet, so the versions "
+            "this tree installed while it was Yarn 1 were not judged"
         ]
         assert payload["exposed_repos"] == ["api-server", "docs-site"]
         rotate = {(r["repo"], r["secret"]) for r in payload["rotate"]}
@@ -519,7 +519,7 @@ class TestUnreadableLockfileDialects:
     def test_yarn_repository_cannot_be_cleared(self, tmp_path, capsys):
         advisory = self._advisory(tmp_path)
         repo = self._repo(tmp_path, "yarnapp", {
-            "yarn.lock": '"chalk@^5.6.0":\n  version "5.6.1"\n',
+            "yarn.lock": '# yarn lockfile v1\n"chalk@^5.6.0":\n  version "5.6.1"\n',
             "package.json": '{"name":"app","dependencies":{"chalk":"^5.6.0"}}',
         })
         code = main(["scan", "--ioc", str(advisory), "--repo", str(repo), "--no-ci"])
@@ -559,7 +559,7 @@ class TestUnreadableLockfileDialects:
         from deptrail.grading import Grade
         advisory = self._advisory(tmp_path)
         repo = self._repo(tmp_path, "yarnapp2", {
-            "yarn.lock": '"chalk@^5.6.0":\n  version "5.6.1"\n',
+            "yarn.lock": '# yarn lockfile v1\n"chalk@^5.6.0":\n  version "5.6.1"\n',
         })
         target = tmp_path / "r.html"
         main(["scan", "--ioc", str(advisory), "--repo", str(repo), "--no-ci",

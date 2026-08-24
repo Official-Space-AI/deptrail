@@ -169,7 +169,7 @@ def parse_yarn_berry_lockfile(text: str) -> LockfileModel:
                                           path=resolution, origin=origin))
 
     declared[ROOT] |= root_deps
-    if entries and not project_entries:
+    if not project_entries:
         # Every one of the 2,186 measured files holds at least one workspace entry
         # (Berry writes the project itself into its lockfile), so a document without
         # one is a prefix whose project -- and everything alphabetically after the

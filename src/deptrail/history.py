@@ -29,8 +29,10 @@ Judgment model (shaped by adversarial review — see PR #8):
   an exposure interval either: the version may still be pinned in a row nobody
   could read.
 - **A tree we cannot read is not a tree without exposure.** Only lockfiles a
-  parser exists for are read: npm's two, and ``pnpm-lock.yaml``. A tree locked
-  with Yarn, Bun, Deno or pnpm 3's ``shrinkwrap.yaml`` is recorded in
+  parser exists for are read: npm's two, ``pnpm-lock.yaml``, and ``yarn.lock``
+  in its Berry format -- the content decides, per blob, because real histories
+  switch from Yarn 1 to Berry on the same path. A tree locked with Yarn 1, Bun,
+  Deno or pnpm 3's ``shrinkwrap.yaml`` is recorded in
   ``unread_trees`` and makes the repo INDETERMINATE —
   reporting CLEAN there would answer a question nobody could have looked at
   (found by replaying such repositories).
@@ -61,6 +63,29 @@ from pathlib import Path
 
 from .lockfile import LockfileModel, LockfileParseError, parse_lockfile
 from .pnpmlock import parse_pnpm_lockfile
+from .yarnberry import parse_yarn_berry_lockfile
+
+
+class Yarn1Lockfile(LockfileParseError):
+    """A ``yarn.lock`` in Yarn 1's own format: recognised, not parsed yet (issue #73).
+
+    Its own exception because the walker must not treat it as lost evidence -- the
+    tree is *unread*, the way a foreign lockfile is, and a warning would raise the
+    grade of every repository that merely predates its Berry migration.
+    """
+
+
+def _read_yarn_lock(text: str) -> LockfileModel:
+    """Berry and Yarn 1 share one basename; the content decides.
+
+    The two signals are total on 2,743 real blobs from three full repository
+    histories: 557 carry Yarn 1's header, 2,186 carry Berry's ``__metadata``, none
+    carry neither. Anything else falls through to the Berry parser's refusal, which
+    is the honest outcome for a file that claims to be a yarn.lock and is not.
+    """
+    if "# yarn lockfile v1" in text[:400]:
+        raise Yarn1Lockfile("Yarn 1 lockfiles are not parsed yet")
+    return parse_yarn_berry_lockfile(text)
 
 # The lockfiles this tool reads, and the parser for each. The basename decides: no
 # tool writes another's filename, and a file whose content lies about it fails its
@@ -72,13 +97,13 @@ PARSED_LOCKFILES = {
     "package-lock.json": parse_lockfile,
     "npm-shrinkwrap.json": parse_lockfile,
     "pnpm-lock.yaml": parse_pnpm_lockfile,
+    "yarn.lock": _read_yarn_lock,
 }
 # Lockfiles we can recognise but not parse yet (issue #17), and the tool that
 # writes each. Finding one means that tree's installed versions are unknown to us.
 # Every package manager that installs from the npm registry belongs here, because
 # a name missing from this table is a repository this tool would call clean.
 FOREIGN_LOCKFILES = {
-    "yarn.lock": "Yarn",
     "shrinkwrap.yaml": "pnpm (v3 and earlier)",
     "bun.lock": "Bun",
     "bun.lockb": "Bun",
@@ -489,6 +514,7 @@ def _descendants(children: dict[str, list[str]], sha: str) -> set[str]:
 
 ABSENT = "absent"          # the commit genuinely has no lockfile there
 UNREADABLE = "unreadable"  # we could not tell what it pinned
+FOREIGN_DIALECT = "foreign-dialect"  # recognised format this tool does not parse yet
 
 
 def _read_snapshot(repo: Path, sha: str, path: str,
@@ -510,6 +536,10 @@ def _read_snapshot(repo: Path, sha: str, path: str,
         return UNREADABLE
     try:
         model = PARSED_LOCKFILES[posixpath.basename(path)](text)
+    except Yarn1Lockfile:
+        # Not lost evidence, so no warning: the tree is unread the way a foreign
+        # lockfile is, and the caller decides whether it was unread inside the window.
+        return FOREIGN_DIALECT
     except LockfileParseError as e:
         finding.warnings.append(f"{path}@{sha[:8]}: unreadable snapshot ({e})")
         return UNREADABLE
@@ -546,7 +576,8 @@ def _scan_ref_chain(repo: Path, path: str, ref: str, chain: list[Commit],
                     seen: set[tuple], snapshots: dict[str, LockfileModel | str],
                     children: dict[str, list[str]], parents: dict[str, list[str]],
                     by_sha: dict[str, Commit], warned: set[str],
-                    shadowed_by: str | None = None) -> None:
+                    shadowed_by: str | None = None,
+                    dialect_witness: dict[str, str] | None = None) -> None:
     """Judge one ref's lockfile history, ancestors first.
 
     An interval starts at the pinning commit and ends at the first *descendant*
@@ -572,6 +603,24 @@ def _scan_ref_chain(repo: Path, path: str, ref: str, chain: list[Commit],
         if shadowed(commit.sha):
             continue
         model = snapshot(commit)
+        if model is FOREIGN_DIALECT and dialect_witness is not None \
+                and path not in dialect_witness:
+            # The tree was in a dialect this tool does not parse. Like a foreign
+            # lockfile, that keeps the repository from being cleared -- but only if
+            # the dialect held the tree while the window was open: babel left Yarn 1
+            # years before any incident this tool will be asked about, and denying
+            # it an all-clear forever would punish the migration. The segment ends at
+            # the first descendant whose snapshot is something else.
+            until: datetime | None = None
+            forward = _descendants(children, commit.sha)
+            for successor in chain[i + 1:]:
+                if successor.sha in forward and snapshot(successor) is not FOREIGN_DIALECT:
+                    until = successor.late
+                    break
+            since = commit.early
+            if not ((query.window_end is not None and since > query.window_end)
+                    or (until is not None and until <= query.window_start)):
+                dialect_witness[path] = commit.sha
         if isinstance(model, str):
             continue
         bad = model.versions_of(query.package) & query.malicious_versions
@@ -590,7 +639,8 @@ def _scan_ref_chain(repo: Path, path: str, ref: str, chain: list[Commit],
                 until = successor.late
                 break
             later = snapshot(successor)
-            if later is UNREADABLE or (later is not ABSENT and later.unread):
+            if later is UNREADABLE or later is FOREIGN_DIALECT \
+                    or (not isinstance(later, str) and later.unread):
                 continue  # cannot claim the pin ended here
             if later is ABSENT or not (
                 later.versions_of(query.package) & query.malicious_versions
@@ -666,6 +716,7 @@ def scan_repo(repo: Path, query: WindowQuery) -> RepoFinding:
         seen: set[tuple] = set()
         snapshots: dict[str, LockfileModel | str] = {}
         by_sha: dict[str, Commit] = {}
+        dialect_witness: dict[str, str] = {}
         any_history = False
         # npm ignores package-lock.json entirely when a shrinkwrap sits beside it,
         # so judging both independently would invent an exposure from a file npm
@@ -690,8 +741,16 @@ def scan_repo(repo: Path, query: WindowQuery) -> RepoFinding:
                 by_sha.update({c.sha: c for c in chain})
                 _scan_ref_chain(repo, path, ref, chain, query, finding, seen,
                                 snapshots, children, parents, by_sha, warned,
-                                shadowed_by=shadowed_by)
+                                shadowed_by=shadowed_by,
+                                dialect_witness=dialect_witness)
 
+        if path in dialect_witness:
+            finding.unread_trees.append(UnreadTree(
+                path=path,
+                reason=f"{path}: Yarn 1 lockfiles are not parsed yet, so the versions "
+                       "this tree installed while it was Yarn 1 were not judged",
+                commit=dialect_witness[path],
+            ))
         if not any_history:
             finding.warnings.append(
                 f"{path}: discovered in refs but no walkable history (evidence unreadable)"

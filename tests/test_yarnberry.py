@@ -533,16 +533,13 @@ class TestAgainstTheFixtureLockfiles:
                 == len(entries), name
 
 
-class TestTheScanPathStillReachesNothing:
-    def test_a_scan_does_not_import_the_berry_reader(self):
-        """history.py does not read yarn.lock yet; the wiring (and the Yarn 1
-        sniffing it needs) is its own change and must import this deliberately."""
+class TestTheScanPathReachesThisThroughTheWalker:
+    def test_the_history_walker_imports_the_berry_reader(self):
         script = (
-            "import sys, tempfile\n"
+            "import sys\n"
             f"sys.path[:0] = {sys.path!r}\n"
-            "from deptrail.cli import main\n"
-            "with tempfile.TemporaryDirectory() as d: main(['demo', '--workdir', d])\n"
-            "sys.exit('imported' if 'deptrail.yarnberry' in sys.modules else 0)\n"
+            "import deptrail.history\n"
+            "sys.exit(0 if 'deptrail.yarnberry' in sys.modules else 'not imported')\n"
         )
         result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
         assert result.returncode == 0, result.stdout.strip() or result.stderr.strip()
