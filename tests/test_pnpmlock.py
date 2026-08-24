@@ -4,7 +4,7 @@ The key splitter is tested in ``test_pnpmkeys``; what is tested here is everythi
 document adds around the keys -- which rows become packages, where edges come from, what
 the project depends on, what happens to a row that will not read -- each on the shape
 pnpm really writes. Two fixtures are real files: ``pnpm-v9-header-lies.yaml`` is
-``smartcontractkit/payment-abstraction`` trimmed to seven rows, a 9.0 header over 6.x
+``smartcontractkit/payment-abstraction`` trimmed to eight rows, a 9.0 header over 6.x
 keys; ``pnpm-v9-mixed-keys.yaml`` is a published test fixture with eleven 9.0 keys and
 two legacy ones, the case that forbids re-reading per key.
 """
@@ -719,8 +719,8 @@ class TestATruncatedDocumentIsNotACleanOne:
                     version: link:packages/ui
             """)
         assert model.packages == []
-        assert model.unread == ["chalk: the importers resolve it to '5.6.1' and the "
-                                "document has no row for it"]
+        assert model.unread == ["chalk: the document resolves it to '5.6.1' and holds "
+                                "no row for chalk@5.6.1"]
 
     def test_a_document_cut_in_the_middle_of_its_rows_names_what_is_missing(self):
         model = parse("""\
@@ -742,8 +742,193 @@ class TestATruncatedDocumentIsNotACleanOne:
                 resolution: {integrity: sha512-a}
             """)
         assert rows(model) == [("express", "4.19.2", NPM, "/express/4.19.2")]
-        assert model.unread == ["chalk: the importers resolve it to '5.6.1' and the "
-                                "document has no row for it"]
+        assert model.unread == ["chalk: the document resolves it to '5.6.1' and holds "
+                                "no row for chalk@5.6.1"]
+
+    def test_a_transitive_pin_with_its_row_gone_is_caught_too(self):
+        """The compromised package is usually transitive: the express row still
+        declares chalk 5.6.1 after the chalk row was cut."""
+        model = parse("""\
+            lockfileVersion: '9.0'
+
+            importers:
+
+              .:
+                dependencies:
+                  express:
+                    specifier: ^4.19.0
+                    version: 4.19.2
+
+            packages:
+
+              express@4.19.2:
+                resolution: {integrity: sha512-a}
+
+            snapshots:
+
+              express@4.19.2:
+                dependencies:
+                  chalk: 5.6.1
+            """)
+        assert model.versions_of("express") == {"4.19.2"}
+        assert model.unread == ["chalk: the document resolves it to '5.6.1' and holds "
+                                "no row for chalk@5.6.1"]
+
+    def test_a_pin_whose_row_survives_at_another_version_is_caught_too(self):
+        """A hand-edited file whose pin and row disagree: a name-level check blessed
+        it, and versions_of answered with the row nobody pinned."""
+        model = parse("""\
+            lockfileVersion: '9.0'
+
+            importers:
+
+              .:
+                dependencies:
+                  chalk:
+                    specifier: ^5.0.0
+                    version: 5.6.1
+
+            packages:
+
+              chalk@5.6.0:
+                resolution: {integrity: sha512-a}
+
+            snapshots:
+
+              chalk@5.6.0: {}
+            """)
+        assert model.versions_of("chalk") == {"5.6.0"}
+        assert model.unread == ["chalk: the document resolves it to '5.6.1' and holds "
+                                "no row for chalk@5.6.1"]
+
+    def test_an_aliased_pin_whose_key_is_gone_is_caught_too(self):
+        """`execa: safe-execa@0.1.2` does not start with a digit; the pin lives in the
+        key it names. Truncation that removed the key removed the evidence."""
+        model = parse("""\
+            lockfileVersion: '9.0'
+
+            importers:
+
+              .:
+                dependencies:
+                  execa:
+                    specifier: npm:safe-execa@^0.1.2
+                    version: safe-execa@0.1.2
+            """)
+        assert model.packages == []
+        assert len(model.unread) == 1
+        assert model.unread[0].startswith("execa: the document resolves it to 'safe-execa@0.1.2'")
+
+    def test_a_git_pin_whose_key_is_gone_is_caught_too(self):
+        model = parse("""\
+            lockfileVersion: '6.0'
+
+            dependencies:
+              ci-info:
+                specifier: watson/ci-info#f43f6a1c
+                version: github.com/watson/ci-info/f43f6a1cefff47fb361c88cf4b943fdbcaafe540
+
+            packages:
+            """)
+        assert model.packages == []
+        assert len(model.unread) == 1 and model.unread[0].startswith("ci-info: ")
+
+    def test_an_aliased_pin_whose_key_survives_is_no_finding(self):
+        model = parse("""\
+            lockfileVersion: '9.0'
+
+            importers:
+
+              .:
+                dependencies:
+                  execa:
+                    specifier: npm:safe-execa@^0.1.2
+                    version: safe-execa@0.1.2
+
+            packages:
+
+              safe-execa@0.1.2:
+                resolution: {integrity: sha512-a}
+
+            snapshots:
+
+              safe-execa@0.1.2: {}
+            """)
+        assert model.unread == []
+        assert model.versions_of("safe-execa") == {"0.1.2"}
+
+    def test_a_corrupted_pin_is_a_finding_not_a_skip(self):
+        model = parse("""\
+            lockfileVersion: '9.0'
+
+            importers:
+
+              .:
+                dependencies:
+                  chalk:
+                    specifier: ^5.0.0
+                    version: 5.6.1)
+            """)
+        assert len(model.unread) == 1
+        assert model.unread[0].startswith("chalk: the document resolves it to '5.6.1)'")
+
+    def test_a_numeric_registry_host_is_a_key_not_a_version(self):
+        model = parse("""\
+            lockfileVersion: 5.4
+
+            dependencies:
+              chalk: 127.0.0.1+4873/chalk/5.6.1
+            specifiers:
+              chalk: ^5.0.0
+
+            packages:
+
+              127.0.0.1+4873/chalk/5.6.1:
+                resolution: {integrity: sha512-a}
+            """)
+        assert model.unread == []
+        assert model.versions_of("chalk") == {"5.6.1"}
+
+    def test_an_alias_to_a_digit_leading_name_is_a_key_not_a_version(self):
+        model = parse("""\
+            lockfileVersion: '9.0'
+
+            importers:
+
+              .:
+                dependencies:
+                  zip:
+                    specifier: npm:7zip-bin@^5.0.0
+                    version: 7zip-bin@5.0.0
+
+            packages:
+
+              7zip-bin@5.0.0:
+                resolution: {integrity: sha512-a}
+
+            snapshots:
+
+              7zip-bin@5.0.0: {}
+            """)
+        assert model.unread == []
+        assert model.versions_of("7zip-bin") == {"5.0.0"}
+
+    def test_a_peer_suffixed_pin_checks_its_version_part(self):
+        model = parse("""\
+            lockfileVersion: 5.4
+
+            importers:
+
+              .:
+                dependencies:
+                  ts-node: 8.10.1_typescript@3.9.3
+
+            packages:
+
+              /ts-node/8.10.1_typescript@3.9.3:
+                resolution: {integrity: sha512-a}
+            """)
+        assert model.unread == []
 
     def test_a_document_that_already_has_unread_rows_does_not_double_report(self):
         model = parse("""\
@@ -1011,22 +1196,30 @@ class TestTwoDocuments:
               chalk@5.6.1:
                 resolution: {integrity: sha512-b}
 
+              ansi-styles@6.2.1:
+                resolution: {integrity: sha512-c}
+
             snapshots:
 
               chalk@5.6.1:
                 dependencies:
                   ansi-styles: 6.2.1
+
+              ansi-styles@6.2.1: {}
             """)
         assert model.root_deps == {"pnpm", "chalk"}
         assert model.declared[ROOT] == {"pnpm", "chalk"}
         assert model.declared["chalk"] == {"ansi-styles"}
-        assert [p.name for p in model.packages] == ["pnpm", "chalk"]
+        assert [p.name for p in model.packages] == ["pnpm", "chalk", "ansi-styles"]
         assert model.unread == ["/stray@1.0.0: v5/v6-style key in a document declaring "
                                "lockfileVersion 9.0"]
 
 
 class TestWhatIsRefused:
     @pytest.mark.parametrize("text, fragment", [
+        ("lockfileVersion: '9.0'\nimporters: []\npackages: {}\n", "importers is a list"),
+        ("lockfileVersion: '9.0'\nimporters:\n  .: [1]\npackages: {}\n",
+         "importer '.' is a list"),
         ("", "no YAML document"),
         ("# only a comment\n", "no YAML document"),
         ("- a\n- b\n", "not a mapping"),
@@ -1109,7 +1302,7 @@ class TestAgainstTheFixtureLockfiles:
             name_only += document_name_only
         paths = [p.path for p in model.packages]
         row_unread = [m for m in model.unread if m.split(": ", 1)[0] in keys]
-        pin_unread = [m for m in model.unread if "the importers resolve it to" in m]
+        pin_unread = [m for m in model.unread if "holds no row for" in m]
         assert sorted(row_unread + pin_unread) == sorted(model.unread), path.name
         assert len(paths) + len(row_unread) + name_only == len(keys), path.name
         assert set(paths) <= set(keys)
