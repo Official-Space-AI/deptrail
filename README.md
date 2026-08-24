@@ -191,7 +191,7 @@ read as a scan that found nothing.
 
 - **npm and pnpm lockfiles.** `package-lock.json`, `npm-shrinkwrap.json` and
   `pnpm-lock.yaml` (every `lockfileVersion` pnpm has written) are parsed. A tree
-  locked with Yarn, Bun or Deno is reported as **not judged**, exits `2`, and
+  locked with Yarn, Bun, Deno or pnpm 3's `shrinkwrap.yaml` is reported as **not judged**, exits `2`, and
   produces no rotation list — neither cleared nor accused
   ([#17](https://github.com/Official-Space-AI/deptrail/issues/17)).
 - **A `package.json` with no lockfile is not yet reported.** Such a tree resolves

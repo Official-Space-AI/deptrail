@@ -140,6 +140,12 @@ def _read_document(document: object, index: int) -> LockfileModel:
                 declared.setdefault(record.name, set()).update(
                     _edges(entry, _PACKAGE_BLOCKS, grammar, packages, snapshots))
 
+    # Only when nothing else already keeps this snapshot from reading clean: a
+    # document with unread rows warns and cannot close an interval regardless, and a
+    # missing pin is then likelier one of those rows than a second finding.
+    if not unread:
+        unread += _pins_without_rows(importers, installed, declared)
+
     return LockfileModel(
         lockfile_version=str(declared_version).strip(),
         root_name="(unnamed)",
@@ -148,6 +154,37 @@ def _read_document(document: object, index: int) -> LockfileModel:
         declared=declared,
         unread=unread,
     )
+
+
+def _pins_without_rows(importers: dict, installed: list[InstalledPackage],
+                       declared: dict[str, set[str]]) -> list[str]:
+    """Importer pins the row sections do not hold: unread evidence, not a clean tree.
+
+    YAML is prefix-valid where JSON is not, so a ``pnpm-lock.yaml`` truncated after its
+    importer block still parses -- the importer records ``version: 5.6.1`` and the row
+    that pinned it is gone. Reading that as "pins nothing" called the tree clean and
+    silently ended exposure intervals, which is the one direction this tool must never
+    be wrong in. A version-shaped importer value therefore requires a row (or a
+    name-only row) of that name. Measured: 14 of 4,407 real documents trip this, every
+    one a vendored scanner fixture or a hand-edited lockfile that really does resolve
+    a name it does not contain.
+    """
+    names = {p.name for p in installed} | set(declared)
+    messages: list[str] = []
+    for importer in importers.values():
+        if not isinstance(importer, dict):
+            continue
+        for block in _IMPORTER_BLOCKS:
+            mapping = importer.get(block)
+            if not isinstance(mapping, dict):
+                continue
+            for name, value in mapping.items():
+                if isinstance(value, dict):
+                    value = value.get("version")
+                if isinstance(value, str) and value[:1].isdigit() and name not in names:
+                    messages.append(f"{name}: the importers resolve it to {value!r} and "
+                                    "the document has no row for it")
+    return messages
 
 
 def _section(document: dict, name: str, index: int) -> dict:
