@@ -3,8 +3,8 @@
 What is tested is the document semantics on the shapes Berry really writes: identity
 from ``resolution`` and never from the key, the locator protocols, aliasing through
 the descriptor index, and the truncation guard. ``yarn-berry-babel-slice.lock`` is
-``babel/babel``'s lockfile trimmed to seven entries -- a workspace root, two ``link:``
-entries, an aliased row, a ``patch:`` row and two plain rows; the other two fixtures
+``babel/babel``'s lockfile trimmed to eight entries -- a workspace root, two ``link:``
+entries, an aliased row, a ``patch:`` row and three plain rows; the other two fixtures
 are npm-only slices used by the YAML reader's own tests.
 """
 from __future__ import annotations
@@ -21,10 +21,19 @@ from deptrail.yarnberry import parse_yarn_berry_lockfile
 
 FIXTURES = pathlib.Path(__file__).parent / "fixtures" / "yaml"
 
+# Every real Berry lockfile records the project itself as a workspace entry, and the
+# reader treats a document without one as truncated, so the shared head carries a
+# minimal root the way the wild does.
 HEAD = """\
             __metadata:
               version: 8
               cacheKey: 10
+
+            "root@workspace:.":
+              version: 0.0.0-use.local
+              resolution: "root@workspace:."
+              languageName: unknown
+              linkType: soft
 
 """
 
@@ -111,10 +120,25 @@ class TestWhatARowBecomes:
               resolution: "chalk@npm:5.6.1"
               languageName: node
               linkType: hard
+
+            "local-tool@portal:./tools/local-tool::locator=app%40workspace%3A.":
+              version: 0.0.0-use.local
+              resolution: "local-tool@portal:./tools/local-tool::locator=app%40workspace%3A."
+              dependencies:
+                picocolors: "npm:^1.0.0"
+              languageName: node
+              linkType: soft
+
+            "picocolors@npm:^1.0.0":
+              version: 1.1.1
+              resolution: "picocolors@npm:1.1.1"
+              languageName: node
+              linkType: hard
             """)
-        assert rows(model) == [("chalk", "5.6.1", NPM)]
-        assert model.root_deps == {"chalk"}
+        assert rows(model) == [("chalk", "5.6.1", NPM), ("picocolors", "1.1.1", NPM)]
+        assert model.root_deps == {"chalk", "picocolors"}, "a portal is the project too"
         assert model.chain_to("chalk") == ["chalk"]
+        assert model.unread == []
 
     def test_a_condition_entry_is_a_switch_not_an_artifact(self):
         """Its variants are rows of their own; the switch contributes edges only."""
@@ -142,6 +166,7 @@ class TestWhatARowBecomes:
             """)
         assert model.versions_of("globals") == {"11.12.0", "13.24.0"}
         assert model.declared["globals"] == {"globals"}, "both variants resolve to the real name"
+        assert model.unread == [], "a condition entry is read, not refused"
 
     def test_an_entry_without_a_version_is_unread(self):
         model = parse(HEAD + """\
@@ -173,6 +198,63 @@ class TestWhatARowBecomes:
             """)
         assert model.packages == []
         assert len(model.unread) == 1 and "is not a locator" in model.unread[0]
+
+    def test_an_ssh_locator_is_source(self):
+        model = parse(HEAD + """\
+            "pkg@ssh://git@github.com/acme/pkg.git#commit=abc123":
+              version: 2.0.0
+              resolution: "pkg@ssh://git@github.com/acme/pkg.git#commit=abc123"
+              languageName: node
+              linkType: hard
+            """)
+        assert rows(model) == [("pkg", "2.0.0", SOURCE)]
+
+    def test_a_dependencies_block_cut_to_nothing_is_unread(self):
+        """A cut right after ``dependencies:`` parses the block to None; the edges
+        that stood there are evidence this snapshot no longer holds."""
+        model = parse(HEAD + """\
+            "app@workspace:.":
+              version: 0.0.0-use.local
+              resolution: "app@workspace:."
+              dependencies:
+            """)
+        assert len(model.unread) == 1
+        assert "dependencies block did not parse" in model.unread[0]
+
+    def test_a_dependency_cut_after_its_name_is_unread(self):
+        model = parse(HEAD + """\
+            "app@workspace:.":
+              version: 0.0.0-use.local
+              resolution: "app@workspace:."
+              dependencies:
+                chalk:
+              languageName: unknown
+              linkType: soft
+            """)
+        assert len(model.unread) == 1
+        assert model.unread[0] == "app@workspace:.: the dependency 'chalk' carries no range"
+
+    def test_a_protocol_less_resolution_without_a_path_is_not_a_shorthand(self):
+        model = parse(HEAD + """\
+            "weird@npm:^1.0.0":
+              version: 1.0.0
+              resolution: "weird@1.0.0"
+              languageName: node
+              linkType: hard
+            """)
+        assert model.packages == [], "a fabricated source row would read as evidence"
+        assert len(model.unread) == 1 and "is not a locator" in model.unread[0]
+
+    def test_a_blank_version_is_unread(self):
+        model = parse(HEAD + """\
+            "chalk@npm:^5.0.0":
+              version: ""
+              resolution: "chalk@npm:5.6.1"
+              languageName: node
+              linkType: hard
+            """)
+        assert model.packages == []
+        assert model.unread == ["chalk@npm:^5.0.0: entry records no version"]
 
     def test_an_early_github_shorthand_is_source(self):
         """41 real resolutions carry no protocol: early Berry's GitHub shorthand."""
@@ -218,6 +300,7 @@ class TestEdgesResolveThroughTheDescriptorIndex:
             """)
         assert model.root_deps == {"safe-execa"}
         assert model.chain_to("safe-execa") == ["safe-execa"]
+        assert model.unread == [], "a complete file with an alias is not truncated"
 
     def test_older_metadata_writes_ranges_bare(self):
         """Before metadata 8 the range has no ``npm:``; the descriptor does."""
@@ -252,6 +335,50 @@ class TestEdgesResolveThroughTheDescriptorIndex:
         assert model.declared["chalk"] == {"ansi-styles"}
         assert model.chain_to("ansi-styles") == ["chalk", "ansi-styles"]
         assert model.lockfile_version == "4"
+        assert model.unread == []
+
+    def test_a_pre_eight_aliased_bare_edge_lands_on_the_real_name(self):
+        """The range is bare but the descriptor carries ``npm:``; only the second
+        spelling finds it, and only the resolution names the row."""
+        model = parse("""\
+            __metadata:
+              version: 4
+              cacheKey: 7
+
+            "app@workspace:.":
+              version: 0.0.0-use.local
+              resolution: "app@workspace:."
+              dependencies:
+                execa: safe-execa@^0.1.2
+              languageName: unknown
+              linkType: soft
+
+            "execa@npm:safe-execa@^0.1.2":
+              version: 0.1.2
+              resolution: "safe-execa@npm:0.1.2"
+              languageName: node
+              linkType: hard
+            """)
+        assert model.root_deps == {"safe-execa"}
+        assert model.unread == []
+
+    def test_an_edge_answered_by_the_second_descriptor_of_a_comma_joined_key(self):
+        model = parse(HEAD + """\
+            "app@workspace:.":
+              version: 0.0.0-use.local
+              resolution: "app@workspace:."
+              dependencies:
+                execa: "npm:safe-execa@^0.2.0"
+              languageName: unknown
+              linkType: soft
+
+            "safe-execa@npm:^0.1.2, execa@npm:safe-execa@^0.2.0":
+              version: 0.2.0
+              resolution: "safe-execa@npm:0.2.0"
+              languageName: node
+              linkType: hard
+            """)
+        assert model.root_deps == {"safe-execa"}
         assert model.unread == []
 
 
@@ -318,6 +445,7 @@ class TestWhatIsRefused:
         ("", "expected one document"),
         ("- a\n- b\n", "is a mapping"),
         ("chalk@npm:5.6.1:\n  version: 5.6.1\n", "no __metadata"),
+        ("__metadata:\n  version:\n", "carries no version"),
         ("# THIS IS AN AUTOGENERATED FILE. DO NOT EDIT THIS FILE DIRECTLY.\n"
          "# yarn lockfile v1\n", "one document"),
     ])
@@ -347,15 +475,43 @@ class TestAgainstTheFixtureLockfiles:
         ("yarn-berry.lock", "10", 10), ("yarn-berry-v4.lock", "4", 9),
     ])
     def test_the_reader_fixtures_parse_every_row_they_hold(self, name, version, count):
-        """These two are the YAML reader's slices, cut without regard for edge targets,
-        so the truncation guard rightly reports their dangling edges -- which is also
-        what pins the guard against real files: it must name only what is missing."""
+        """These two are the YAML reader's slices, cut without regard for edge targets
+        or the workspace entry, so the truncation guards rightly report both."""
         model = parse_yarn_berry_lockfile(FIXTURES.joinpath(name).read_text(encoding="utf-8"))
         assert model.lockfile_version == version
         assert len(model.packages) == count
         assert all(p.origin == NPM for p in model.packages)
+        assert any("holds no workspace entry" in message for message in model.unread)
         assert all("holds no entry for it" in message or "no resolution" in message
+                   or "holds no workspace entry" in message
                    for message in model.unread), model.unread
+
+    def test_a_closed_prefix_without_the_project_is_not_a_clean_tree(self):
+        """A cut can leave an alphabetical run that references only itself -- 2,007 of
+        jest's 2,025 rows vanished behind a clean model until the workspace check."""
+        model = parse("""\
+            __metadata:
+              version: 8
+              cacheKey: 10
+
+            "@algolia/cache-common@npm:4.13.1":
+              version: 4.13.1
+              resolution: "@algolia/cache-common@npm:4.13.1"
+              languageName: node
+              linkType: hard
+
+            "@algolia/cache-in-memory@npm:4.13.1":
+              version: 4.13.1
+              resolution: "@algolia/cache-in-memory@npm:4.13.1"
+              dependencies:
+                "@algolia/cache-common": "npm:4.13.1"
+              languageName: node
+              linkType: hard
+            """)
+        assert len(model.packages) == 2, "the surviving rows are still read"
+        assert model.unread == ["the document holds no workspace entry; every Berry "
+                               "lockfile records its own project, so the rest of this "
+                               "one is missing"]
 
     def test_every_fixture_entry_is_accounted_for(self):
         """Entries == rows + unread + project entries + condition entries, counted
@@ -371,7 +527,8 @@ class TestAgainstTheFixtureLockfiles:
             project = sum(1 for r in resolutions
                           if any(p in r for p in ("@workspace:", "@link:", "@portal:")))
             condition = sum(1 for r in resolutions if "@condition:" in r)
-            guard = sum(1 for m in model.unread if "holds no entry for it" in m)
+            guard = sum(1 for m in model.unread if "holds no entry for it" in m
+                        or "holds no workspace entry" in m)
             assert len(model.packages) + (len(model.unread) - guard) + project + condition \
                 == len(entries), name
 
