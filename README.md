@@ -162,6 +162,12 @@ deptrail scan --ioc incident.json --org my-org --format html --output report.htm
 deptrail feeds                                          # bundled advisories
 ```
 
+Every mode except `--no-ci` reads CI runs and secret names through the
+[GitHub CLI](https://cli.github.com/), so `gh` must be installed and
+`gh auth login` done **before** incident day — `pip install` cannot install it
+for you, and a scan on a machine without it fails at the first API call, which
+is the worst moment to discover a prerequisite. `--no-ci` needs nothing.
+
 As a GitHub Action:
 
 ```yaml
