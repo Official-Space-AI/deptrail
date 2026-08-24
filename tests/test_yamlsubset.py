@@ -105,6 +105,7 @@ class TestRealLockfiles:
             "pnpm-v9-mixed-keys.yaml",
             "yarn-berry.lock",
             "yarn-berry-v4.lock",
+            "yarn-berry-babel-slice.lock",
         }
 
     @pytest.mark.parametrize("name", REAL_LOCKFILES)
