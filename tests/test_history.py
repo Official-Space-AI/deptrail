@@ -437,7 +437,7 @@ class TestPnpmTrees:
         assert finding.exposures[0].until is None, "the truncated snapshot proves nothing"
         assert finding.exposures[0].still_pinned
         assert len(finding.warnings) == 1
-        assert "the importers resolve it to" in finding.warnings[0]
+        assert "holds no row for" in finding.warnings[0]
 
     def test_a_lockfile_that_will_not_parse_warns_and_is_not_clean(self, tmp_path):
         repo = tmp_path / "pnpm-broken"

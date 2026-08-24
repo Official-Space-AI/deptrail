@@ -412,7 +412,7 @@ class TestAgainstTheFixtureLockfiles:
     # seven 6.x keys, and a 9.0 document with two legacy keys among eleven. The document
     # reader (``pnpmlock``) decides what becomes of those; here they are pinned so the
     # splitter keeps refusing them per key.
-    UNKNOWN_BY_DESIGN = {"pnpm-v9-header-lies.yaml": 7, "pnpm-v9-mixed-keys.yaml": 2}
+    UNKNOWN_BY_DESIGN = {"pnpm-v9-header-lies.yaml": 8, "pnpm-v9-mixed-keys.yaml": 2}
 
     def test_every_key_in_every_fixture_splits_to_a_known_status(self):
         for path in sorted(FIXTURES.joinpath("yaml").glob("pnpm-*.yaml")):

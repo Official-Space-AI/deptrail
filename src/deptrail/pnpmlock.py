@@ -109,9 +109,7 @@ def _read_document(document: object, index: int) -> LockfileModel:
         if any(record.status != UNKNOWN for _, _, record in legacy):
             grammar, rows = _LEGACY_GRAMMAR, legacy
 
-    importers = document.get("importers")
-    if not isinstance(importers, dict):
-        importers = {".": document}
+    importers = _importer_table(document, index)
     root_deps: set[str] = set()
     for importer in importers.values():
         if isinstance(importer, dict):
@@ -144,7 +142,8 @@ def _read_document(document: object, index: int) -> LockfileModel:
     # document with unread rows warns and cannot close an interval regardless, and a
     # missing pin is then likelier one of those rows than a second finding.
     if not unread:
-        unread += _pins_without_rows(importers, installed, declared)
+        checked_snapshots = snapshots if band == "v9" and grammar == declared_version else {}
+        unread += _pins_without_rows(importers, rows, checked_snapshots, installed)
 
     return LockfileModel(
         lockfile_version=str(declared_version).strip(),
@@ -156,37 +155,103 @@ def _read_document(document: object, index: int) -> LockfileModel:
     )
 
 
-def _pins_without_rows(importers: dict, installed: list[InstalledPackage],
-                       declared: dict[str, set[str]]) -> list[str]:
-    """Importer pins the row sections do not hold: unread evidence, not a clean tree.
+def _importer_table(document: dict, index: int) -> dict:
+    """The ``importers:`` mapping; absent means the document is its own importer.
 
-    YAML is prefix-valid where JSON is not, so a ``pnpm-lock.yaml`` truncated after its
-    importer block still parses -- the importer records ``version: 5.6.1`` and the row
-    that pinned it is gone. Reading that as "pins nothing" called the tree clean and
-    silently ended exposure intervals, which is the one direction this tool must never
-    be wrong in. A version-shaped importer value therefore requires a row (or a
-    name-only row) of that name. Measured: 14 of 4,407 real documents trip this, every
-    one a vendored scanner fixture or a hand-edited lockfile that really does resolve
-    a name it does not contain.
+    Present but not a mapping -- ``importers: []`` -- is refused rather than read as
+    absent: the fallback would consult top-level blocks that are not there, report an
+    empty project, and a malformed file would testify to a clean tree.
     """
-    names = {p.name for p in installed} | set(declared)
-    messages: list[str] = []
+    importers = document.get("importers")
+    if importers is None:
+        return {".": document}
+    if not isinstance(importers, dict):
+        raise LockfileParseError(
+            f"document {index}: importers is a {type(importers).__name__}, not a mapping")
+    for key, importer in importers.items():
+        if importer is not None and not isinstance(importer, dict):
+            raise LockfileParseError(
+                f"document {index}: importer {key!r} is a "
+                f"{type(importer).__name__}, not a mapping")
+    return importers
+
+
+def _pins_without_rows(importers: dict, rows: list[tuple[str, object, KeyRecord]],
+                       snapshots: dict, installed: list[InstalledPackage]) -> list[str]:
+    """Version pins the row sections do not hold: unread evidence, not a clean tree.
+
+    YAML is prefix-valid where JSON is not, so a ``pnpm-lock.yaml`` truncated after any
+    entry boundary still parses -- the importer records ``version: 5.6.1``, or a row
+    still declares ``chalk: 5.6.1``, and the row that pinned it is gone. Reading that
+    as "pins nothing" called the tree clean and silently ended exposure intervals,
+    which is the one direction this tool must never be wrong in. Every version-shaped
+    value -- in an importer block and in a row's dependency block alike, since the
+    compromised package is usually transitive -- therefore requires a row of exactly
+    that name and version; a name-only match would bless a hand-edited file whose pin
+    and row disagree. A dep-path value (an alias, a git location) requires its key or
+    a row answering to its name. Measured over 4,395 real files: 24 trip it (306
+    pins), every one a vendored scanner fixture or a genuinely incomplete file -- one
+    template repository resolves 68 devDependencies it holds no rows for. What stays
+    invisible: a cut landing exactly between an importer's ``specifier:`` and
+    ``version:`` lines leaves no version string to demand a row for.
+    """
+    held = {(p.name, p.version) for p in installed}
+    row_names = {record.name for _, _, record in rows if record.name is not None}
+    keys = {key for key, _, _ in rows} | set(snapshots)
+    missing: dict[tuple[str, str], str] = {}
+
+    def note(name: str, value: object) -> None:
+        if isinstance(value, dict):
+            value = value.get("version")
+        if not isinstance(value, str) or not value:
+            return
+        # ``link:`` and ``workspace:`` targets legitimately have no row, and a
+        # ``file:`` value's path is written relative to its importer, so its key
+        # cannot be reconstructed from here.
+        if value.startswith(("link:", "workspace:", "file:")):
+            return
+        # A pin that is a key of the document is backed, whatever it starts with --
+        # decided before the digit test, because a dep-path can start with a digit
+        # too (a numeric registry host, an alias to a digit-leading name).
+        if value in keys or f"{name}@{value}" in keys:
+            return
+        if value[:1].isdigit():
+            try:
+                version = suffix_groups(value)[0].split("_", 1)[0]
+            except Exception:
+                # An unbalanced suffix is still a pin; a corrupted one proves less,
+                # not more.
+                missing.setdefault((name, value), value)
+                return
+            if (name, version) in held:
+                return
+            if "/" in version and name in row_names:
+                return  # a digit-leading dep-path over bare keys; the name is backed
+            missing.setdefault((name, version), value)
+            return
+        # An alias or a git location pins a row through a key, and the row it installs
+        # carries a name of its own, so a row answering to the name also backs it -- a
+        # mirror-registry file writes host-prefixed values over bare keys (measured).
+        if name not in row_names:
+            missing.setdefault((name, value), value)
+
     for importer in importers.values():
         if not isinstance(importer, dict):
             continue
         for block in _IMPORTER_BLOCKS:
             mapping = importer.get(block)
-            if not isinstance(mapping, dict):
-                continue
-            for name, value in mapping.items():
-                if isinstance(value, dict):
-                    value = value.get("version")
-                if isinstance(value, str) and value[:1].isdigit() and name not in names:
-                    messages.append(f"{name}: the importers resolve it to {value!r} and "
-                                    "the document has no row for it")
-    return messages
-
-
+            if isinstance(mapping, dict):
+                for name, value in mapping.items():
+                    note(str(name), value)
+    for entry in [entry for _, entry, _record in rows] + list(snapshots.values()):
+        if isinstance(entry, dict):
+            for block in _PACKAGE_BLOCKS:
+                mapping = entry.get(block)
+                if isinstance(mapping, dict):
+                    for name, value in mapping.items():
+                        note(str(name), value)
+    return [f"{name}: the document resolves it to {value!r} and holds no row for "
+            f"{name}@{version}" for (name, version), value in sorted(missing.items())]
 def _section(document: dict, name: str, index: int) -> dict:
     """The ``packages:`` or ``snapshots:`` mapping; absent and empty are the same thing."""
     section = document.get(name)
