@@ -1009,6 +1009,38 @@ class TestEnvironmentSecrets:
                                   secrets=lambda p, n: ("REPO_ONLY",))
         assert any("environment(s) production" in n for n in report.rotation_notes)
 
+    def test_a_comment_inside_the_block_does_not_erase_the_environment(self, tmp_path, plan):
+        """The comment stripper leaves a whitespace-only line where the comment
+        stood, and the block pattern must step over it — a comment must not make
+        the environment vanish from the report.
+        """
+        workflow = ("name: Pages\non: [push]\njobs:\n  deploy:\n"
+                    "    environment:\n      # our GitHub Pages environment\n"
+                    "      name: github-pages\n"
+                    "    steps:\n      - run: npm ci\n      - run: deploy\n"
+                    "        env:\n          T: ${{ secrets.PROD_TOKEN }}\n")
+        repo = make_repo(tmp_path, "api", [("2025-11-25T10:00:00+00:00", "5.6.1")],
+                         workflow=workflow)
+        report = scan_organization([("api", repo)], plan, runs=runs_with(head(repo)),
+                                  secrets=lambda p, n: ("REPO_ONLY",))
+        assert any("environment(s) github-pages" in n for n in report.rotation_notes)
+
+    def test_a_nameless_block_does_not_borrow_a_name_from_another_mapping(self, tmp_path, plan):
+        """A block without ``name:`` must yield no environment — not the first
+        ``name:`` the scan walks into after dedenting, which here is the next
+        step's display name.
+        """
+        workflow = ("name: CI\non: [push]\njobs:\n  ship:\n"
+                    "    environment:\n      url: https://x.test\n"
+                    "    steps:\n      - name: Deploy to production\n"
+                    "        run: deploy\n"
+                    "        env:\n          T: ${{ secrets.PROD_TOKEN }}\n")
+        repo = make_repo(tmp_path, "api", [("2025-11-25T10:00:00+00:00", "5.6.1")],
+                         workflow=workflow)
+        report = scan_organization([("api", repo)], plan, runs=runs_with(head(repo)),
+                                  secrets=lambda p, n: ("REPO_ONLY",))
+        assert not any("environment(s)" in n for n in report.rotation_notes)
+
 
 THREE = dict(ADVISORY, packages=[
     {"name": "chalk", "versions": ["5.6.1"], "sources": ["https://a.test"]},

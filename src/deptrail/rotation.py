@@ -50,20 +50,27 @@ LOCAL_USES = re.compile(r"uses:\s*[\"']?(\./[^\s\"']+\.ya?ml)")
 # The scalar pattern must not cross the line end: ``\s`` matches newlines, and on
 # the block form (``environment:`` then an indented ``name:``, which is what the
 # Pages starter workflow ships) a value-side ``\s*`` walked onto the next line and
-# named the mapping key ``name`` as the environment (#91). The block pattern reads
-# the ``name:`` entry wherever it sits in the block, because ``url:`` may come first.
-# The next-line pattern keeps a form the old ``\s*`` caught by accident: a plain
-# scalar continued on the following line (``environment:`` then an indented bare
-# ``production``) is valid YAML for the same string, and dropping it would silence
-# the environment caveat for that spelling — the token must not be a ``key:`` line,
-# which is what separates it from the block form.
+# named the mapping key ``name`` as the environment (#91). Both multi-line patterns
+# anchor every follow-on line to indentation strictly deeper than the header's own
+# (the backreferenced group): without that, a block that lacks a ``name:`` let the
+# walk dedent out of the environment entirely and capture a ``name:`` belonging to
+# a different mapping — a job's display name, or the next job's. Whitespace-only
+# lines are allowed through, because the comment stripper above turns a full-line
+# comment inside the block into one, and a comment must not make the environment
+# vanish from the report. ``\r?`` keeps CRLF blobs readable. The block pattern
+# reads the ``name:`` entry wherever it sits in the block (``url:`` may come
+# first); the next-line pattern keeps a form the old ``\s*`` caught by accident —
+# a plain scalar continued on the following line is the same string to YAML — and
+# what separates it from the block form is that its line is not a ``key:`` line.
 ENVIRONMENT_SCALAR = re.compile(r"(?m)^[ \t]*environment:[ \t]*[\"']?([A-Za-z0-9._-]+)")
 ENVIRONMENT_BLOCK = re.compile(
-    r"(?m)^[ \t]*environment:[ \t]*\n"
-    r"(?:[ \t]+(?!name:)[A-Za-z_-]+:[^\n]*\n)*"
-    r"[ \t]+name:[ \t]*[\"']?([A-Za-z0-9._-]+)")
+    r"(?m)^([ \t]*)environment:[ \t]*\r?\n"
+    r"(?:(?:\1[ \t]+(?!name:)[A-Za-z_-]+:[^\n]*|[ \t]*)\r?\n)*"
+    r"\1[ \t]+name:[ \t]*[\"']?(?P<name>[A-Za-z0-9._-]+)")
 ENVIRONMENT_NEXT_LINE = re.compile(
-    r"(?m)^[ \t]*environment:[ \t]*\n[ \t]+[\"']?([A-Za-z0-9._-]+)[\"']?[ \t]*$")
+    r"(?m)^([ \t]*)environment:[ \t]*\r?\n"
+    r"(?:[ \t]*\r?\n)*"
+    r"\1[ \t]+[\"']?(?P<name>[A-Za-z0-9._-]+)[\"']?[ \t]*\r?$")
 REMOTE_USES = re.compile(r"uses:\s*[\"']?([A-Za-z0-9._-]+/[A-Za-z0-9._-]+/\.github/workflows/[^\s\"']+)")
 # Forms that hand a job every secret it could see, so nothing can be narrowed:
 # passing them on to a called workflow, serialising the whole context, or
@@ -282,8 +289,8 @@ def environments_in_workflows(repo: Path, sha: str, paths: tuple[str, ...],
         except GitError:
             continue
         found.update(ENVIRONMENT_SCALAR.findall(body))
-        found.update(ENVIRONMENT_BLOCK.findall(body))
-        found.update(ENVIRONMENT_NEXT_LINE.findall(body))
+        found.update(m.group("name") for m in ENVIRONMENT_BLOCK.finditer(body))
+        found.update(m.group("name") for m in ENVIRONMENT_NEXT_LINE.finditer(body))
     return tuple(sorted(found))
 
 
