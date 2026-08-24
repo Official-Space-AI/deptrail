@@ -1027,13 +1027,13 @@ class TestEnvironmentSecrets:
 
     def test_a_nameless_block_does_not_borrow_a_name_from_another_mapping(self, tmp_path, plan):
         """A block without ``name:`` must yield no environment — not the first
-        ``name:`` the scan walks into after dedenting, which here is the next
-        step's display name.
+        ``name:`` the scan walks into after dedenting, which here is the job's
+        own display name on the very next line.
         """
         workflow = ("name: CI\non: [push]\njobs:\n  ship:\n"
                     "    environment:\n      url: https://x.test\n"
-                    "    steps:\n      - name: Deploy to production\n"
-                    "        run: deploy\n"
+                    "    name: Deploy to production\n"
+                    "    steps:\n      - run: deploy\n"
                     "        env:\n          T: ${{ secrets.PROD_TOKEN }}\n")
         repo = make_repo(tmp_path, "api", [("2025-11-25T10:00:00+00:00", "5.6.1")],
                          workflow=workflow)
