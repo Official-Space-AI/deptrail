@@ -79,8 +79,8 @@ of the fix — OSV-Scanner puts "found nothing to analyse" outside its result ra
 entirely and requires `--allow-no-lockfiles` to downgrade it, and Snyk's
 `strictOutOfSync` refuses by default.
 
-**There was no lockfile we could read at all** — a tree locked with Yarn, pnpm,
-Bun or Deno, present while the malicious version was installable. Nothing was seen,
+**There was no lockfile we could read at all** — a tree locked with Yarn, Bun
+or Deno, present while the malicious version was installable. Nothing was seen,
 and nothing was hidden from us either: no version, no window overlap, no run. Such a
 tree is listed under **not judged** with the file that caused it, the report refuses
 to prove absence, and the run exits `2`. It raises no credentials, because grading it

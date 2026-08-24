@@ -189,9 +189,10 @@ the scan could not run at all — a green check must never mean "we could not lo
 What the tool cannot do, it says out loud — a scan that could not look must never
 read as a scan that found nothing.
 
-- **npm lockfiles only.** `package-lock.json` and `npm-shrinkwrap.json` are parsed.
-  A tree locked with Yarn, pnpm, Bun or Deno is reported as **not judged**, exits
-  `2`, and produces no rotation list — neither cleared nor accused
+- **npm and pnpm lockfiles.** `package-lock.json`, `npm-shrinkwrap.json` and
+  `pnpm-lock.yaml` (every `lockfileVersion` pnpm has written) are parsed. A tree
+  locked with Yarn, Bun or Deno is reported as **not judged**, exits `2`, and
+  produces no rotation list — neither cleared nor accused
   ([#17](https://github.com/Official-Space-AI/deptrail/issues/17)).
 - **A `package.json` with no lockfile is not yet reported.** Such a tree resolves
   ranges fresh at install time, so what it installed is unknown, but deciding
