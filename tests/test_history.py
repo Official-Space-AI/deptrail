@@ -1574,6 +1574,65 @@ class TestPrecedenceAndDiagnostics:
         (shorthand / "legacy").write_text(str(tmp_path / "somewhere.git") + "\n")
         assert "legacy" in _remotes(repo)
 
+    def test_an_inherited_git_dir_cannot_answer_for_another_repository(
+            self, tmp_path, monkeypatch):
+        """`GIT_DIR` outranks `-C`, and the last git call here that had not been told
+        so was the one that asks whether a path existed at a commit — which decides
+        whether a lockfile this tool cannot read was there during the window. Under
+        an inherited `GIT_DIR` it answered about a different repository, the tree
+        stopped being a witness, and a repository that could not be judged was
+        cleared instead.
+        """
+        from deptrail.history import scan_repo
+        repo = self.fresh(tmp_path, "foreign-tree")
+        self.write(repo, "package.json", '{"name": "x"}\n',
+                   "2025-11-25T10:00:00+00:00")
+        self.write(repo, "bun.lockb", "lockfile\n", "2025-11-25T10:30:00+00:00")
+        elsewhere = self.fresh(tmp_path, "elsewhere")
+        self.write(elsewhere, "README.md", "nothing here\n",
+                   "2025-11-25T10:00:00+00:00")
+        monkeypatch.setenv("GIT_DIR", str(elsewhere / ".git"))
+        assert scan_repo(repo, WINDOW).verdict is Verdict.INDETERMINATE
+
+    def test_a_credential_helper_named_by_the_environment_is_not_asked(
+            self, tmp_path, monkeypatch):
+        """`GIT_ASKPASS` is exported by VS Code, GitHub Desktop and `gh auth
+        setup-git`, and it hands a stored password to whatever host git is talking
+        to — which here is a host the scanned repository named.
+        """
+        import http.server
+        import threading
+        from deptrail.history import _remote_heads
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                # The host asks for credentials, which is what sends git looking
+                # for one; without it the connection fails first and askpass is
+                # never reached.
+                self.send_response(401)
+                self.send_header("WWW-Authenticate", 'Basic realm="x"')
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        witness = tmp_path / "asked"
+        askpass = tmp_path / "askpass.sh"
+        askpass.write_text(f"#!/bin/sh\ntouch {witness}\necho secret\n")
+        askpass.chmod(0o755)
+        monkeypatch.setenv("GIT_ASKPASS", str(askpass))
+        monkeypatch.setenv("GIT_ALLOW_PROTOCOL", "http")
+        repo = self.fresh(tmp_path, "askpass-clone")
+        git(repo, "remote", "add", "origin",
+            f"http://127.0.0.1:{server.server_address[1]}/x.git")
+        try:
+            assert _remote_heads(repo, "origin") is None
+            assert not witness.exists()
+        finally:
+            server.shutdown()
+
     def test_config_injected_by_the_environment_is_not_carried(self, tmp_path,
                                                                monkeypatch):
         """`GIT_CONFIG_COUNT` and its numbered keys are settings that arrive without

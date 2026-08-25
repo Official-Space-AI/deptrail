@@ -341,16 +341,30 @@ GIT_LOCATION_VARS = frozenset({
 })
 
 
-def _without_injected_config(env: dict[str, str]) -> dict[str, str]:
-    """The same environment with git's config-by-environment removed.
+# Settings and credential providers that arrive through the environment rather
+# than a file, so blanking `HOME` and the config files does not touch them. The
+# askpass pair hands over a stored password on request; the ssh pair names a
+# command this code would then run against an address the scanned repository
+# chose; `GIT_CONFIG_COUNT` and its numbered keys are config with no file at all,
+# and an inherited `http.extraHeader` was measured going out through them.
+PROBE_STRIPPED_VARS = frozenset({
+    "GIT_CONFIG", "GIT_CONFIG_COUNT", "GIT_ASKPASS", "SSH_ASKPASS",
+    "GIT_SSH", "GIT_SSH_COMMAND", "GIT_PROXY_COMMAND", "SSH_AUTH_SOCK",
+})
 
-    ``GIT_CONFIG_COUNT`` and its numbered keys are settings that arrive without a
-    file, so disabling the global and system files and pointing ``HOME`` at an
-    empty directory does not touch them: an inherited ``http.extraHeader`` was
-    still sent to whatever address the scanned repository named.
+
+def _without_injected_config(env: dict[str, str]) -> dict[str, str]:
+    """The same environment with git's settings-by-environment removed.
+
+    What still reaches the probe, and is not removable here: the ssh client reads
+    ``~/.ssh`` from the *account*, not from ``HOME`` — measured, OpenSSH ignores a
+    redirected ``HOME`` — so an ssh remote is still contacted with the operator's
+    own key. The claim this makes is therefore narrow: no git config from a file,
+    no credential asked for on demand, no command named by the environment, and
+    nothing from a URL's userinfo.
     """
     return {key: value for key, value in env.items()
-            if key not in ("GIT_CONFIG", "GIT_CONFIG_COUNT")
+            if key not in PROBE_STRIPPED_VARS
             and not key.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))}
 
 
@@ -483,7 +497,10 @@ def _remote_heads(repo: Path, remote: str = "origin") -> dict[str, str] | None:
     repository under suspicion: an unscoped ``http.extraHeader`` was measured
     reaching a host the scanned checkout named, and clearing that one key by name
     does not work — a URL-scoped header outranks the override, still goes out, and
-    takes the unscoped one with it. So the probe authenticates as nobody. What it
+    takes the unscoped one with it. So the probe carries no credential it can be given: no git config from a
+    file, none injected through the environment, no askpass, and nothing from a
+    URL's userinfo. An ssh key on the account's own disk is the exception the
+    docstring on ``_without_injected_config`` records. What it
     costs is real: a private remote comes back unverified rather than answered, as
     does one behind a proxy the operator configured globally. The alternative is
     handing whatever the machine holds to whatever address a compromised
@@ -559,7 +576,10 @@ def _remote_heads(repo: Path, remote: str = "origin") -> dict[str, str] | None:
                     child.wait()
                     code = None
                     break
-        if code != 0:
+        # Polling alone is not the cap: an advertisement that finishes inside the
+        # first interval is never measured by the loop, so the size is checked once
+        # more when the child is done.
+        if code != 0 or sink.stat().st_size > MAX_ADVERTISEMENT:
             return None
         advertisement = sink.read_text(encoding="utf-8", errors="replace")
     heads: dict[str, str] = {}
@@ -837,7 +857,7 @@ def _exists_at(repo: Path, sha: str, path: str) -> bool:
     """
     result = subprocess.run(
         ["git", "-C", str(repo), "ls-tree", "-z", "--name-only", sha, "--", path],
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=_git_env(GIT_NO_LAZY_FETCH="1"),
     )
     return result.returncode == 0 and bool(result.stdout.strip("\0"))
 
