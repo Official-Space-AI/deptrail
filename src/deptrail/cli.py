@@ -411,7 +411,13 @@ def cmd_scan(args: argparse.Namespace) -> int:
     # `--no-ci` is documented as "no token needed", so it withholds the token --
     # not the check. Withholding the check meant the same clone exited 2 without
     # the flag and 0 with it, and the report said nothing about why.
-    named = args.org or (args.slug and len(args.repo) == 1)
+    # Counted as repositories, not as arguments. `len(args.repo) == 1` read the
+    # same clone passed twice — `--repo P --repo P`, which a wrapper assembling its
+    # arguments from two sources produces — as "several repositories", withheld the
+    # named address, and with it the whole blocking path: measured, that clone with
+    # a poisoned pin on an unfetched branch went from exit 2 to exit 0 on the
+    # duplicate alone. The paths are already resolved above, so the set is exact.
+    named = args.org or (args.slug and len({str(path) for _n, path in repos}) == 1)
     trusted = ((lambda name: f"https://github.com/{slug_of(name)}.git")
                if slug_of is not None and named else None)
     report = scan_organization(repos, advisory.plan(), runs=runs, secrets=secrets,
