@@ -401,8 +401,14 @@ def cmd_scan(args: argparse.Namespace) -> int:
     # The address the operator named, never the one the checkout carries: `--org`
     # builds it here and `--slug` is typed, so ref coverage can authenticate as
     # them without the repository under suspicion choosing where that goes.
+    #
+    # One `--slug` cannot speak for several `--repo` paths. It would name the same
+    # repository for each, and since a named repository is the only one asked, a
+    # second clone holding every branch of the named one would be cleared while
+    # missing a branch of its own origin.
+    named = args.org or (args.slug and len(args.repo) == 1)
     trusted = ((lambda name: f"https://github.com/{slug_of(name)}.git")
-               if slug_of is not None else None)
+               if slug_of is not None and named else None)
     report = scan_organization(repos, advisory.plan(), runs=runs, secrets=secrets,
                                allow_incomplete=args.allow_incomplete_history,
                                remote_url=trusted)

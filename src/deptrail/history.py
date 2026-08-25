@@ -54,6 +54,7 @@ The attack window is inclusive on both ends; held intervals are half-open
 """
 from __future__ import annotations
 
+import base64
 import os
 import posixpath
 import re
@@ -492,6 +493,23 @@ def _without_userinfo(url: str) -> str:
     return f"{scheme}://{host}{slash}{tail}"
 
 
+def _github_authorization(url: str) -> str | None:
+    """A Basic header for a GitHub URL when the environment holds a token.
+
+    Only for an address the operator named, and only for github.com: the point of
+    a trusted URL is that nothing about where this goes came from the repository,
+    and a token is worth carrying only under exactly that condition.
+    """
+    host = url.partition("://")[2].partition("/")[0].rpartition("@")[2]
+    if host not in ("github.com", "www.github.com"):
+        return None
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    if not token:
+        return None
+    pair = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+    return f"Authorization: Basic {pair}"
+
+
 def _remote_heads(repo: Path, remote: str = "origin", *,
                   trusted_url: str | None = None) -> dict[str, str] | None:
     """The remote's branch names and tips, or ``None`` when it could not be asked.
@@ -566,8 +584,16 @@ def _remote_heads(repo: Path, remote: str = "origin", *,
         # escapes, and `#` or `;` start a comment, so an interpolated value either
         # truncated the URL or made the file unparseable.
         quoted = url.replace("\\", "\\\\").replace('"', '\\"')
-        config.write_text(
-            f'{config.read_text()}[remote "origin"]\n\turl = "{quoted}"\n')
+        settings = f'[remote "origin"]\n\turl = "{quoted}"\n'
+        # In the shipped Action the token arrives as GH_TOKEN, which git does not
+        # read, while `actions/checkout` leaves its own credential in the config of
+        # the repository being scanned -- the one config this probe refuses to read.
+        # Without this the Action's whole reason for the check goes unauthenticated
+        # on a private repository, which is exactly where it was needed. It is
+        # written to the file rather than passed as an argument: `ps` sees argv.
+        if (header := _github_authorization(url)) is not None:
+            settings += f'[http "{url}"]\n\textraHeader = "{header}"\n'
+        config.write_text(config.read_text() + settings)
         # The advertisement lands in a file, not in this process: the timeout bounds
         # how long a hostile endpoint may talk, and nothing bounded how much, so a
         # remote that streams could exhaust the scanner before the clock ran out.
