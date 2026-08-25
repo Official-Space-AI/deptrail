@@ -347,9 +347,19 @@ GIT_LOCATION_VARS = frozenset({
 # command this code would then run against an address the scanned repository
 # chose; `GIT_CONFIG_COUNT` and its numbered keys are config with no file at all,
 # and an inherited `http.extraHeader` was measured going out through them.
+#
+# `GIT_CONFIG_PARAMETERS` is the same thing under a second name, and the more
+# likely one to be inherited: git writes it for every child process whenever the
+# parent was run as `git -c key=value`, so a scan launched from an alias, a hook
+# or `git rebase --exec` carries it. Measured, it survived every isolation above
+# — `http.extraHeader`, `http.sslVerify` and `credential.helper` all arrived in
+# the probe through it. It is command scope, so it also outranks the config file
+# this probe writes: a helper set this way is a helper the probe has, in a
+# directory that was meant to have none.
 PROBE_STRIPPED_VARS = frozenset({
-    "GIT_CONFIG", "GIT_CONFIG_COUNT", "GIT_ASKPASS", "SSH_ASKPASS",
-    "GIT_SSH", "GIT_SSH_COMMAND", "GIT_PROXY_COMMAND", "SSH_AUTH_SOCK",
+    "GIT_CONFIG", "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS", "GIT_ASKPASS",
+    "SSH_ASKPASS", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_PROXY_COMMAND",
+    "SSH_AUTH_SOCK",
 })
 
 

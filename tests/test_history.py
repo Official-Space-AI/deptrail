@@ -1671,6 +1671,45 @@ class TestPrecedenceAndDiagnostics:
         finally:
             server.shutdown()
 
+    def test_config_git_itself_exports_is_not_carried_either(self, tmp_path,
+                                                             monkeypatch):
+        """`GIT_CONFIG_PARAMETERS` is the same channel as `GIT_CONFIG_COUNT` under a
+        second name, and the one more likely to be inherited: git writes it for every
+        child whenever the parent ran as `git -c key=value`, so a scan launched from
+        an alias, a hook or `git rebase --exec` carries it. Measured, it survived the
+        blanked `HOME` and the devnull config files, and it is command scope, so it
+        outranks the file the probe writes for itself.
+        """
+        import http.server
+        import threading
+        from deptrail.history import _remote_heads
+
+        seen: list[str | None] = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                seen.append(self.headers.get("Authorization"))
+                self.send_response(404)
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        monkeypatch.setenv("GIT_CONFIG_PARAMETERS",
+                           "'http.extraHeader=Authorization: Bearer INJECTED'")
+        monkeypatch.setenv("GIT_ALLOW_PROTOCOL", "http")
+        repo = self.fresh(tmp_path, "exported")
+        git(repo, "remote", "add", "origin",
+            f"http://127.0.0.1:{server.server_address[1]}/x.git")
+        try:
+            assert _remote_heads(repo, "origin") is None
+            assert seen, "the probe never reached the server"
+            assert seen[0] is None, seen
+        finally:
+            server.shutdown()
+
     def test_a_tags_refspec_does_not_make_a_narrow_clone_look_wide(self, tmp_path):
         """The refspec is one per line, and each line is judged on its own: testing
         the whole blob for a `*` meant that adding the documented tags refspec to a
