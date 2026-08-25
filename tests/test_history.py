@@ -1786,6 +1786,27 @@ class TestPrecedenceAndDiagnostics:
         # print the same sentence twice on every report.
         assert note is None, note
 
+    def test_another_remote_cannot_answer_for_the_address_the_operator_named(
+            self, tmp_path):
+        """The first fix let any answer stand in, and that is a hole the scanned
+        repository can open by itself: it chooses which remotes it has, so a public
+        fork, a stale mirror or a plain decoy — any address whose heads the clone
+        already holds — turned the named repository's silence back into a note and
+        cleared the clone.
+        """
+        from deptrail.history import _ref_coverage
+        decoy = self.origin_with_two_branches(tmp_path, "decoy-remote")
+        repo = tmp_path / "decoyed"
+        git(tmp_path, "clone", "-q", str(decoy), str(repo))
+        git(repo, "fetch", "-q", "origin", "release/1.x")
+        # The decoy answers and holds nothing this clone is missing.
+        assert _ref_coverage(repo, None)[0] is None
+        # The address the operator named cannot be asked, and that is still a
+        # reason: the decoy is not it.
+        reason, _ = _ref_coverage(repo, None, str(tmp_path / "named-but-gone.git"),
+                                  True)
+        assert reason is not None and "could not be asked" in reason, reason
+
     def test_silence_beside_an_answer_says_what_the_answer_covered(self, tmp_path):
         """"Coverage was not verified" is false on the shipped Action's ordinary
         shape: the named address answers in full while the checkout's own `origin`,
