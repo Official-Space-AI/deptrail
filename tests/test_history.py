@@ -4,6 +4,7 @@ Each test builds a real git repo with faked commit dates. The regression
 classes at the bottom encode the failure scenarios found by adversarial
 review of PR #8 — every one of them produced a wrong verdict before the fix.
 """
+import base64
 import json
 import os
 import stat
@@ -1734,24 +1735,50 @@ class TestPrecedenceAndDiagnostics:
         monkeypatch.delenv("GH_TOKEN")
         monkeypatch.setenv("GITHUB_TOKEN", "ghs_SECONDNAME")
         assert history._github_authorization("https://github.com/o/r.git")
-        # Neither variable carries a host of its own. On a GitHub Enterprise runner
-        # both are that instance's credential, and the address here is always
-        # github.com — the same harm as the unpinned `gh auth token` below, through
-        # the other door.
-        for name, value in (("GH_HOST", "ghe.example.com"),
-                            ("GITHUB_SERVER_URL", "https://ghe.example.com")):
-            monkeypatch.setenv(name, value)
+        # `GH_HOST` picks `gh`'s default *target*; it does not re-home a token.
+        # `GH_TOKEN`/`GITHUB_TOKEN` are github.com credentials by `gh`'s own rule,
+        # and a GitHub Enterprise host is served by `GH_ENTERPRISE_TOKEN`, which
+        # this code never reads. Testing `GH_HOST` here refused a github.com PAT for
+        # github.com: an operator who exported it for their enterprise had a
+        # complete scan of a private github.com repository turned from 0 into 2.
+        for value in ("ghe.example.com", "github.com", "user@github.com", ""):
+            monkeypatch.setenv("GH_HOST", value)
+            assert history._github_authorization(
+                "https://github.com/o/r.git"), f"GH_HOST={value!r}"
+        monkeypatch.delenv("GH_HOST")
+        # `GITHUB_SERVER_URL` is the one that says where a token lives: Actions sets
+        # it to the instance that minted the run's token, so on a GHES runner
+        # `GH_TOKEN: ${{ github.token }}` — which this project's own action.yml
+        # writes — is that instance's. `gh` never consults it, so the `--hostname`
+        # pin below cannot catch this one.
+        withheld = ("https://ghe.example.com", "https://ghe.example.com/",
+                    # No scheme is how an operator would type it, and reading the
+                    # host as `partition("://")[2]` made it the empty string, took
+                    # that for "nobody named a host", and sent the enterprise token.
+                    "ghe.example.com", "ghe.example.com/x",
+                    "https:/ghe.example.com", "://", "not a url")
+        for value in withheld:
+            monkeypatch.setenv("GITHUB_SERVER_URL", value)
             called.clear()
-            assert history._github_authorization("https://github.com/o/r.git") is None
+            assert history._github_authorization(
+                "https://github.com/o/r.git") is None, f"GITHUB_SERVER_URL={value!r}"
             # Refusing the variable is not enough while the fallback can read it
-            # back: measured, `GH_TOKEN=X GH_HOST=ghe gh auth token --hostname
-            # github.com` prints X, so `gh` handed back the exact credential
-            # refused above — the Action's own token, and on a GHES runner that
-            # instance's.
-            assert called, "the fallback was never reached"
+            # back: measured, `GH_TOKEN=X gh auth token --hostname github.com`
+            # prints X, so `gh` handed back the exact credential refused above.
+            assert called, f"the fallback was never reached for {value!r}"
             _argv, env = called[0]
             assert "GH_TOKEN" not in env and "GITHUB_TOKEN" not in env, sorted(env)
-            monkeypatch.delenv(name)
+        # And the shipped Action's own environment still gets a token. Every earlier
+        # test deleted these rather than setting them to a github.com value, so a
+        # parse that forgot the scheme — withholding on every plain Actions run, and
+        # so blocking every private repository at exit 2 — left the suite green.
+        for value in ("https://github.com", "https://github.com/", "https://GITHUB.COM/",
+                      "https://github.com/o/r", "https://github.com:443", "github.com",
+                      "https://user@github.com", ""):
+            monkeypatch.setenv("GITHUB_SERVER_URL", value)
+            assert history._github_authorization(
+                "https://github.com/o/r.git"), f"GITHUB_SERVER_URL={value!r}"
+        monkeypatch.delenv("GITHUB_SERVER_URL")
         monkeypatch.delenv("GITHUB_TOKEN")
         called.clear()
         assert history._github_authorization("https://github.com/o/r.git") is None
@@ -1774,6 +1801,15 @@ class TestPrecedenceAndDiagnostics:
         # under test is the config this code writes, which is written first and
         # read by the spy below — overriding the guarantee to `https` sent this
         # bogus credential to the real github.com on every run.
+        # The environment this runs in decides which token is built, and the
+        # assertion below only asks whether *a* header exists. On a machine with
+        # `GITHUB_SERVER_URL` naming an enterprise it failed; on one with `gh`
+        # logged in it passed carrying a credential this test never set, which is
+        # worse. Both variables are pinned, and the header is compared to the exact
+        # value this test provided.
+        monkeypatch.delenv("GH_HOST", raising=False)
+        monkeypatch.setenv("GITHUB_SERVER_URL", "https://github.com")
+        expected = base64.b64encode(b"x-access-token:ghs_LEAKME").decode()
         repo = self.fresh(tmp_path, "tokenscope")
         git(repo, "remote", "add", "origin", "https://github.com/o/r.git")
         seen: list[str] = []
@@ -1792,7 +1828,158 @@ class TestPrecedenceAndDiagnostics:
                               trusted_url="https://github.com/o/r.git")
         assert len(seen) == 2, seen
         assert "extraHeader" not in seen[0], seen[0]
-        assert "extraHeader" in seen[1], seen[1]
+        assert expected in seen[1], seen[1]
+
+    @pytest.mark.parametrize("failure", [
+        FileNotFoundError(2, "No such file or directory: 'gh'"),
+        subprocess.TimeoutExpired(["gh"], 10),
+    ])
+    def test_a_missing_credential_helper_is_a_missing_credential(
+            self, tmp_path, monkeypatch, failure):
+        """`gh` not being installed raised out of `_github_authorization`, out of
+        `_remote_heads` *before* `ls-remote` was ever built, and `_ref_coverage`
+        read that as the named address falling silent — so `pip install deptrail` on
+        a box without `gh` reported a public, complete clone as incomplete and told
+        the operator to go and set a token. A `gh` that hangs arrives by
+        `TimeoutExpired`, which the query's own timeout makes reachable.
+        """
+        from deptrail import history
+        monkeypatch.delenv("GH_TOKEN", raising=False)
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        origin = self.origin_with_two_branches(tmp_path, "nogh")
+        repo = tmp_path / "nogh-clone"
+        git(tmp_path, "clone", "-q", str(origin), str(repo))
+        real = history.subprocess.run
+
+        def refuse(args, *rest, **kwargs):
+            if isinstance(args, list) and args and args[0] == "gh":
+                raise failure
+            return real(args, *rest, **kwargs)
+
+        monkeypatch.setattr(history.subprocess, "run", refuse)
+        # A trusted URL that reaches the `gh` lookup at all has to be an https
+        # github.com one — that is the only shape the header is built for, and the
+        # only shape the CLI produces.
+        header = history._github_authorization("https://github.com/o/r.git")
+        assert header is None, header
+        # And the query still happens: the clone is complete, so there is no gap.
+        reason, _ = history._ref_coverage(repo, None, str(origin), True)
+        assert reason is None, reason
+
+    def test_the_probe_does_not_follow_a_redirect_to_another_host(
+            self, tmp_path, monkeypatch):
+        """Git's default `followRedirects = initial` rebases the remote URL on the
+        redirect target, and protocol v2's second request then goes to the new host
+        as a fresh request — measured, carrying the header written for the address
+        the operator named. The branch list came back from the host that answered
+        the redirect rather than the one that was asked.
+        """
+        from deptrail import history
+        repo = self.fresh(tmp_path, "redirected")
+        git(repo, "remote", "add", "origin", "https://example.invalid/x.git")
+        seen: list[str] = []
+        real = history.subprocess.Popen
+
+        class Spy(real):
+            def __init__(self, args, **kwargs):
+                if isinstance(args, list) and "ls-remote" in args:
+                    probe = args[args.index("-C") + 1]
+                    seen.append((Path(probe) / ".git" / "config").read_text())
+                super().__init__(args, **kwargs)
+
+        monkeypatch.setattr(history.subprocess, "Popen", Spy)
+        history._remote_heads(repo, "origin")
+        assert seen, "the probe never ran"
+        assert "followRedirects = false" in seen[0], seen[0]
+
+    def test_verification_cannot_be_turned_off_from_the_environment(
+            self, tmp_path, monkeypatch):
+        """The probe carries a credential now — one the operator never put in the
+        environment, since `gh auth token` supplies it — while the setting that
+        decides who may receive it was still whatever the environment said.
+        `GIT_SSL_NO_VERIFY` cannot be answered from the config this probe writes:
+        measured against a self-signed endpoint, an explicit `http.sslVerify = true`
+        in the probe's own file loses to it.
+        """
+        from deptrail import history
+        monkeypatch.setenv("GIT_SSL_NO_VERIFY", "1")
+        # Kept, deliberately: an operator behind a TLS-intercepting proxy has no
+        # other way to make the query work, and naming a CA still verifies.
+        monkeypatch.setenv("GIT_SSL_CAINFO", "/corp/ca.pem")
+        repo = self.fresh(tmp_path, "verify")
+        git(repo, "remote", "add", "origin", "https://example.invalid/x.git")
+        seen: list[dict] = []
+        real = history.subprocess.Popen
+
+        class Spy(real):
+            def __init__(self, args, **kwargs):
+                if isinstance(args, list) and "ls-remote" in args:
+                    seen.append(kwargs.get("env") or {})
+                super().__init__(args, **kwargs)
+
+        monkeypatch.setattr(history.subprocess, "Popen", Spy)
+        history._remote_heads(repo, "origin")
+        assert seen, "the probe never ran"
+        assert "GIT_SSL_NO_VERIFY" not in seen[0], sorted(seen[0])
+        assert seen[0].get("GIT_SSL_CAINFO") == "/corp/ca.pem", sorted(seen[0])
+
+    def test_the_cache_remembers_which_address_was_asked(self, tmp_path):
+        """The answer stopped being a property of the checkout alone when the
+        address the operator named became one of the sources. Keyed on the path, one
+        cache reused across both handed back the first call's non-blocking caveat in
+        place of the second call's blocking reason.
+        """
+        from deptrail.history import _ref_coverage
+        repo = self.fresh(tmp_path, "cached")
+        gone = tmp_path / "not-there.git"
+        git(repo, "remote", "add", "origin", str(gone))
+        cache: dict = {}
+        first, _ = _ref_coverage(repo, cache, None, True)
+        assert first is None, first
+        second, _ = _ref_coverage(repo, cache, str(gone), True)
+        assert second is not None and "could not be asked" in second, second
+
+    def test_a_source_that_advertises_nothing_has_not_answered(self, tmp_path):
+        """`_remote_heads` returns an empty dict, not None, for a remote serving no
+        refs, so it counted as an answer and the note named it as what a clean
+        result rested on. It had said nothing.
+        """
+        from deptrail.history import _ref_coverage
+        empty = tmp_path / "empty-origin.git"
+        git(tmp_path, "init", "-q", "--bare", str(empty))
+        repo = self.fresh(tmp_path, "restson")
+        git(repo, "remote", "add", "hollow", str(empty))
+        git(repo, "remote", "add", "unreachable", str(tmp_path / "not-there.git"))
+        reason, note = _ref_coverage(repo, None)
+        assert reason is None, reason
+        assert note is not None and "unreachable" in note, note
+        assert "rests on" not in note, note
+
+    def test_a_remote_cannot_take_the_name_the_report_uses_for_the_operator(
+            self, tmp_path):
+        """A remote's name is a config section or a filename, so a clone can call one
+        of its own remotes exactly what this code calls the operator's address. The
+        report then said "not verified against the repository you named, and rests on
+        the repository you named" and attributed that remote's gaps to the address
+        the operator gave.
+        """
+        from deptrail.history import NAMED_ADDRESS, _ref_coverage
+        origin = self.origin_with_two_branches(tmp_path, "impostor")
+        repo = tmp_path / "impostor-clone"
+        git(tmp_path, "clone", "-q", str(origin), str(repo))
+        # `git remote add` refuses the name; the legacy shorthand does not, and git
+        # fetches through it either way.
+        legacy = repo / ".git" / "remotes"
+        legacy.mkdir(parents=True, exist_ok=True)
+        (legacy / NAMED_ADDRESS).write_text(
+            f"URL: {tmp_path / 'not-there.git'}\n")
+        reason, note = _ref_coverage(repo, None, str(origin), True)
+        assert reason is None, reason
+        assert note is not None, note
+        # The impostor is named as a remote, and what coverage rests on is the
+        # address the operator actually gave.
+        assert f'remote "{NAMED_ADDRESS}"' in note, note
+        assert note.partition("rests on")[2].strip().startswith(NAMED_ADDRESS), note
 
     def test_a_named_address_nobody_could_ask_is_a_reason_and_not_a_note(
             self, tmp_path):

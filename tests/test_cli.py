@@ -550,6 +550,26 @@ class TestOneSlugCannotSpeakForSeveralRepositories:
         assert all(url == "https://github.com/acme/api-server.git"
                    for url in urls), urls
 
+    def test_the_same_clone_passed_twice_is_still_one_repository(self, tmp_path):
+        """The guard counted arguments. `--repo P --repo P` — which a wrapper
+        assembling its arguments from two sources produces — read one clone as
+        several, withheld the named address, and took the whole blocking path with
+        it: measured, a clone with a poisoned pin on an unfetched branch went from
+        exit 2 to exit 0 on the duplicate alone.
+        """
+        from deptrail.demo import advisory_path, build
+
+        build(tmp_path / "demo")
+        advisory = advisory_path(tmp_path / "demo")
+        path = str(tmp_path / "demo" / "api-server")
+        urls = self._trusted_urls(
+            ["scan", "--ioc", str(advisory), "--no-ci",
+             "--repo", path, "--repo", path + "/",
+             "--slug", "acme/api-server"])
+        assert urls, "no repository was scanned"
+        assert all(url == "https://github.com/acme/api-server.git"
+                   for url in urls), urls
+
     def test_an_org_names_every_repository_it_cloned(self, tmp_path, monkeypatch,
                                                      capsys):
         """`--org` is the other arm of the same condition, and it was the untested
