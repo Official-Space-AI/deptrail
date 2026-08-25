@@ -1052,9 +1052,20 @@ class TestPrecedenceAndDiagnostics:
         git(work, "checkout", "-qb", "release/1.x")
         self.write(work, "package-lock.json", lock_json("5.6.1"),
                    "2025-11-25T10:00:00+00:00")
+        # A second commit so the branch can be rewound to a tip that is genuinely
+        # nobody's ref — rewinding to the first would land on main's own tip.
+        self.write(work, "NOTES.md", "release notes\n", "2025-11-25T11:00:00+00:00")
         git(work, "push", "-q", "origin", "release/1.x")
         git(origin, "symbolic-ref", "HEAD", "refs/heads/main")
         return origin
+
+    def rewind(self, tmp_path, origin, branch):
+        """Point a remote branch at its parent, so its tip is a commit a clone holds
+        but no ref of its own names."""
+        parent = subprocess.run(
+            ["git", "-C", str(origin), "rev-parse", f"refs/heads/{branch}~1"],
+            check=True, capture_output=True, text=True).stdout.strip()
+        git(origin, "update-ref", f"refs/heads/{branch}", parent)
 
     def test_a_one_branch_fetch_is_named_by_asking_the_remote(self, tmp_path):
         """#27: `git init` + `fetch origin main` kept the wildcard refspec, was not
@@ -1095,10 +1106,11 @@ class TestPrecedenceAndDiagnostics:
         a branch fetched into a ref of a different name is still walked, so naming it
         missing would be a reason with no cost behind it.
 
-        The remote-tracking ref the wildcard refspec writes anyway is deleted, or the
-        branch would be held under its ordinary name too and this would asserts
-        nothing — the first version of this test passed with the whole
-        name-independent path removed.
+        What it pins is the tip set, not the reachability query behind it: the
+        branch is held at the identical commit, so the fast path answers it. The
+        remote-tracking ref the wildcard refspec writes anyway is deleted, or the
+        branch would be held under its ordinary name and the naming would not be
+        tested at all.
         """
         from deptrail.history import incomplete_history
         origin = self.origin_with_two_branches(tmp_path, "renamed")
@@ -1171,6 +1183,58 @@ class TestPrecedenceAndDiagnostics:
         heads = _remote_heads(repo)
         assert heads is not None and "release/1.x" in heads, heads
 
+    def test_an_unborn_head_does_not_lose_the_branches_the_clone_has(self, tmp_path):
+        """A checkout that fetched and never checked out has no HEAD to resolve.
+        Feeding `^HEAD` to rev-list anyway made the whole query fatal, and a fatal
+        query reads as "nothing is reachable" — so a clone holding every branch was
+        told it was missing them.
+        """
+        from deptrail.history import incomplete_history
+        origin = self.origin_with_two_branches(tmp_path, "unborn")
+        repo = self.fresh(tmp_path, "unborn-clone")
+        git(repo, "remote", "add", "origin", str(origin))
+        git(repo, "fetch", "-q", "origin", "+refs/heads/*:refs/remotes/origin/*")
+        # The remote is rewound to a commit this clone holds but no ref points at,
+        # so the tip has to be asked about rather than matched — which is the path
+        # `^HEAD` was fatal on.
+        self.rewind(tmp_path, origin, "release/1.x")
+        assert incomplete_history(repo)[0] == []
+
+    def test_one_broken_ref_does_not_condemn_every_other_branch(self, tmp_path):
+        """A pruned or half-fetched clone can hold a ref whose object is gone. Naming
+        such a ref as an exclusion made rev-list fatal, and the same "fatal means
+        nothing is reachable" rule then reported every diverged branch as missing.
+        """
+        from deptrail.history import incomplete_history
+        origin = self.origin_with_two_branches(tmp_path, "brokenref")
+        repo = tmp_path / "brokenref-clone"
+        git(tmp_path, "clone", "-q", str(origin), str(repo))
+        broken = repo / ".git/refs/remotes/origin/pruned"
+        broken.parent.mkdir(parents=True, exist_ok=True)
+        broken.write_text("0" * 39 + "1\n")
+        # Same reason as above: a tip that must be asked about, not matched.
+        self.rewind(tmp_path, origin, "release/1.x")
+        assert incomplete_history(repo)[0] == []
+
+    def test_a_permissive_environment_cannot_widen_the_transports(self, tmp_path,
+                                                                  monkeypatch):
+        """The allowlist is intersected with the environment, not defaulted to it: an
+        operator may narrow the transports, but a permissive value must not put
+        `ext::` — whose command comes from the repository under investigation — back
+        within reach.
+        """
+        from deptrail.history import _remote_heads
+        monkeypatch.setenv("GIT_ALLOW_PROTOCOL", "https:ssh:ext")
+        marker = tmp_path / "widened"
+        payload = tmp_path / "payload.sh"
+        payload.write_text(f"#!/bin/sh\ntouch {marker}\nexit 1\n")
+        payload.chmod(0o755)
+        repo = self.fresh(tmp_path, "widened-clone")
+        git(repo, "remote", "add", "origin", f"ext::{payload}")
+        git(repo, "config", "protocol.ext.allow", "always")
+        assert _remote_heads(repo) is None
+        assert not marker.exists()
+
     def test_an_exotic_transport_is_refused_even_if_the_repo_re_enables_it(
             self, tmp_path, monkeypatch):
         """`ext::` runs the command named in the URL, and the repository under
@@ -1186,8 +1250,15 @@ class TestPrecedenceAndDiagnostics:
         # allowlist the code sets for itself.
         monkeypatch.delenv("GIT_ALLOW_PROTOCOL", raising=False)
         marker = tmp_path / "executed-ext"
+        # A script, not a quoted shell line: git splits an `ext::` command on
+        # whitespace, and the first version of this test planted a payload that
+        # `sh` refused to parse — so it passed with the allowlist removed and
+        # guarded nothing.
+        payload = tmp_path / "payload.sh"
+        payload.write_text(f"#!/bin/sh\ntouch {marker}\nexit 1\n")
+        payload.chmod(0o755)
         repo = self.fresh(tmp_path, "hostile-ext")
-        git(repo, "remote", "add", "origin", f'ext::sh -c "touch {marker}"')
+        git(repo, "remote", "add", "origin", f"ext::{payload}")
         git(repo, "config", "protocol.ext.allow", "always")
         assert _remote_heads(repo) is None
         assert not marker.exists()
