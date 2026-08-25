@@ -333,7 +333,29 @@ def _remote_url(repo: Path) -> str | None:
     if not url or url.startswith("-") or any(c < " " or c == "\x7f" for c in url):
         return None
     local = repo / url
-    return str(local.resolve()) if local.exists() else url
+    if local.exists():
+        return str(local.resolve())
+    return _without_userinfo(url)
+
+
+def _without_userinfo(url: str) -> str:
+    """The same URL with any embedded credentials dropped.
+
+    Writing the URL to a config file instead of a command line does not keep a
+    token out of process listings, because git hands the full URL to its own
+    transport helper: ``git remote-https origin https://user:token@host/path``
+    shows in ``ps`` and in ``GIT_TRACE`` whatever this code does. So the credential
+    is not carried at all. Where the operator's own credential helper knows the
+    host — the ordinary case on a machine that cloned the repository — the query
+    still authenticates; where it does not, coverage comes back unverified, which
+    is the honest outcome and not a token this tool handed to a child process.
+    """
+    scheme, separator, rest = url.partition("://")
+    if not separator or "@" not in rest.split("/", 1)[0]:
+        return url
+    authority, _, tail = rest.partition("/")
+    host = authority.rpartition("@")[2]
+    return f"{scheme}://{host}" + (f"/{tail}" if tail else "")
 
 
 def _remote_heads(repo: Path) -> dict[str, str] | None:
@@ -381,7 +403,12 @@ def _remote_heads(repo: Path) -> dict[str, str] | None:
         # command line: a clone whose origin embeds a token — CI writes them that
         # way — would otherwise show it to every `ps` on the machine for as long as
         # the query runs. It is written last, so nothing follows it to be swallowed.
-        config.write_text(f'{config.read_text()}[remote "origin"]\n\turl = {url}\n')
+        # Quoted the way git config reads it back: a Windows path's backslashes are
+        # escapes, and `#` or `;` start a comment, so an interpolated value either
+        # truncated the URL or made the file unparseable.
+        quoted = url.replace("\\", "\\\\").replace('"', '\\"')
+        config.write_text(
+            f'{config.read_text()}[remote "origin"]\n\turl = "{quoted}"\n')
         result = subprocess.run(
             ["git", "-C", probe, "ls-remote", "--heads", "origin"],
             capture_output=True, text=True, encoding="utf-8",

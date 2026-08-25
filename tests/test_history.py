@@ -1321,15 +1321,20 @@ class TestPrecedenceAndDiagnostics:
         assert _remote_heads(repo) is None
         assert not marker.exists()
 
-    def test_the_url_never_becomes_a_command_line_argument(self, tmp_path,
-                                                           monkeypatch):
-        """A clone written by CI can carry a token in its origin URL, and an argument
-        is visible to every `ps` on the machine while the query runs.
+    def test_a_credential_in_the_url_is_never_carried_into_the_query(self, tmp_path,
+                                                                     monkeypatch):
+        """A clone written by CI can carry a token in its origin URL, and keeping it
+        out of *this* code's arguments does not keep it out of `ps`: git hands the
+        whole URL to its own transport helper (`git remote-https origin <url>`,
+        seen in GIT_TRACE). So the credential is dropped instead — where the
+        operator's credential helper knows the host the query still authenticates,
+        and where it does not, coverage comes back unverified.
         """
         from deptrail import history
         secret = "https://x-access-token:s3cr3t-token@example.invalid/x.git"
         repo = self.fresh(tmp_path, "tokened")
         git(repo, "remote", "add", "origin", secret)
+        assert history._remote_url(repo) == "https://example.invalid/x.git"
         seen: list[list[str]] = []
         real = history.subprocess.run
 
@@ -1342,6 +1347,23 @@ class TestPrecedenceAndDiagnostics:
         history._remote_heads(repo)
         assert seen, "no command ran"
         assert not any("s3cr3t-token" in part for args in seen for part in args), seen
+
+    def test_a_url_git_config_would_mangle_is_still_read(self, tmp_path):
+        """The URL is written into a config file, where a backslash is an escape and
+        `#` or `;` start a comment — a Windows path or a path with either character
+        was truncated or made the file unparseable, and the coverage answer was lost
+        with it.
+        """
+        from deptrail.history import _remote_heads
+        origin = self.origin_with_two_branches(tmp_path, "awkward")
+        awkward = tmp_path / "we#ird;dir"
+        awkward.mkdir()
+        moved = awkward / origin.name
+        origin.rename(moved)
+        repo = self.fresh(tmp_path, "awkward-clone")
+        git(repo, "remote", "add", "origin", str(moved))
+        heads = _remote_heads(repo)
+        assert heads is not None and "release/1.x" in heads, heads
 
     def test_a_permissive_environment_cannot_widen_the_transports(self, tmp_path,
                                                                   monkeypatch):
