@@ -1334,7 +1334,7 @@ class TestPrecedenceAndDiagnostics:
         secret = "https://x-access-token:s3cr3t-token@example.invalid/x.git"
         repo = self.fresh(tmp_path, "tokened")
         git(repo, "remote", "add", "origin", secret)
-        assert history._remote_url(repo) == "https://example.invalid/x.git"
+        assert history._remote_url(repo, "origin") == "https://example.invalid/x.git"
         seen: list[list[str]] = []
         real = history.subprocess.run
 
@@ -1462,7 +1462,7 @@ class TestPrecedenceAndDiagnostics:
         asked = []
         real = history._remote_heads
         monkeypatch.setattr(history, "_remote_heads",
-                            lambda r: (asked.append(r), real(r))[1])
+                            lambda r, name="origin": (asked.append(r), real(r, name))[1])
         cache: dict = {}
         for _ in range(3):
             history.incomplete_history(repo, cache)
@@ -1471,6 +1471,64 @@ class TestPrecedenceAndDiagnostics:
         # `scan_repo` needs.
         history.incomplete_history(repo)
         assert len(asked) == 2, asked
+
+    def test_a_remote_not_called_origin_is_still_the_remote(self, tmp_path):
+        """Every check that read config spelled the name `origin`, so a clone made
+        with `-o upstream` — or on a machine with `clone.defaultRemoteName` set,
+        which is one global config line — answered none of them. Measured: the same
+        single-branch checkout went from exit 2 to exit 0 on that alone.
+        """
+        from deptrail.history import incomplete_history
+        origin = self.origin_with_two_branches(tmp_path, "renamed-remote")
+        repo = self.fresh(tmp_path, "renamed-remote-clone")
+        git(repo, "remote", "add", "upstream", str(origin))
+        git(repo, "fetch", "-q", "upstream",
+            "+refs/heads/main:refs/remotes/upstream/main")
+        git(repo, "checkout", "-qb", "main", "upstream/main")
+        git(repo, "config", "remote.upstream.fetch",
+            "+refs/heads/main:refs/remotes/upstream/main")
+        reasons, _ = incomplete_history(repo)
+        assert any("single-branch clone" in r for r in reasons), reasons
+        assert any("release/1.x" in r for r in reasons), reasons
+
+    def test_a_rewritten_remote_is_asked_where_the_clone_actually_fetched(
+            self, tmp_path):
+        """`url.<base>.insteadOf` sends git somewhere other than the URL written in
+        the config. Probing the literal value asked a repository this clone never
+        fetched from, and its answer cleared branches nobody had.
+        """
+        from deptrail.history import _remote_heads
+        origin = self.origin_with_two_branches(tmp_path, "rewritten")
+        decoy = tmp_path / "decoy.git"
+        git(tmp_path, "init", "-q", "--bare", str(decoy))
+        repo = self.fresh(tmp_path, "rewritten-clone")
+        git(repo, "config", f"url.{origin}.insteadOf", str(decoy))
+        git(repo, "remote", "add", "origin", str(decoy))
+        heads = _remote_heads(repo, "origin")
+        assert heads is not None and "release/1.x" in heads, heads
+
+    def test_a_ref_advertised_with_a_null_id_is_not_a_branch(self, tmp_path,
+                                                             monkeypatch):
+        """A ref whose name git will not accept is advertised with an all-zero id.
+        Kept, the peeled rule overwrote a real branch's tip with it, and a branch
+        this clone holds was reported as one it cannot walk.
+        """
+        from deptrail import history
+        origin = self.origin_with_two_branches(tmp_path, "nullid")
+        repo = tmp_path / "nullid-clone"
+        git(tmp_path, "clone", "-q", str(origin), str(repo))
+        real = history.subprocess.run
+
+        def with_a_null_line(args, **kwargs):
+            done = real(args, **kwargs)
+            if isinstance(args, list) and "ls-remote" in args and done.returncode == 0:
+                done.stdout += ("0" * 40 + "\trefs/heads/release/1.x^{}\n"
+                                + "0" * 40 + "\trefs/heads/broken\tname\n")
+            return done
+
+        monkeypatch.setattr(history.subprocess, "run", with_a_null_line)
+        heads = history._remote_heads(repo, "origin")
+        assert history._heads_not_here(repo, heads) == [], heads
 
     def test_an_unreachable_remote_is_an_observation_and_not_a_reason(self, tmp_path):
         """A remote that cannot be reached leaves coverage unverified, which is worth

@@ -319,14 +319,47 @@ GIT_LOCATION_VARS = frozenset({
 })
 
 
-def _remote_url(repo: Path) -> str | None:
+def _clone_remote(repo: Path) -> str | None:
+    """The remote this clone came from, whatever it is called.
+
+    Every completeness check that reads config used to spell the name ``origin``,
+    and a clone made with ``-o upstream`` — or on a machine with
+    ``clone.defaultRemoteName`` set, which is one global config line — answered
+    none of them: not the single-branch refspec, not the partial-clone filter, not
+    ref coverage. A single-branch checkout of a repository whose other branch held
+    the pin went from exit 2 to exit 0 on that alone.
+
+    The current branch's own remote is the most direct answer; ``origin`` settles
+    the ordinary case; and a lone remote can only be the one. Several remotes with
+    no upstream branch and no ``origin`` is genuinely ambiguous — a fork checkout is
+    the usual shape — and the caller says so rather than picking.
+    """
+    branch = _local_git(repo, ["rev-parse", "--abbrev-ref", "HEAD"], "").stdout.strip()
+    if branch and branch != "HEAD":
+        named = _config(repo, f"branch.{branch}.remote")
+        if named and named != ".":
+            return named.splitlines()[0]
+    remotes = _local_git(repo, ["remote"], "").stdout.split()
+    if "origin" in remotes:
+        return "origin"
+    return remotes[0] if len(remotes) == 1 else None
+
+
+def _remote_url(repo: Path, remote: str) -> str | None:
     """``origin``'s URL as a value, or ``None`` when there is nothing safe to use.
 
     A URL beginning with ``-`` would reach git as an option rather than a remote,
     and a relative local path is written against the clone, so it is resolved here
     while that is still meaningful.
     """
-    lines = _config(repo, "remote.origin.url").splitlines()
+    # `get-url` resolves `url.<base>.insteadOf`, which the raw config value does
+    # not: a clone whose config rewrites its remote fetches from one place while
+    # `remote.<name>.url` names another, and the probe asked the decoy. Reading
+    # config executes nothing — the settings that run commands run on transport,
+    # which is still done from the neutral directory below.
+    resolved = _local_git(repo, ["remote", "get-url", remote], "")
+    lines = (resolved.stdout if resolved.returncode == 0
+             else _config(repo, f"remote.{remote}.url")).splitlines()
     url = lines[0].strip() if lines else ""
     # A control character would let the value break out of the config line it is
     # written on, which is the one way a URL could become a setting.
@@ -358,7 +391,7 @@ def _without_userinfo(url: str) -> str:
     return f"{scheme}://{host}" + (f"/{tail}" if tail else "")
 
 
-def _remote_heads(repo: Path) -> dict[str, str] | None:
+def _remote_heads(repo: Path, remote: str = "origin") -> dict[str, str] | None:
     """The remote's branch names and tips, or ``None`` when it could not be asked.
 
     The repository under investigation may be the compromised one, so its
@@ -376,7 +409,7 @@ def _remote_heads(repo: Path) -> dict[str, str] | None:
     interactive password prompt. With it, the same remote fails in well under a
     second and the caller reports that coverage is unverified.
     """
-    url = _remote_url(repo)
+    url = _remote_url(repo, remote)
     if url is None:
         return None
     # An operator may narrow the transports; they may not widen them. `setdefault`
@@ -419,7 +452,10 @@ def _remote_heads(repo: Path) -> dict[str, str] | None:
     heads: dict[str, str] = {}
     for line in result.stdout.splitlines():
         tip, _, ref = line.partition("\t")
-        if not tip or not ref.startswith("refs/heads/"):
+        # A ref whose name git will not accept is advertised with an all-zero id,
+        # and the peeled rule below would then overwrite a real branch's tip with
+        # it — reporting a branch this clone holds as one it cannot walk.
+        if not tip or set(tip) == {"0"} or not ref.startswith("refs/heads/"):
             continue
         name = ref[len("refs/heads/"):]
         if name.endswith("^{}"):
@@ -558,19 +594,21 @@ def incomplete_history(repo: Path,
         reasons.append(
             "shallow clone: history is truncated, absence of exposure is not evidence"
         )
-    fetch = _config(repo, "remote.origin.fetch")
+    remote = _clone_remote(repo)
+    fetch = _config(repo, f"remote.{remote}.fetch") if remote else ""
     if fetch and "*" not in fetch:
         reasons.append(
             f"single-branch clone ({fetch}): other refs, if the remote has any, were "
             "not fetched, and exposure on a branch nobody fetched is still exposure"
         )
-    if _config(repo, "remote.origin.promisor") == "true":
-        filtered = _config(repo, "remote.origin.partialclonefilter") or "unknown filter"
+    if remote and _config(repo, f"remote.{remote}.promisor") == "true":
+        filtered = (_config(repo, f"remote.{remote}.partialclonefilter")
+                    or "unknown filter")
         notes.append(
             f"partial clone ({filtered}): lockfile contents were fetched on demand; "
             "any that could not be read are listed as unreadable snapshots"
         )
-    reason, note = _ref_coverage(repo, coverage_cache)
+    reason, note = _ref_coverage(repo, remote, coverage_cache)
     if reason:
         reasons.append(reason)
     if note:
@@ -578,7 +616,7 @@ def incomplete_history(repo: Path,
     return reasons, notes
 
 
-def _ref_coverage(repo: Path,
+def _ref_coverage(repo: Path, remote: str | None,
                   cache: dict[str, tuple[str | None, str | None]] | None = None,
                   ) -> tuple[str | None, str | None]:
     """What the remote's branch list says about this clone: (reason, observation).
@@ -591,18 +629,29 @@ def _ref_coverage(repo: Path,
     key = str(repo)
     if cache is not None and key in cache:
         return cache[key]
-    if not _config(repo, "remote.origin.url"):
-        outcome: tuple[str | None, str | None] = (None, None)
+    if remote is None:
+        # Several remotes, no upstream branch, no `origin`: which one this clone
+        # came from is not recorded anywhere, and picking would be a guess.
+        outcome: tuple[str | None, str | None] = (
+            (None, "ref coverage was not verified: this clone has several remotes "
+                   "and none of them is the one it came from, so there is nothing "
+                   "to compare its refs against")
+            if _local_git(repo, ["remote"], "").stdout.split() else (None, None))
+        if cache is not None:
+            cache[key] = outcome
+        return outcome
+    if not _config(repo, f"remote.{remote}.url"):
+        outcome = (None, None)
         if cache is not None:
             cache[key] = outcome
         return outcome
     try:
-        heads = _remote_heads(repo)
+        heads = _remote_heads(repo, remote)
     except (OSError, subprocess.SubprocessError):
         heads = None
     if heads is None:
         outcome = (None,
-                   "ref coverage was not verified: origin could not be reached, so "
+                   f"ref coverage was not verified: {remote} could not be reached, so "
                    "a checkout that fetched only some branches cannot be told from "
                    "a complete one")
     elif (missing := _heads_not_here(repo, heads)):
@@ -612,7 +661,7 @@ def _ref_coverage(repo: Path,
         shown = ", ".join(missing[:5])
         if len(missing) > 5:
             shown += f", and {len(missing) - 5} more"
-        outcome = (f"{len(missing)} branch(es) on origin are not in this clone "
+        outcome = (f"{len(missing)} branch(es) on {remote} are not in this clone "
                    f"({shown}): a branch this clone cannot walk cannot testify, "
                    "and exposure on it is still exposure", None)
     else:
