@@ -575,7 +575,11 @@ class OrgReport:
         its ``caveats`` key repeated what ``not_judged`` already held.
         """
         shown = {*self.unread, *self.incomplete, *self.unnamed_rotations}
-        return tuple(c for c in (*self.notes, *self.rotation_notes) if c not in shown)
+        # Two sources, one list: an observation that is both a note and a rotation
+        # cause printed twice in every renderer, which reads as two problems.
+        seen: set[str] = set()
+        return tuple(c for c in (*self.notes, *self.rotation_notes)
+                     if c not in shown and not (c in seen or seen.add(c)))
 
     @property
     def worst_grade(self) -> Grade:

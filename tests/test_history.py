@@ -1128,6 +1128,49 @@ class TestPrecedenceAndDiagnostics:
         assert _remote_heads(repo) is None      # unreachable, as it should be
         assert not marker.exists()
 
+    def test_a_planted_upload_pack_is_not_run_by_the_coverage_check(self, tmp_path,
+                                                                    monkeypatch):
+        """The second measured command in the same config, and the reason the query
+        stopped reading that config at all: `remote.origin.uploadpack` is executed
+        for a local remote, and overriding it on the command line did not stop it.
+        """
+        from deptrail.history import _remote_heads
+        monkeypatch.delenv("GIT_ALLOW_PROTOCOL", raising=False)
+        origin = self.origin_with_two_branches(tmp_path, "uploadpack")
+        marker = tmp_path / "upload-pack-ran"
+        repo = self.fresh(tmp_path, "uploadpack-clone")
+        git(repo, "remote", "add", "origin", str(origin))
+        git(repo, "config", "remote.origin.uploadpack", f"touch {marker} ; false")
+        assert _remote_heads(repo) is not None   # the URL still answers
+        assert not marker.exists()
+
+    def test_a_detached_head_covers_the_tip_it_holds(self, tmp_path):
+        """`_refs` walks HEAD, so a detached checkout can be the only thing holding
+        a branch tip — and leaving HEAD out of the coverage check reported a
+        complete clone as missing every branch it had.
+        """
+        from deptrail.history import incomplete_history
+        origin = self.origin_with_two_branches(tmp_path, "detached")
+        repo = tmp_path / "detached-clone"
+        git(tmp_path, "clone", "-q", str(origin), str(repo))
+        git(repo, "checkout", "-q", "--detach", "origin/release/1.x")
+        for ref in ("refs/remotes/origin/release/1.x", "refs/remotes/origin/main",
+                    "refs/remotes/origin/HEAD"):
+            git(repo, "update-ref", "-d", ref)
+        git(repo, "branch", "-D", "main")
+        assert [r for r in incomplete_history(repo)[0] if "release/1.x" in r] == []
+
+    def test_a_relative_remote_path_still_resolves(self, tmp_path):
+        """The query runs from a neutral directory, so a URL written relative to the
+        clone has to be resolved while it still means something.
+        """
+        from deptrail.history import _remote_heads
+        origin = self.origin_with_two_branches(tmp_path, "relative")
+        repo = self.fresh(tmp_path, "relative-clone")
+        git(repo, "remote", "add", "origin", f"../{origin.name}")
+        heads = _remote_heads(repo)
+        assert heads is not None and "release/1.x" in heads, heads
+
     def test_an_exotic_transport_is_refused_even_if_the_repo_re_enables_it(
             self, tmp_path, monkeypatch):
         """`ext::` runs the command named in the URL, and the repository under

@@ -965,6 +965,18 @@ class TestRefCoverageReachesTheReport:
         assert any("ref coverage was not verified" in c for c in report.caveats), \
             report.caveats
 
+    def test_the_same_observation_is_not_printed_twice(self, tmp_path, plan):
+        """It reaches the caveat list from two directions once a repository also
+        needs rotating — as a note and again as a rotation cause — and two identical
+        lines read as two problems.
+        """
+        repo = make_repo(tmp_path, "api", [("2025-11-25T10:00:00+00:00", "5.6.1")])
+        git(repo, "remote", "add", "origin", str(tmp_path / "gone-for-good.git"))
+        report = scan_organization([("api", repo)], plan, runs=runs_with(head(repo)),
+                                  secrets=lambda p, n: ("PROD_TOKEN",))
+        matching = [c for c in report.caveats if "ref coverage was not verified" in c]
+        assert len(matching) == 1, matching
+
 
 class TestEnvironmentSecrets:
     def test_environment_is_named_because_its_secrets_are_not_listed(self, tmp_path, plan):
