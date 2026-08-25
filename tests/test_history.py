@@ -1549,6 +1549,69 @@ class TestPrecedenceAndDiagnostics:
         reasons, _ = incomplete_history(repo)
         assert any("release/1.x" in r for r in reasons), reasons
 
+    def test_a_partial_wildcard_refspec_is_not_every_head(self, tmp_path):
+        """`refs/heads/release/*` fetches nothing outside `release/`, and reading any
+        `*` as completeness cleared every branch beside it. A negative refspec takes
+        branches back out of whatever the positive ones brought, so a clone carrying
+        one has not fetched every head either.
+        """
+        from deptrail.history import _fetches_every_head
+        assert _fetches_every_head("+refs/heads/*:refs/remotes/origin/*")
+        assert not _fetches_every_head(
+            "+refs/heads/release/*:refs/remotes/origin/release/*")
+        assert not _fetches_every_head(
+            "+refs/heads/*:refs/remotes/origin/*\n^refs/heads/secret")
+
+    def test_a_remote_named_the_older_old_way_is_still_a_remote(self, tmp_path):
+        """`$GIT_DIR/branches/<name>` is the second spelling that predates the config
+        sections. git still fetches through it and `git remote` does not list it, so
+        a clone using one looked like a clone with no remote at all.
+        """
+        from deptrail.history import _remotes
+        repo = self.fresh(tmp_path, "branches-shorthand")
+        shorthand = repo / ".git" / "branches"
+        shorthand.mkdir(parents=True)
+        (shorthand / "legacy").write_text(str(tmp_path / "somewhere.git") + "\n")
+        assert "legacy" in _remotes(repo)
+
+    def test_config_injected_by_the_environment_is_not_carried(self, tmp_path,
+                                                               monkeypatch):
+        """`GIT_CONFIG_COUNT` and its numbered keys are settings that arrive without
+        a file, so disabling the global and system files and pointing `HOME` at an
+        empty directory does not touch them — an inherited `http.extraHeader` still
+        reached whatever address the scanned repository named.
+        """
+        import http.server
+        import threading
+        from deptrail.history import _remote_heads
+
+        seen: list[str | None] = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                seen.append(self.headers.get("Authorization"))
+                self.send_response(404)
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+        monkeypatch.setenv("GIT_CONFIG_KEY_0", "http.extraHeader")
+        monkeypatch.setenv("GIT_CONFIG_VALUE_0", "Authorization: Bearer INJECTED")
+        monkeypatch.setenv("GIT_ALLOW_PROTOCOL", "http")
+        repo = self.fresh(tmp_path, "injected")
+        git(repo, "remote", "add", "origin",
+            f"http://127.0.0.1:{server.server_address[1]}/x.git")
+        try:
+            assert _remote_heads(repo, "origin") is None
+            assert seen, "the probe never reached the server"
+            assert seen[0] is None, seen
+        finally:
+            server.shutdown()
+
     def test_a_tags_refspec_does_not_make_a_narrow_clone_look_wide(self, tmp_path):
         """The refspec is one per line, and each line is judged on its own: testing
         the whole blob for a `*` meant that adding the documented tags refspec to a

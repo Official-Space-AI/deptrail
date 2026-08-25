@@ -59,6 +59,7 @@ import posixpath
 import re
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
@@ -340,6 +341,19 @@ GIT_LOCATION_VARS = frozenset({
 })
 
 
+def _without_injected_config(env: dict[str, str]) -> dict[str, str]:
+    """The same environment with git's config-by-environment removed.
+
+    ``GIT_CONFIG_COUNT`` and its numbered keys are settings that arrive without a
+    file, so disabling the global and system files and pointing ``HOME`` at an
+    empty directory does not touch them: an inherited ``http.extraHeader`` was
+    still sent to whatever address the scanned repository named.
+    """
+    return {key: value for key, value in env.items()
+            if key not in ("GIT_CONFIG", "GIT_CONFIG_COUNT")
+            and not key.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))}
+
+
 def _remotes(repo: Path) -> list[str]:
     """Every remote this clone is configured with.
 
@@ -362,10 +376,14 @@ def _remotes(repo: Path) -> list[str]:
              if line.strip()}
     git_dir = _local_git(repo, ["rev-parse", "--git-dir"], "").stdout.strip()
     if git_dir:
-        legacy = Path(git_dir)
-        legacy = (legacy if legacy.is_absolute() else repo / legacy) / "remotes"
-        if legacy.is_dir():
-            names |= {entry.name for entry in legacy.iterdir() if entry.is_file()}
+        root = Path(git_dir)
+        root = root if root.is_absolute() else repo / root
+        # Two spellings predate the config sections, git still fetches through
+        # both, and `git remote` lists neither.
+        for legacy in (root / "remotes", root / "branches"):
+            if legacy.is_dir():
+                names |= {entry.name for entry in legacy.iterdir()
+                          if entry.is_file()}
     return sorted(names)
 
 
@@ -376,12 +394,20 @@ def _fetches_every_head(refspec: str) -> bool:
     for a ``*`` meant that adding the documented tags refspec to a single-branch
     clone — one line, no other change — made it look like a full one.
     """
+    wide = False
     for line in refspec.splitlines():
         source = line.strip().lstrip("+").partition(":")[0]
-        if source == "refs/*" or (source.startswith("refs/heads/")
-                                  and source.endswith("*")):
-            return True
-    return False
+        # A negative refspec removes branches from whatever the positive ones
+        # brought, so a clone carrying one has not fetched every head no matter
+        # what else it says.
+        if source.startswith("^"):
+            return False
+        # And only the whole namespace counts. `refs/heads/release/*` is a
+        # wildcard that fetches nothing outside `release/`, and reading any `*`
+        # as completeness cleared every branch beside it.
+        if source in ("refs/*", "refs/heads/*"):
+            wide = True
+    return wide
 
 
 def _remote_url(repo: Path, remote: str) -> str | None:
@@ -488,6 +514,7 @@ def _remote_heads(repo: Path, remote: str = "origin") -> dict[str, str] | None:
         # `HOME` at the empty probe says the same thing to every git that has ever
         # looked there — belt and braces, because a version that quietly ignored the
         # first pair would read the operator's credentials and never say so.
+        env = _without_injected_config(env)
         env["GIT_CONFIG_GLOBAL"] = os.devnull
         env["GIT_CONFIG_SYSTEM"] = os.devnull
         env["GIT_CONFIG_NOSYSTEM"] = "1"
@@ -510,14 +537,29 @@ def _remote_heads(repo: Path, remote: str = "origin") -> dict[str, str] | None:
         # The advertisement lands in a file, not in this process: the timeout bounds
         # how long a hostile endpoint may talk, and nothing bounded how much, so a
         # remote that streams could exhaust the scanner before the clock ran out.
+        # The cap is enforced while the transfer runs, not after it: checking the
+        # size once the child had exited bounded what this process reads and let a
+        # fast endpoint write for the whole ten seconds first.
         sink = Path(probe) / "advertisement"
         with sink.open("wb") as buffered:
-            result = subprocess.run(
+            child = subprocess.Popen(
                 ["git", "-C", probe, "ls-remote", "--heads", "origin"],
-                stdout=buffered, stderr=subprocess.DEVNULL,
-                env=env, timeout=LS_REMOTE_TIMEOUT, check=False,
+                stdout=buffered, stderr=subprocess.DEVNULL, env=env,
             )
-        if result.returncode != 0 or sink.stat().st_size > MAX_ADVERTISEMENT:
+            deadline = time.monotonic() + LS_REMOTE_TIMEOUT
+            while True:
+                try:
+                    code = child.wait(timeout=0.2)
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+                if (time.monotonic() > deadline
+                        or sink.stat().st_size > MAX_ADVERTISEMENT):
+                    child.kill()
+                    child.wait()
+                    code = None
+                    break
+        if code != 0:
             return None
         advertisement = sink.read_text(encoding="utf-8", errors="replace")
     heads: dict[str, str] = {}
