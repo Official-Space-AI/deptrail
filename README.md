@@ -172,7 +172,10 @@ itself comes from `gh repo list`; CI runs and secret names are read through
 it when the scan knows which GitHub repository a clone is — `--org`, or
 `--repo` with `--slug` — and `--no-ci` is absent. A `--repo` scan with no
 `--slug` calls nothing and says so: the report marks CI evidence uncollected
-rather than silently assuming it. Install `gh` and run `gh auth login`
+rather than silently assuming it. `--no-ci` withholds the token, not the
+checks, and on a **private** repository that is a difference you will see: the
+branch-coverage query is refused without a credential, and a scan that could
+not list the branches reports incomplete rather than clean. Install `gh` and run `gh auth login`
 **before** incident day — `pip install` cannot do it for you, and a machine
 without it fails at the first API call, which is the worst moment to discover
 a prerequisite.
