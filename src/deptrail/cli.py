@@ -844,10 +844,12 @@ def build_parser() -> argparse.ArgumentParser:
                            "establish what the repository did")
     scan.add_argument("--no-ci", action="store_true",
                       help="skip CI and secret lookups (no token needed). It "
-                           "withholds the token, not the checks: on a private "
-                           "repository the branch-coverage query is then refused, "
-                           "and a scan that could not list the branches reports "
-                           "incomplete rather than clean")
+                           "withholds the token, not the checks: where the scan "
+                           "knows which GitHub repository it is looking at "
+                           "(--org, or one --repo with --slug) and that "
+                           "repository is private, the branch-coverage query is "
+                           "then refused and the scan reports incomplete rather "
+                           "than clean")
     add_output(scan)
     scan.set_defaults(func=cmd_scan)
 
