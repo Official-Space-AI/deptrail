@@ -510,7 +510,19 @@ def _github_authorization(url: str) -> str | None:
     host = url.partition("://")[2].partition("/")[0].rpartition("@")[2]
     if host not in ("github.com", "www.github.com"):
         return None
-    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    # `GH_TOKEN` and `GITHUB_TOKEN` carry no host of their own, and on a GitHub
+    # Enterprise runner they are that instance's credential: `GH_TOKEN` is scoped by
+    # `GH_HOST` the same way `gh` scopes it, and the Action's `GITHUB_TOKEN` belongs
+    # to whatever `GITHUB_SERVER_URL` names. Sending either to github.com is the
+    # harm the `--hostname` pin below was written to stop, arriving by the other
+    # door.
+    ambient = os.environ.get("GH_HOST") or ""
+    server = os.environ.get("GITHUB_SERVER_URL") or ""
+    elsewhere = {ambient.rpartition("@")[2].partition("/")[0].lower(),
+                 server.partition("://")[2].partition("/")[0].lower()} - {""}
+    token = ""
+    if not elsewhere - {"github.com", "www.github.com"}:
+        token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN") or ""
     if not token:
         # The same tool the scan already reads CI runs and secret names through, so
         # it is the operator's own login and nothing new is being asked of them.
@@ -792,10 +804,13 @@ def incomplete_history(repo: Path,
     and the same absent ``origin/HEAD``; only the ref *count* differs, and a count
     means nothing without knowing what the remote has. So this asks: the remote's
     branch list, compared against what the clone can walk, names the branches that
-    were never fetched. When the remote cannot be reached the answer is an
-    observation and not a reason, because refusing every offline scan its all-clear
-    would cry wolf at complete clones; when no remote is configured there is nothing
-    to compare and no penalty, which is what ``deptrail demo`` produces.
+    were never fetched. When a remote *the repository names* cannot be reached the
+    answer is an observation and not a reason, because refusing every offline scan
+    its all-clear would cry wolf at complete clones; when the address the *operator*
+    named cannot be asked it is a reason, because nothing else can answer for it and
+    the scanned repository is what chooses the alternatives. When no remote is
+    configured there is nothing to compare and no penalty, which is what
+    ``deptrail demo`` produces.
     """
     reasons, notes = [], []
     if is_shallow(repo):
@@ -859,7 +874,7 @@ def _ref_coverage(repo: Path,
     if trusted_url:
         asked.insert(0, (None, trusted_url))
     answered: list[str] = []
-    named_silent = False
+    silent_named: list[str] = []
     for remote, url in asked:
         try:
             heads = _remote_heads(repo, remote or "origin", trusted_url=url,
@@ -869,8 +884,12 @@ def _ref_coverage(repo: Path,
         label = remote or "the repository you named"
         if heads is None:
             silent.append(label)
-            # `url` is set only for the address the operator named.
-            named_silent = named_silent or url is not None
+            # `url` is set only for the address the operator named. Kept apart
+            # because the reason speaks about that address alone, and interpolating
+            # the whole silent list into "the address you named could not be asked"
+            # named the clone's own remotes as addresses the operator had chosen.
+            if url is not None:
+                silent_named.append(label)
             continue
         answered.append(label)
         # One line per gap, and a gap is a branch *at a tip*: the named address and
@@ -893,7 +912,7 @@ def _ref_coverage(repo: Path,
         reason = (f"{len(missing)} branch(es) on this clone's remote(s) are not in "
                   f"it ({shown}): a branch this clone cannot walk cannot testify, "
                   "and exposure on it is still exposure")
-    if named_silent:
+    if silent_named:
         # Withholding the token withheld the *answer*, and an answer nobody got is
         # not an answer nobody needed. On a private repository the unauthenticated
         # query is refused, the clone's own remote is the same address and is
@@ -907,13 +926,24 @@ def _ref_coverage(repo: Path,
         # has, so a public fork, a stale mirror or a plain decoy -- any address
         # whose heads the clone already holds -- was enough to turn the named
         # repository's silence back into a note and clear the clone.
-        silence = ("the address you named could not be asked "
-                   f"({', '.join(silent)}): without its branch list, a clone that "
-                   "fetched only some of them cannot be told from one that fetched "
-                   "them all, and no other remote can answer for it — the scanned "
-                   "repository chooses those. A private repository needs a token "
-                   "— GH_TOKEN, GITHUB_TOKEN or `gh auth token` — and `--no-ci` "
-                   "withholds it")
+        #
+        # The remedy is only named where it is known to be the remedy. Every
+        # unreachable address arrives here -- a deleted repository, a mistyped
+        # slug, no network, a proxy this probe refuses to read -- and telling an
+        # operator whose repository is public and complete to go and set a token
+        # prescribes a fix for something that is not wrong.
+        remedy = (" A private repository needs a token — GH_TOKEN, GITHUB_TOKEN or "
+                  "`gh auth token` — and `--no-ci` withholds it." if not authenticate
+                  else " It was unreachable, or it refused the query: check the "
+                       "address, and for a private repository that GH_TOKEN, "
+                       "GITHUB_TOKEN or `gh auth token` holds a credential for it.")
+        others = [label for label in silent if label not in silent_named]
+        beside = (f" ({', '.join(others)} could not be asked either)"
+                  if others else "")
+        silence = (f"the address you named could not be asked{beside}: without its "
+                   "branch list, a clone that fetched only some of them cannot be "
+                   "told from one that fetched them all, and no other remote can "
+                   "answer for it — the scanned repository chooses those." + remedy)
         # Both block, and the branches are the actionable half, so the gaps stay the
         # reason and the silence is still said rather than said twice.
         if reason is None:

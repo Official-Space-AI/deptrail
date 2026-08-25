@@ -1711,22 +1711,40 @@ class TestPrecedenceAndDiagnostics:
         the scan already reads CI runs through.
         """
         from deptrail import history
+        monkeypatch.delenv("GH_HOST", raising=False)
+        monkeypatch.delenv("GITHUB_SERVER_URL", raising=False)
+        # `gh` never really runs, from the first line: with the operator's own login
+        # answering, every assertion below about the *environment* is satisfied by
+        # the fallback instead — measured, deleting the GITHUB_TOKEN lookup
+        # altogether left this test passing and the whole suite green. Its other job
+        # is that the real token never reaches an assertion message.
+        called: list[list[str]] = []
+        monkeypatch.setattr(
+            history.subprocess, "run",
+            lambda *a, **k: (called.append(a[0])
+                             or subprocess.CompletedProcess(a, 1, "", "")))
         monkeypatch.setenv("GH_TOKEN", "ghs_TESTTOKEN")
         assert history._github_authorization("https://github.com/o/r.git")
         assert history._github_authorization("https://evil.example/o/r.git") is None
         # Plain http would put the header on the wire before a redirect could
         # upgrade it.
         assert history._github_authorization("http://github.com/o/r.git") is None
+        # Read under its second name too: the reason this code prints tells
+        # operators to set GITHUB_TOKEN.
         monkeypatch.delenv("GH_TOKEN")
-        # Both, or the fallback is never reached on a machine that exports the
-        # other one — and the assertion below then fails by printing the
-        # operator's real token, base64-encoded, into the test log.
-        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-        called: list[list[str]] = []
-        monkeypatch.setattr(
-            history.subprocess, "run",
-            lambda *a, **k: (called.append(a[0])
-                             or subprocess.CompletedProcess(a, 1, "", "")))
+        monkeypatch.setenv("GITHUB_TOKEN", "ghs_SECONDNAME")
+        assert history._github_authorization("https://github.com/o/r.git")
+        # Neither variable carries a host of its own. On a GitHub Enterprise runner
+        # both are that instance's credential, and the address here is always
+        # github.com — the same harm as the unpinned `gh auth token` below, through
+        # the other door.
+        for name, value in (("GH_HOST", "ghe.example.com"),
+                            ("GITHUB_SERVER_URL", "https://ghe.example.com")):
+            monkeypatch.setenv(name, value)
+            assert history._github_authorization("https://github.com/o/r.git") is None
+            monkeypatch.delenv(name)
+        monkeypatch.delenv("GITHUB_TOKEN")
+        called.clear()
         assert history._github_authorization("https://github.com/o/r.git") is None
         # Pinned to the host it will be sent to: `gh auth token` answers for
         # whatever `GH_HOST` names, so an operator logged in to a GitHub Enterprise
@@ -1780,11 +1798,27 @@ class TestPrecedenceAndDiagnostics:
         repo = self.fresh(tmp_path, "unanswerable")
         gone = tmp_path / "no-such-repository.git"
         git(repo, "remote", "add", "origin", str(gone))
-        reason, note = _ref_coverage(repo, None, str(gone), True)
+        reason, note = _ref_coverage(repo, None, str(gone), False)
         assert reason is not None and "could not be asked" in reason, reason
         # Said once. It was the reason, so repeating it as an observation would
         # print the same sentence twice on every report.
         assert note is None, note
+        # The clone's own remotes are not addresses the operator named, and
+        # interpolating the whole silent list into that sentence said they were.
+        # Counted, not just located: adding a second parenthetical that lists every
+        # silent source leaves "could not be asked either" intact, so a test looking
+        # only for that clause cannot tell the two sentences apart.
+        assert "(origin could not be asked either)" in reason, reason
+        assert reason.count("origin") == 1, reason
+        # The token is the remedy for the case that is known to be about a token.
+        assert "`--no-ci` withholds it" in reason, reason
+        reachable, _ = _ref_coverage(repo, None, str(gone), True)
+        # And not for the rest of them: a deleted repository, a mistyped slug or no
+        # network all arrive here, and telling that operator to set a token
+        # prescribes a fix for something that is not wrong.
+        assert reachable is not None, reachable
+        assert "`--no-ci` withholds it" not in reachable, reachable
+        assert "It was unreachable" in reachable, reachable
 
     def test_another_remote_cannot_answer_for_the_address_the_operator_named(
             self, tmp_path):
@@ -1821,8 +1855,13 @@ class TestPrecedenceAndDiagnostics:
         git(repo, "remote", "add", "unreachable", str(tmp_path / "not-here.git"))
         reason, note = _ref_coverage(repo, None, str(origin), True)
         assert reason is None, reason
-        assert note is not None and "rests on" in note, note
-        assert "unreachable" in note, note
+        assert note is not None and "unreachable" in note, note
+        # What it rests on has to be what answered. Naming the silent source there
+        # instead is the same false sentence this note replaced, and asserting only
+        # that "rests on" appears let that mutation through the whole suite.
+        rests_on = note.partition("rests on")[2]
+        assert "the repository you named" in rests_on, note
+        assert "unreachable" not in rests_on, note
 
     def test_two_remotes_missing_the_same_name_at_different_tips_are_two_gaps(
             self, tmp_path):
@@ -1865,7 +1904,9 @@ class TestPrecedenceAndDiagnostics:
         git(repo, "checkout", "-qb", "main", "FETCH_HEAD")
         reason, note = _ref_coverage(repo, None, "https://unreachable.invalid/x.git")
         assert reason and "release/1.x" in reason, (reason, note)
-        assert note and "the repository you named" in note, note
+        # Both block, so the branches — the actionable half — stay the reason and
+        # the silence is still said, once, beside them.
+        assert note and "the address you named could not be asked" in note, note
 
     def test_a_branch_both_sources_miss_is_reported_once(self, tmp_path):
         """The named address and a remote of the clone are usually the same
