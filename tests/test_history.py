@@ -1634,6 +1634,60 @@ class TestPrecedenceAndDiagnostics:
         finally:
             server.shutdown()
 
+    def test_the_token_is_not_attached_to_an_address_the_repository_chose(
+            self, tmp_path, monkeypatch):
+        """Keyed on the URL alone, a scan with `GH_TOKEN` in its environment — every
+        Action, `--no-ci` among them — attached the token to a github.com URL read
+        from the checkout's own config, which is an address the repository chose.
+        """
+        from deptrail import history
+        monkeypatch.setenv("GH_TOKEN", "ghs_LEAKME")
+        monkeypatch.setenv("GIT_ALLOW_PROTOCOL", "https")
+        repo = self.fresh(tmp_path, "tokenscope")
+        git(repo, "remote", "add", "origin", "https://github.com/o/r.git")
+        seen: list[str] = []
+        real = history.subprocess.Popen
+
+        class Spy(real):
+            def __init__(self, args, **kwargs):
+                if isinstance(args, list) and "ls-remote" in args:
+                    probe = args[args.index("-C") + 1]
+                    seen.append((Path(probe) / ".git" / "config").read_text())
+                super().__init__(args, **kwargs)
+
+        monkeypatch.setattr(history.subprocess, "Popen", Spy)
+        history._remote_heads(repo, "origin")
+        history._remote_heads(repo, "origin",
+                              trusted_url="https://github.com/o/r.git")
+        assert len(seen) == 2, seen
+        assert "extraHeader" not in seen[0], seen[0]
+        assert "extraHeader" in seen[1], seen[1]
+
+    def test_two_remotes_missing_the_same_name_at_different_tips_are_two_gaps(
+            self, tmp_path):
+        """A gap is a branch *at a tip*. Keyed on the name alone the second was
+        dropped, and fetching the source that was named would have left the other
+        unexamined.
+        """
+        from deptrail.history import _ref_coverage
+        first = self.origin_with_two_branches(tmp_path, "twin-a")
+        second = self.origin_with_two_branches(tmp_path, "twin-b")
+        # The helper is deterministic, so the two origins would otherwise carry the
+        # same commits under the same names — one gap, correctly counted once.
+        elsewhere = tmp_path / "twin-b-work"
+        git(elsewhere, "checkout", "-q", "release/1.x")
+        self.write(elsewhere, "diverged.md", "not the same commit\n",
+                   "2025-11-26T10:00:00+00:00")
+        git(elsewhere, "push", "-q", "origin", "release/1.x")
+        repo = self.fresh(tmp_path, "twin-clone")
+        git(repo, "remote", "add", "one", str(first))
+        git(repo, "remote", "add", "two", str(second))
+        git(repo, "fetch", "-q", "one", "main")
+        git(repo, "checkout", "-qb", "main", "FETCH_HEAD")
+        reason, _ = _ref_coverage(repo, None)
+        # Both origins carry a `release/1.x`, and they are different commits.
+        assert reason and reason.count("release/1.x") == 2, reason
+
     def test_a_named_address_that_cannot_answer_does_not_silence_the_clone(
             self, tmp_path):
         """The address the operator named is asked as well as the clone's remotes,
