@@ -802,11 +802,12 @@ def _ref_coverage(repo: Path,
                   ) -> tuple[str | None, str | None]:
     """What the remotes' branch lists say about this clone: (reason, observation).
 
-    Every remote is asked, and a branch none of them can account for is one the
-    walk cannot testify about. A fork checkout is told that its upstream's
-    unfetched branches are unfetched, which is true and is waivable with
-    ``--allow-incomplete-history``; the alternative — picking one remote — was
-    three separate false all-clears.
+    Every remote is asked, plus the address the operator named if there is one, and
+    a branch none of them can account for is one the walk cannot testify about. A
+    fork checkout is told that its upstream's unfetched branches are unfetched,
+    which is true and is waivable with ``--allow-incomplete-history``; the
+    alternative — picking one — was four separate false all-clears, the last of
+    them from letting a named address stand in for the rest.
 
     ``cache`` is keyed by repository because the answer is a property of the
     checkout and not of the advisory: ``scan_organization`` walks every repository
@@ -816,13 +817,17 @@ def _ref_coverage(repo: Path,
     key = str(repo)
     if cache is not None and key in cache:
         return cache[key]
-    missing: list[str] = []
+    found: dict[str, str] = {}
     silent: list[str] = []
-    # When the operator has said which repository this is, that is the one asked and
-    # the only one: they have named it, the same assertion that already governs its
-    # CI evidence, and the clone's other remotes are forks and mirrors they did not.
-    asked = [(None, trusted_url)] if trusted_url else [
+    # The address the operator named is asked *as well as* the clone's own remotes,
+    # never instead of them. Replacing them looked reasonable -- they named it, so
+    # it is the authority -- and it put #27 back: when the named address could not
+    # answer, nothing else was asked, the gap became an observation, and the same
+    # clone that exits 2 without `--slug` exited 0 with it.
+    asked: list[tuple[str | None, str | None]] = [
         (remote, None) for remote in _remotes(repo)]
+    if trusted_url:
+        asked.insert(0, (None, trusted_url))
     for remote, url in asked:
         try:
             heads = _remote_heads(repo, remote or "origin", trusted_url=url)
@@ -832,8 +837,12 @@ def _ref_coverage(repo: Path,
         if heads is None:
             silent.append(label)
             continue
-        missing += [f"{label}/{branch}" if remote else branch
-                    for branch in _heads_not_here(repo, heads)]
+        # One line per branch, whoever noticed it first: the named address and a
+        # remote of the clone are usually the same repository, and saying the same
+        # branch twice reads as two gaps.
+        for branch in _heads_not_here(repo, heads):
+            found.setdefault(branch, label)
+    missing = [f"{label}/{branch}" for branch, label in found.items()]
     reason = note = None
     if missing:
         # The names are the point — they are what a responder re-fetches — but a

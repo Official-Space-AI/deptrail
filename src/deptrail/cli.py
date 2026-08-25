@@ -406,7 +406,9 @@ def cmd_scan(args: argparse.Namespace) -> int:
     # repository for each, and since a named repository is the only one asked, a
     # second clone holding every branch of the named one would be cleared while
     # missing a branch of its own origin.
-    named = args.org or (args.slug and len(args.repo) == 1)
+    # `--no-ci` is documented as "no token needed", so it must not be the run that
+    # hands a password to the network.
+    named = not args.no_ci and (args.org or (args.slug and len(args.repo) == 1))
     trusted = ((lambda name: f"https://github.com/{slug_of(name)}.git")
                if slug_of is not None and named else None)
     report = scan_organization(repos, advisory.plan(), runs=runs, secrets=secrets,

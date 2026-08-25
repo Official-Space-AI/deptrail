@@ -1634,6 +1634,39 @@ class TestPrecedenceAndDiagnostics:
         finally:
             server.shutdown()
 
+    def test_a_named_address_that_cannot_answer_does_not_silence_the_clone(
+            self, tmp_path):
+        """The address the operator named is asked as well as the clone's remotes,
+        never instead of them. Replacing them looked reasonable — they named it, so
+        it is the authority — and it put #27 back: with the named address silent,
+        nothing else was asked and the same clone that exits 2 without a slug came
+        back clean with one.
+        """
+        from deptrail.history import _ref_coverage
+        origin = self.origin_with_two_branches(tmp_path, "fallback")
+        repo = self.fresh(tmp_path, "fallback-clone")
+        git(repo, "remote", "add", "origin", str(origin))
+        git(repo, "fetch", "-q", "origin", "main")
+        git(repo, "checkout", "-qb", "main", "FETCH_HEAD")
+        reason, note = _ref_coverage(repo, None, "https://unreachable.invalid/x.git")
+        assert reason and "release/1.x" in reason, (reason, note)
+        assert note and "the repository you named" in note, note
+
+    def test_a_branch_both_sources_miss_is_reported_once(self, tmp_path):
+        """The named address and a remote of the clone are usually the same
+        repository, so the same branch comes back from both; two lines read as two
+        gaps.
+        """
+        from deptrail.history import _ref_coverage
+        origin = self.origin_with_two_branches(tmp_path, "onceonly")
+        repo = self.fresh(tmp_path, "onceonly-clone")
+        git(repo, "remote", "add", "origin", str(origin))
+        git(repo, "fetch", "-q", "origin", "main")
+        git(repo, "checkout", "-qb", "main", "FETCH_HEAD")
+        reason, _ = _ref_coverage(repo, None, str(origin))
+        assert reason and reason.count("release/1.x") == 1, reason
+        assert reason.startswith("1 branch(es)"), reason
+
     def test_the_action_token_reaches_only_the_named_github_url(self, tmp_path,
                                                                 monkeypatch):
         """In the shipped Action the token arrives as `GH_TOKEN`, which git does not

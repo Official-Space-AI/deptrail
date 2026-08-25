@@ -464,6 +464,32 @@ class TestOrgCacheSafety:
         assert any("fetch failed" in t for t in payload["could_not_run"])
 
 
+class TestNoCiMeansNoToken:
+    def test_no_ci_does_not_take_the_authenticated_path(self, tmp_path):
+        """`--no-ci` is documented as "no token needed", so it must not be the run
+        that hands a credential to the network.
+        """
+        from deptrail.demo import advisory_path, build
+
+        build(tmp_path / "demo")
+        advisory = advisory_path(tmp_path / "demo")
+        asked: list[str | None] = []
+        import deptrail.org as org
+        original = org.scan_repo
+
+        def record(repo, query, cache=None, trusted_url=None):
+            asked.append(trusted_url)
+            return original(repo, query, cache, trusted_url)
+
+        org.scan_repo = record
+        try:
+            main(["scan", "--ioc", str(advisory), "--no-ci", "--slug", "acme/x",
+                  "--repo", str(tmp_path / "demo" / "api-server")])
+        finally:
+            org.scan_repo = original
+        assert asked and all(url is None for url in asked), asked
+
+
 class TestOneSlugCannotSpeakForSeveralRepositories:
     def test_two_repo_paths_with_one_slug_keep_their_own_remotes(self, tmp_path,
                                                                  capsys):
