@@ -402,10 +402,12 @@ def cmd_scan(args: argparse.Namespace) -> int:
     # builds it here and `--slug` is typed, so ref coverage can authenticate as
     # them without the repository under suspicion choosing where that goes.
     #
-    # One `--slug` cannot speak for several `--repo` paths. It would name the same
-    # repository for each, and since a named repository is the only one asked, a
-    # second clone holding every branch of the named one would be cleared while
-    # missing a branch of its own origin.
+    # One `--slug` cannot speak for several `--repo` paths: it names one repository
+    # and would be handed to each clone in turn, so the second is compared against a
+    # repository it is not. Every branch of the named one then reads as a branch
+    # that clone is missing — invented gaps, and exit 2 for a checkout with nothing
+    # wrong with it. (That the same `--slug` also answers for every `--repo` on the
+    # CI and secrets path is older and separate: #105.)
     # `--no-ci` is documented as "no token needed", so it withholds the token --
     # not the check. Withholding the check meant the same clone exited 2 without
     # the flag and 0 with it, and the report said nothing about why.

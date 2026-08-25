@@ -495,26 +495,60 @@ class TestNoCiMeansNoToken:
 
 
 class TestOneSlugCannotSpeakForSeveralRepositories:
-    def test_two_repo_paths_with_one_slug_keep_their_own_remotes(self, tmp_path,
-                                                                 capsys):
-        """A named repository is the only one asked, so letting one `--slug` name
-        every `--repo` path would clear a second clone that holds every branch of
-        the named repository while missing one of its own origin.
+    @staticmethod
+    def _trusted_urls(argv) -> list[str | None]:
+        """The address handed to each repository's scan, in order."""
+        import deptrail.org as org
+        seen: list[str | None] = []
+        original = org.scan_repo
+
+        def record(repo, query, cache=None, trusted_url=None, authenticate=True):
+            seen.append(trusted_url)
+            return original(repo, query, cache, trusted_url, authenticate)
+
+        org.scan_repo = record
+        try:
+            main(argv)
+        finally:
+            org.scan_repo = original
+        return seen
+
+    def test_two_repo_paths_with_one_slug_get_no_named_address(self, tmp_path):
+        """One `--slug` names one repository. Handing it to a second clone as well
+        compares that clone against a repository it is not, so every branch of the
+        named one reads as a branch the clone is missing — hundreds of invented
+        gaps, and exit 2 for a checkout with nothing wrong with it.
+
+        Asserting only that the scan ran and printed both names pinned nothing: the
+        guard could be deleted outright and this class still passed.
         """
         from deptrail.demo import advisory_path, build
 
         build(tmp_path / "demo")
         advisory = advisory_path(tmp_path / "demo")
-        first = tmp_path / "demo" / "api-server"
-        second = tmp_path / "demo" / "docs-site"
-        code = main(["scan", "--ioc", str(advisory), "--no-ci",
-                     "--repo", str(first), "--repo", str(second),
-                     "--slug", "acme/api-server"])
-        # What is pinned is that it ran and judged both, not the grade: the guard
-        # is that one slug did not become the trusted remote for the other clone.
-        assert code in (0, 1, 2)
-        out = capsys.readouterr().out
-        assert "api-server" in out and "docs-site" in out
+        urls = self._trusted_urls(
+            ["scan", "--ioc", str(advisory), "--no-ci",
+             "--repo", str(tmp_path / "demo" / "api-server"),
+             "--repo", str(tmp_path / "demo" / "docs-site"),
+             "--slug", "acme/api-server"])
+        assert urls, "no repository was scanned"
+        assert all(url is None for url in urls), urls
+
+    def test_one_repo_path_with_one_slug_still_gets_it(self, tmp_path):
+        """And the guard withholds the address only for the case it cannot answer:
+        with a single `--repo`, the slug names that clone and is used.
+        """
+        from deptrail.demo import advisory_path, build
+
+        build(tmp_path / "demo")
+        advisory = advisory_path(tmp_path / "demo")
+        urls = self._trusted_urls(
+            ["scan", "--ioc", str(advisory), "--no-ci",
+             "--repo", str(tmp_path / "demo" / "api-server"),
+             "--slug", "acme/api-server"])
+        assert urls, "no repository was scanned"
+        assert all(url == "https://github.com/acme/api-server.git"
+                   for url in urls), urls
 
 
 class TestReportEncoding:

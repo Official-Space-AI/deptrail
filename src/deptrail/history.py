@@ -500,6 +500,13 @@ def _github_authorization(url: str) -> str | None:
     a trusted URL is that nothing about where this goes came from the repository,
     and a token is worth carrying only under exactly that condition.
     """
+    # Over plain http the header goes out before any redirect can upgrade it, so a
+    # token would be on the wire in the clear. Only the scheme that carries it
+    # inside TLS may carry it at all — the shipped CLI builds `https://` and
+    # nothing else, and this keeps that true for any other caller of the injected
+    # `remote_url`.
+    if not url.startswith("https://"):
+        return None
     host = url.partition("://")[2].partition("/")[0].rpartition("@")[2]
     if host not in ("github.com", "www.github.com"):
         return None
@@ -507,7 +514,11 @@ def _github_authorization(url: str) -> str | None:
     if not token:
         # The same tool the scan already reads CI runs and secret names through, so
         # it is the operator's own login and nothing new is being asked of them.
-        asked = subprocess.run(["gh", "auth", "token"], capture_output=True,
+        # Pinned to the host it will be sent to: `gh auth token` answers for
+        # whatever `GH_HOST` names, so an operator logged in to a GitHub Enterprise
+        # instance had that instance's credential handed to github.com.
+        asked = subprocess.run(["gh", "auth", "token", "--hostname", "github.com"],
+                               capture_output=True,
                                text=True, check=False, timeout=LS_REMOTE_TIMEOUT,
                                env=_git_env())
         token = asked.stdout.strip() if asked.returncode == 0 else ""
@@ -847,6 +858,8 @@ def _ref_coverage(repo: Path,
         (remote, None) for remote in _remotes(repo)]
     if trusted_url:
         asked.insert(0, (None, trusted_url))
+    answered: list[str] = []
+    named_silent = False
     for remote, url in asked:
         try:
             heads = _remote_heads(repo, remote or "origin", trusted_url=url,
@@ -856,7 +869,10 @@ def _ref_coverage(repo: Path,
         label = remote or "the repository you named"
         if heads is None:
             silent.append(label)
+            # `url` is set only for the address the operator named.
+            named_silent = named_silent or url is not None
             continue
+        answered.append(label)
         # One line per gap, and a gap is a branch *at a tip*: the named address and
         # a remote of the clone are usually the same repository, so the same branch
         # at the same commit is one gap and saying it twice reads as two. Two
@@ -877,7 +893,32 @@ def _ref_coverage(repo: Path,
         reason = (f"{len(missing)} branch(es) on this clone's remote(s) are not in "
                   f"it ({shown}): a branch this clone cannot walk cannot testify, "
                   "and exposure on it is still exposure")
-    if silent:
+    # The silence is the reason itself, so it must not also be repeated as a note.
+    silence_is_the_reason = named_silent and not answered and not missing
+    if silence_is_the_reason:
+        # Withholding the token withheld the *answer*, and an answer nobody got is
+        # not an answer nobody needed. On a private repository the unauthenticated
+        # query is refused, the clone's own remote is the same address and is
+        # refused too, and every source falls silent -- so the check ran, found
+        # nothing to say, and the clone was cleared. Measured, the same clone with
+        # an unfetched branch holding the poisoned pin exited 2 without `--no-ci`
+        # and 0 with it, which is the split this path was added to close.
+        reason = ("the address you named could not be asked "
+                  f"({', '.join(silent)}), and no other remote answered: without a "
+                  "branch list, a clone that fetched only some of them cannot be "
+                  "told from one that fetched them all. A private repository needs "
+                  "a token — GH_TOKEN, GITHUB_TOKEN or `gh auth token` — and "
+                  "`--no-ci` withholds it")
+    if silent and answered:
+        # Saying "coverage was not verified" is false on the shipped Action's
+        # ordinary shape: the named address answers in full while the checkout's own
+        # `origin` -- whose credential lives in the config this probe refuses to
+        # read -- cannot be asked at all. The unqualified sentence fired on exactly
+        # the runs where the feature was working.
+        note = (f"ref coverage was not verified against {', '.join(silent)}, and "
+                f"rests on {', '.join(answered)}: a branch that exists only on a "
+                "remote none of those could speak for would not have been seen")
+    elif silent and not silence_is_the_reason:
         note = (f"ref coverage was not verified against {', '.join(silent)}: a "
                 "remote that cannot be reached, or has no URL to ask, leaves a "
                 "checkout that fetched only some branches looking like a complete "
