@@ -303,6 +303,9 @@ def _config(repo: Path, key: str) -> str:
 # local one, so the ceiling is not there to bound the normal case — it is there so a
 # remote that accepts the connection and then says nothing cannot hang a scan.
 LS_REMOTE_TIMEOUT = 10.0
+# Every real advertisement is a line per ref; the largest repository anyone scans
+# is nowhere near this. It is a ceiling on a hostile endpoint, not on a remote.
+MAX_ADVERTISEMENT = 32 * 1024 * 1024
 
 
 # Transports a repository under investigation may send us to. The allowlist is the
@@ -332,24 +335,19 @@ def _clone_remote(repo: Path) -> str | None:
     ref coverage. A single-branch checkout of a repository whose other branch held
     the pin went from exit 2 to exit 0 on that alone.
 
-``origin`` settles the ordinary case and is asked first: the branch's own remote
-    records where it *pulls from*, not where the clone came from, and in a fork
-    checkout — ``origin`` the fork, ``upstream`` the canonical repository — taking
-    the branch's answer would have skipped every check against the remote this
-    clone actually is. A lone remote can only be the one. Anything else is
-    genuinely ambiguous, and the caller says so rather than picking.
+``origin`` settles the ordinary case, and a lone remote can only be the one.
+    Nothing else is asked. ``branch.<name>.remote`` looked like a good third
+    answer and is not one: it records where a branch *pulls from*, not where the
+    clone came from, so in a fork checkout it named the canonical repository
+    instead of the fork, and a branch reconfigured later named a remote the clone
+    never came from at all — either way the coverage answer would be about the
+    wrong repository while reading as verified. Several remotes with no ``origin``
+    is genuinely ambiguous, and the caller says so rather than picking.
     """
     remotes = _local_git(repo, ["remote"], "").stdout.split()
     if "origin" in remotes:
         return "origin"
-    if len(remotes) == 1:
-        return remotes[0]
-    branch = _local_git(repo, ["rev-parse", "--abbrev-ref", "HEAD"], "").stdout.strip()
-    if branch and branch != "HEAD":
-        named = _config(repo, f"branch.{branch}.remote")
-        if named and named != "." and named.splitlines()[0] in remotes:
-            return named.splitlines()[0]
-    return None
+    return remotes[0] if len(remotes) == 1 else None
 
 
 def _remote_url(repo: Path, remote: str) -> str | None:
@@ -459,22 +457,28 @@ def _remote_heads(repo: Path, remote: str = "origin") -> dict[str, str] | None:
         quoted = url.replace("\\", "\\\\").replace('"', '\\"')
         config.write_text(
             f'{config.read_text()}[remote "origin"]\n\turl = "{quoted}"\n')
-        result = subprocess.run(
-            # The URL comes from a repository this code treats as hostile, and an
-            # unscoped `http.extraHeader` in the operator's own global config is
-            # sent to whatever host that URL names — measured, a bearer token
-            # reaching a server the scanned checkout chose. Credential helpers stay:
-            # they answer per host, so a remote the operator has no credential for
-            # simply comes back unreachable.
-            ["git", "-C", probe, "-c", "http.extraHeader=",
-             "ls-remote", "--heads", "origin"],
-            capture_output=True, text=True, encoding="utf-8",
-            env=env, timeout=LS_REMOTE_TIMEOUT, check=False,
-        )
-    if result.returncode != 0:
-        return None
+        # The advertisement lands in a file, not in this process: the timeout bounds
+        # how long a hostile endpoint may talk, and nothing bounded how much, so a
+        # remote that streams could exhaust the scanner before the clock ran out.
+        sink = Path(probe) / "advertisement"
+        with sink.open("wb") as buffered:
+            result = subprocess.run(
+                # The URL comes from a repository this code treats as hostile, and
+                # an unscoped `http.extraHeader` in the operator's own global config
+                # is sent to whatever host that URL names — measured, a bearer token
+                # reaching a server the scanned checkout chose. Credential helpers
+                # stay: they answer per host, so a remote the operator has no
+                # credential for simply comes back unreachable.
+                ["git", "-C", probe, "-c", "http.extraHeader=",
+                 "ls-remote", "--heads", "origin"],
+                stdout=buffered, stderr=subprocess.DEVNULL,
+                env=env, timeout=LS_REMOTE_TIMEOUT, check=False,
+            )
+        if result.returncode != 0 or sink.stat().st_size > MAX_ADVERTISEMENT:
+            return None
+        advertisement = sink.read_text(encoding="utf-8", errors="replace")
     heads: dict[str, str] = {}
-    for line in result.stdout.splitlines():
+    for line in advertisement.splitlines():
         tip, _, ref = line.partition("\t")
         # A ref whose name git will not accept is advertised with an all-zero id,
         # and the peeled rule below would then overwrite a real branch's tip with
@@ -665,7 +669,11 @@ def _ref_coverage(repo: Path, remote: str | None,
             cache[key] = outcome
         return outcome
     if not _config(repo, f"remote.{remote}.url"):
-        outcome = (None, None)
+        # A remote section with no URL is not the same as no remote: something was
+        # unset, and silence there reads as coverage nobody checked.
+        outcome = (None, f"ref coverage was not verified: {remote} has no URL to "
+                         "ask, so what this clone holds could not be compared "
+                         "against what the repository has")
         if cache is not None:
             cache[key] = outcome
         return outcome
