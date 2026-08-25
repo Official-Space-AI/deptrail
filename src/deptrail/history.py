@@ -893,9 +893,7 @@ def _ref_coverage(repo: Path,
         reason = (f"{len(missing)} branch(es) on this clone's remote(s) are not in "
                   f"it ({shown}): a branch this clone cannot walk cannot testify, "
                   "and exposure on it is still exposure")
-    # The silence is the reason itself, so it must not also be repeated as a note.
-    silence_is_the_reason = named_silent and not answered and not missing
-    if silence_is_the_reason:
+    if named_silent:
         # Withholding the token withheld the *answer*, and an answer nobody got is
         # not an answer nobody needed. On a private repository the unauthenticated
         # query is refused, the clone's own remote is the same address and is
@@ -903,13 +901,26 @@ def _ref_coverage(repo: Path,
         # nothing to say, and the clone was cleared. Measured, the same clone with
         # an unfetched branch holding the poisoned pin exited 2 without `--no-ci`
         # and 0 with it, which is the split this path was added to close.
-        reason = ("the address you named could not be asked "
-                  f"({', '.join(silent)}), and no other remote answered: without a "
-                  "branch list, a clone that fetched only some of them cannot be "
-                  "told from one that fetched them all. A private repository needs "
-                  "a token — GH_TOKEN, GITHUB_TOKEN or `gh auth token` — and "
-                  "`--no-ci` withholds it")
-    if silent and answered:
+        #
+        # Another remote answering does not stand in for it, and letting it was the
+        # first attempt at this: the *scanned repository* chooses which remotes it
+        # has, so a public fork, a stale mirror or a plain decoy -- any address
+        # whose heads the clone already holds -- was enough to turn the named
+        # repository's silence back into a note and clear the clone.
+        silence = ("the address you named could not be asked "
+                   f"({', '.join(silent)}): without its branch list, a clone that "
+                   "fetched only some of them cannot be told from one that fetched "
+                   "them all, and no other remote can answer for it — the scanned "
+                   "repository chooses those. A private repository needs a token "
+                   "— GH_TOKEN, GITHUB_TOKEN or `gh auth token` — and `--no-ci` "
+                   "withholds it")
+        # Both block, and the branches are the actionable half, so the gaps stay the
+        # reason and the silence is still said rather than said twice.
+        if reason is None:
+            reason = silence
+        else:
+            note = silence
+    elif silent and answered:
         # Saying "coverage was not verified" is false on the shipped Action's
         # ordinary shape: the named address answers in full while the checkout's own
         # `origin` -- whose credential lives in the config this probe refuses to
@@ -918,7 +929,7 @@ def _ref_coverage(repo: Path,
         note = (f"ref coverage was not verified against {', '.join(silent)}, and "
                 f"rests on {', '.join(answered)}: a branch that exists only on a "
                 "remote none of those could speak for would not have been seen")
-    elif silent and not silence_is_the_reason:
+    elif silent:
         note = (f"ref coverage was not verified against {', '.join(silent)}: a "
                 "remote that cannot be reached, or has no URL to ask, leaves a "
                 "checkout that fetched only some branches looking like a complete "
