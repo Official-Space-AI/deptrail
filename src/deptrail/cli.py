@@ -584,11 +584,14 @@ def _check_derive_inputs(wanted: dict[str, tuple[str, ...]],
 def cmd_advisory_derive(args: argparse.Namespace) -> int:
     """Build an advisory whose window starts come from the registry, not a keyboard.
 
-    This is the only command in the tool that touches the network, and it is
+    This is the only command in the tool that reads the registry, and it is
     deliberately not a scan: the derived advisory is written to a file a human reads
     and then passes to `scan`. A verdict must not depend on a registry the incident
     may itself have taken down, and a window that differs between two runs of the
-    same scan is not evidence.
+    same scan is not evidence. A scan does reach the network for its own evidence —
+    clones, CI runs, and the branch list `origin` answers with — but only ever to
+    *narrow* what it will claim: an unreachable remote leaves ref coverage
+    unverified, never established.
     """
     # Imported here rather than at module scope: nothing on the scan path should be
     # able to reach the network, and keeping urllib out of the import graph of every
