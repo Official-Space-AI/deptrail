@@ -591,7 +591,11 @@ def _remote_heads(repo: Path, remote: str = "origin", *,
         # Without this the Action's whole reason for the check goes unauthenticated
         # on a private repository, which is exactly where it was needed. It is
         # written to the file rather than passed as an argument: `ps` sees argv.
-        if (header := _github_authorization(url)) is not None:
+        # Only for an address the operator named. Keyed on the URL alone, a scan
+        # with GH_TOKEN in its environment -- which is every Action, and `--no-ci`
+        # among them -- attached the token to a github.com URL read from the
+        # checkout's own config, which is an address the repository chose.
+        if trusted_url and (header := _github_authorization(url)) is not None:
             settings += f'[http "{url}"]\n\textraHeader = "{header}"\n'
         config.write_text(config.read_text() + settings)
         # The advertisement lands in a file, not in this process: the timeout bounds
@@ -817,7 +821,7 @@ def _ref_coverage(repo: Path,
     key = str(repo)
     if cache is not None and key in cache:
         return cache[key]
-    found: dict[str, str] = {}
+    found: dict[tuple[str, str], str] = {}
     silent: list[str] = []
     # The address the operator named is asked *as well as* the clone's own remotes,
     # never instead of them. Replacing them looked reasonable -- they named it, so
@@ -837,12 +841,15 @@ def _ref_coverage(repo: Path,
         if heads is None:
             silent.append(label)
             continue
-        # One line per branch, whoever noticed it first: the named address and a
-        # remote of the clone are usually the same repository, and saying the same
-        # branch twice reads as two gaps.
+        # One line per gap, and a gap is a branch *at a tip*: the named address and
+        # a remote of the clone are usually the same repository, so the same branch
+        # at the same commit is one gap and saying it twice reads as two. Two
+        # remotes advertising that name at different commits are two, and keying on
+        # the name alone dropped the second — fetching one source would have left
+        # the other unexamined.
         for branch in _heads_not_here(repo, heads):
-            found.setdefault(branch, label)
-    missing = [f"{label}/{branch}" for branch, label in found.items()]
+            found.setdefault((branch, heads[branch]), label)
+    missing = [f"{label}/{branch}" for (branch, _tip), label in found.items()]
     reason = note = None
     if missing:
         # The names are the point — they are what a responder re-fetches — but a
