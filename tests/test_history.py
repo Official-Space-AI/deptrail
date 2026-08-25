@@ -1510,6 +1510,40 @@ class TestPrecedenceAndDiagnostics:
         git(repo, "config", "branch.main.remote", "upstream")
         assert _clone_remote(repo) == "origin"
 
+    def test_several_remotes_without_origin_are_ambiguous(self, tmp_path):
+        """`branch.<name>.remote` records where a branch pulls from, not where the
+        clone came from, so it cannot stand in for the clone's source: a branch
+        reconfigured later names a remote this clone never came from, and the
+        coverage answer would be about the wrong repository while reading as
+        verified. Ambiguity is said out loud instead.
+        """
+        from deptrail.history import _clone_remote, incomplete_history
+        origin = self.origin_with_two_branches(tmp_path, "ambiguous")
+        repo = self.fresh(tmp_path, "ambiguous-clone")
+        git(repo, "remote", "add", "one", str(origin))
+        git(repo, "remote", "add", "two", str(origin))
+        git(repo, "fetch", "-q", "one", "main")
+        git(repo, "checkout", "-qb", "main", "FETCH_HEAD")
+        git(repo, "config", "branch.main.remote", "two")
+        assert _clone_remote(repo) is None
+        reasons, notes = incomplete_history(repo)
+        assert reasons == []
+        assert any("several remotes" in n for n in notes), notes
+
+    def test_a_remote_with_no_url_says_so(self, tmp_path):
+        """A remote section whose URL was unset is not the same as no remote at all,
+        and silence there reads as coverage nobody checked.
+        """
+        from deptrail.history import incomplete_history
+        repo = self.fresh(tmp_path, "urlless")
+        self.write(repo, "package-lock.json", lock_json("5.6.0"),
+                   "2025-11-25T10:00:00+00:00")
+        git(repo, "config", "remote.origin.fetch",
+            "+refs/heads/*:refs/remotes/origin/*")
+        reasons, notes = incomplete_history(repo)
+        assert reasons == []
+        assert any("no URL to ask" in n for n in notes), notes
+
     def test_a_network_url_is_not_resolved_against_the_checkout(self, tmp_path):
         """`repo / url` turned `https://host/repo.git` into the candidate path
         `<checkout>/https:/host/repo.git`. A compromised checkout can ship a bare
@@ -1606,9 +1640,13 @@ class TestPrecedenceAndDiagnostics:
 
         def with_a_null_line(args, **kwargs):
             done = real(args, **kwargs)
-            if isinstance(args, list) and "ls-remote" in args and done.returncode == 0:
-                done.stdout += ("0" * 40 + "\trefs/heads/release/1.x^{}\n"
-                                + "0" * 40 + "\trefs/heads/broken\tname\n")
+            sink = kwargs.get("stdout")
+            if (isinstance(args, list) and "ls-remote" in args
+                    and done.returncode == 0 and hasattr(sink, "write")):
+                # The advertisement is written to a file, so the extra lines go
+                # there too rather than onto a captured string.
+                sink.write(("0" * 40 + "\trefs/heads/release/1.x^{}\n"
+                            + "0" * 40 + "\trefs/heads/broken\tname\n").encode())
             return done
 
         monkeypatch.setattr(history.subprocess, "run", with_a_null_line)
@@ -1640,7 +1678,10 @@ class TestPrecedenceAndDiagnostics:
                    "2025-11-25T10:00:00+00:00")
         git(repo, "config", "remote.origin.fetch",
             "+refs/heads/*:refs/remotes/origin/*")
-        assert incomplete_history(repo) == ([], [])
+        # Reasons only: this fixture names a remote it never gave a URL, which is
+        # its own observation now — what it pins is that a wildcard refspec and no
+        # promisor cost the repository nothing.
+        assert incomplete_history(repo)[0] == []
         assert scan_repo(repo, WINDOW).verdict is Verdict.CLEAN
 
     def test_a_rewritten_date_is_a_diagnostic_and_not_lost_evidence(self, tmp_path):
