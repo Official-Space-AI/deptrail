@@ -54,6 +54,7 @@ The attack window is inclusive on both ends; held intervals are half-open
 """
 from __future__ import annotations
 
+import os
 import posixpath
 import subprocess
 from dataclasses import dataclass, field
@@ -296,6 +297,59 @@ def _config(repo: Path, key: str) -> str:
     return result.stdout.strip() if result.returncode == 0 else ""
 
 
+# `git ls-remote` against a real GitHub remote measured 675 ms, and 18 ms against a
+# local one, so the ceiling is not there to bound the normal case — it is there so a
+# remote that accepts the connection and then says nothing cannot hang a scan.
+LS_REMOTE_TIMEOUT = 10.0
+
+
+def _remote_heads(repo: Path) -> dict[str, str] | None:
+    """The remote's branch names and tips, or ``None`` when it could not be asked.
+
+    ``GIT_TERMINAL_PROMPT=0`` is the load-bearing part: a private remote whose
+    credentials this machine does not hold would otherwise stop the scan at an
+    interactive password prompt. With it, the same remote fails in well under a
+    second and the caller reports that coverage is unverified.
+    """
+    result = subprocess.run(
+        ["git", "-C", str(repo), "ls-remote", "--heads", "origin"],
+        capture_output=True, text=True, encoding="utf-8",
+        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+        timeout=LS_REMOTE_TIMEOUT, check=False,
+    )
+    if result.returncode != 0:
+        return None
+    heads = {}
+    for line in result.stdout.splitlines():
+        tip, _, ref = line.partition("\t")
+        if ref.startswith("refs/heads/") and tip:
+            heads[ref[len("refs/heads/"):]] = tip
+    return heads
+
+
+def _heads_not_here(repo: Path, heads: dict[str, str]) -> list[str]:
+    """Which of the remote's branches this clone cannot walk.
+
+    A branch counts as held under any name the walk enumerates — its
+    remote-tracking ref, a local branch of the same name, or any ref pointing at
+    the same tip, because a checkout that fetched it under a different name still
+    holds it. Anything left over is a branch ``_refs`` will never hand to the
+    walker, and the exposure it may carry cannot be seen from here.
+    """
+    names, tips = set(), set()
+    for line in _git(repo, "for-each-ref", "--format=%(objectname) %(refname)",
+                     "refs/heads", "refs/remotes").splitlines():
+        tip, _, ref = line.partition(" ")
+        names.add(ref)
+        tips.add(tip)
+    return sorted(
+        name for name, tip in heads.items()
+        if f"refs/remotes/origin/{name}" not in names
+        and f"refs/heads/{name}" not in names
+        and tip not in tips
+    )
+
+
 def incomplete_history(repo: Path) -> tuple[list[str], list[str]]:
     """How much less this clone holds than the repository does, and what that costs.
 
@@ -313,9 +367,19 @@ def incomplete_history(repo: Path) -> tuple[list[str], list[str]]:
     repository is as fully judged as a full clone would be. So a partial clone is an
     observation, and the read failures are the evidence.
 
-    What this cannot see: a checkout built by ``git init`` plus ``git fetch origin
-    <branch>`` keeps the wildcard refspec, is not shallow and has no promisor, yet
-    holds one branch. Distinguishing it needs the remote's ref list — see issue #27.
+    A checkout built by ``git init`` plus ``git fetch origin <branch>`` defeats all
+    three: it keeps the wildcard refspec, is not shallow and has no promisor, yet
+    holds one branch, and it used to be cleared at exit 0 with the malicious pin
+    sitting on a branch nobody fetched (#27). No local signal separates it from a
+    complete checkout — ``actions/checkout`` with ``fetch-depth: 0`` fetches every
+    head and, being ``init`` plus ``fetch`` itself, leaves the same wildcard refspec
+    and the same absent ``origin/HEAD``; only the ref *count* differs, and a count
+    means nothing without knowing what the remote has. So this asks: the remote's
+    branch list, compared against what the clone can walk, names the branches that
+    were never fetched. When the remote cannot be reached the answer is an
+    observation and not a reason, because refusing every offline scan its all-clear
+    would cry wolf at complete clones; when no remote is configured there is nothing
+    to compare and no penalty, which is what ``deptrail demo`` produces.
     """
     reasons, notes = [], []
     if is_shallow(repo):
@@ -334,6 +398,29 @@ def incomplete_history(repo: Path) -> tuple[list[str], list[str]]:
             f"partial clone ({filtered}): lockfile contents were fetched on demand; "
             "any that could not be read are listed as unreadable snapshots"
         )
+    if _config(repo, "remote.origin.url"):
+        try:
+            heads = _remote_heads(repo)
+        except (OSError, subprocess.SubprocessError):
+            heads = None
+        if heads is None:
+            notes.append(
+                "ref coverage was not verified: origin could not be reached, so a "
+                "checkout that fetched only some branches cannot be told from a "
+                "complete one"
+            )
+        elif (missing := _heads_not_here(repo, heads)):
+            # The names are the point — they are what a responder re-fetches — but a
+            # repository can have hundreds of branches, and a reason that prints them
+            # all is a reason nobody reads.
+            shown = ", ".join(missing[:5])
+            if len(missing) > 5:
+                shown += f", and {len(missing) - 5} more"
+            reasons.append(
+                f"{len(missing)} branch(es) on origin were never fetched ({shown}): "
+                "a branch nobody fetched cannot testify, and exposure on it is still "
+                "exposure"
+            )
     return reasons, notes
 
 

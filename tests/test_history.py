@@ -1039,6 +1039,88 @@ class TestPrecedenceAndDiagnostics:
         assert finding.verdict is Verdict.INDETERMINATE
         assert any("unreadable" in w for w in finding.warnings), finding.warnings
 
+    def origin_with_two_branches(self, tmp_path, name):
+        """A bare origin holding `main` and `release/1.x`, the #27 shape's remote."""
+        origin = tmp_path / f"{name}-origin.git"
+        git(tmp_path, "init", "-q", "--bare", str(origin))
+        work = self.fresh(tmp_path, f"{name}-work")
+        self.write(work, "package-lock.json", lock_json(None),
+                   "2025-11-20T10:00:00+00:00")
+        git(work, "branch", "-M", "main")
+        git(work, "remote", "add", "origin", str(origin))
+        git(work, "push", "-q", "origin", "main")
+        git(work, "checkout", "-qb", "release/1.x")
+        self.write(work, "package-lock.json", lock_json("5.6.1"),
+                   "2025-11-25T10:00:00+00:00")
+        git(work, "push", "-q", "origin", "release/1.x")
+        git(origin, "symbolic-ref", "HEAD", "refs/heads/main")
+        return origin
+
+    def test_a_one_branch_fetch_is_named_by_asking_the_remote(self, tmp_path):
+        """#27: `git init` + `fetch origin main` kept the wildcard refspec, was not
+        shallow and had no promisor, so every local check passed and the repository
+        was cleared at exit 0 — with the exposing pin sitting on a branch nobody
+        fetched. Only the remote's own ref list settles it.
+        """
+        from deptrail.history import incomplete_history
+        origin = self.origin_with_two_branches(tmp_path, "onebranch")
+        repo = self.fresh(tmp_path, "onebranch-clone")
+        git(repo, "remote", "add", "origin", str(origin))
+        git(repo, "fetch", "-q", "origin", "main")
+        git(repo, "checkout", "-qb", "main", "FETCH_HEAD")
+        reasons, _ = incomplete_history(repo)
+        assert any("release/1.x" in r for r in reasons), reasons
+        assert scan_repo(repo, WINDOW).verdict is Verdict.INDETERMINATE
+
+    def test_a_checkout_that_fetched_every_head_is_not_penalised(self, tmp_path):
+        """The shape that makes the local signals useless: `actions/checkout` with
+        `fetch-depth: 0` is `init` plus a wildcard `fetch`, so it holds every branch
+        while leaving no `origin/HEAD` and the same wildcard refspec as the case
+        above. Penalising it would refuse an all-clear for the recommended CI
+        configuration.
+        """
+        from deptrail.history import incomplete_history
+        origin = self.origin_with_two_branches(tmp_path, "ciwide")
+        repo = self.fresh(tmp_path, "ciwide-clone")
+        git(repo, "remote", "add", "origin", str(origin))
+        git(repo, "fetch", "-q", "--no-tags", "--prune", "origin",
+            "+refs/heads/*:refs/remotes/origin/*")
+        git(repo, "checkout", "-qb", "main", "origin/main")
+        assert incomplete_history(repo) == ([], [])
+        # And it still sees the exposure the one-branch fetch could not.
+        assert scan_repo(repo, WINDOW).verdict is Verdict.EXPOSED
+
+    def test_a_branch_fetched_under_another_name_is_not_called_missing(self, tmp_path):
+        """Coverage is about what the walk can reach, not what the refs are called:
+        a branch fetched into a ref of a different name is still walked, so naming it
+        missing would be a reason with no cost behind it.
+        """
+        from deptrail.history import incomplete_history
+        origin = self.origin_with_two_branches(tmp_path, "renamed")
+        repo = self.fresh(tmp_path, "renamed-clone")
+        git(repo, "remote", "add", "origin", str(origin))
+        git(repo, "fetch", "-q", "origin",
+            "+refs/heads/main:refs/remotes/origin/main",
+            "+refs/heads/release/1.x:refs/remotes/origin/kept-under-another-name")
+        git(repo, "checkout", "-qb", "main", "origin/main")
+        assert incomplete_history(repo)[0] == []
+
+    def test_an_unreachable_remote_is_an_observation_and_not_a_reason(self, tmp_path):
+        """A remote that cannot be reached leaves coverage unverified, which is worth
+        saying and is not evidence of anything: refusing every offline scan its
+        all-clear would cry wolf at complete clones, so the exit code is unchanged
+        and the report carries the note.
+        """
+        from deptrail.history import incomplete_history
+        repo = self.fresh(tmp_path, "unreachable")
+        self.write(repo, "package-lock.json", lock_json("5.6.0"),
+                   "2025-11-25T10:00:00+00:00")
+        git(repo, "remote", "add", "origin", str(tmp_path / "gone-for-good.git"))
+        reasons, notes = incomplete_history(repo)
+        assert reasons == []
+        assert any("ref coverage was not verified" in n for n in notes), notes
+        assert scan_repo(repo, WINDOW).verdict is Verdict.CLEAN
+
     def test_a_full_clone_is_not_called_truncated(self, tmp_path):
         # The control: a wildcard refspec and no promisor must stay clean, or the
         # checks above would just be a way of never clearing anything.
