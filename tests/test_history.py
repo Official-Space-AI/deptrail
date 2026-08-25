@@ -1634,6 +1634,38 @@ class TestPrecedenceAndDiagnostics:
         finally:
             server.shutdown()
 
+    def test_the_action_token_reaches_only_the_named_github_url(self, tmp_path,
+                                                                monkeypatch):
+        """In the shipped Action the token arrives as `GH_TOKEN`, which git does not
+        read, while `actions/checkout` leaves its own credential in the config of
+        the repository being scanned — the one config this probe refuses to read.
+        Without carrying it the check goes unauthenticated on a private repository,
+        which is where it was needed. It goes nowhere else, and never into argv,
+        which `ps` can read.
+        """
+        from deptrail import history
+        monkeypatch.setenv("GH_TOKEN", "ghs_TESTTOKEN")
+        assert history._github_authorization("https://github.com/o/r.git")
+        assert history._github_authorization("https://evil.example/o/r.git") is None
+        monkeypatch.delenv("GH_TOKEN")
+        assert history._github_authorization("https://github.com/o/r.git") is None
+
+        monkeypatch.setenv("GH_TOKEN", "ghs_TESTTOKEN")
+        monkeypatch.setenv("GIT_ALLOW_PROTOCOL", "https")
+        seen: list[list[str]] = []
+        real = history.subprocess.run
+
+        def record(args, **kwargs):
+            if isinstance(args, list):
+                seen.append(args)
+            return real(args, **kwargs)
+
+        monkeypatch.setattr(history.subprocess, "run", record)
+        repo = self.fresh(tmp_path, "action-token")
+        history._remote_heads(repo, "origin",
+                              trusted_url="https://github.com/o/r.git")
+        assert not any("ghs_TESTTOKEN" in part for args in seen for part in args)
+
     def test_a_url_the_operator_named_is_asked_as_the_operator(self, tmp_path,
                                                                monkeypatch):
         """Carrying a credential was never the danger — carrying one to an address a

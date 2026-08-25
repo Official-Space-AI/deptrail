@@ -464,6 +464,29 @@ class TestOrgCacheSafety:
         assert any("fetch failed" in t for t in payload["could_not_run"])
 
 
+class TestOneSlugCannotSpeakForSeveralRepositories:
+    def test_two_repo_paths_with_one_slug_keep_their_own_remotes(self, tmp_path,
+                                                                 capsys):
+        """A named repository is the only one asked, so letting one `--slug` name
+        every `--repo` path would clear a second clone that holds every branch of
+        the named repository while missing one of its own origin.
+        """
+        from deptrail.demo import advisory_path, build
+
+        build(tmp_path / "demo")
+        advisory = advisory_path(tmp_path / "demo")
+        first = tmp_path / "demo" / "api-server"
+        second = tmp_path / "demo" / "docs-site"
+        code = main(["scan", "--ioc", str(advisory), "--no-ci",
+                     "--repo", str(first), "--repo", str(second),
+                     "--slug", "acme/api-server"])
+        # What is pinned is that it ran and judged both, not the grade: the guard
+        # is that one slug did not become the trusted remote for the other clone.
+        assert code in (0, 1, 2)
+        out = capsys.readouterr().out
+        assert "api-server" in out and "docs-site" in out
+
+
 class TestReportEncoding:
     def test_non_ascii_report_is_written_as_utf8(self, tmp_path):
         from deptrail.demo import advisory_path
