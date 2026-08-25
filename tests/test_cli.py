@@ -465,9 +465,10 @@ class TestOrgCacheSafety:
 
 
 class TestNoCiMeansNoToken:
-    def test_no_ci_does_not_take_the_authenticated_path(self, tmp_path):
-        """`--no-ci` is documented as "no token needed", so it must not be the run
-        that hands a credential to the network.
+    def test_no_ci_withholds_the_token_and_not_the_check(self, tmp_path):
+        """`--no-ci` is documented as "no token needed". Reading that as "no check"
+        turned the same clone from exit 2 into exit 0 on the flag alone, with
+        nothing in the report to say the check had been skipped.
         """
         from deptrail.demo import advisory_path, build
 
@@ -477,9 +478,9 @@ class TestNoCiMeansNoToken:
         import deptrail.org as org
         original = org.scan_repo
 
-        def record(repo, query, cache=None, trusted_url=None):
-            asked.append(trusted_url)
-            return original(repo, query, cache, trusted_url)
+        def record(repo, query, cache=None, trusted_url=None, authenticate=True):
+            asked.append((trusted_url, authenticate))
+            return original(repo, query, cache, trusted_url, authenticate)
 
         org.scan_repo = record
         try:
@@ -487,7 +488,10 @@ class TestNoCiMeansNoToken:
                   "--repo", str(tmp_path / "demo" / "api-server")])
         finally:
             org.scan_repo = original
-        assert asked and all(url is None for url in asked), asked
+        # The check still runs against the address the operator named; what the
+        # flag withholds is the credential.
+        assert asked and all(url is not None for url, _ in asked), asked
+        assert all(auth is False for _, auth in asked), asked
 
 
 class TestOneSlugCannotSpeakForSeveralRepositories:

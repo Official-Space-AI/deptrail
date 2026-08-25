@@ -1634,6 +1634,79 @@ class TestPrecedenceAndDiagnostics:
         finally:
             server.shutdown()
 
+    def test_a_token_is_written_for_a_named_address_and_never_asked_for(
+            self, tmp_path, monkeypatch):
+        """The probe holds one credential and only one: a token written into its own
+        config for an address the operator named. Letting a credential *helper*
+        answer instead meant that a stale token drew a 401, git asked the helper,
+        git then ran `credential erase`, and a read-only scan deleted the operator's
+        saved GitHub login — from an ordinary run, and from `pytest` with every test
+        green.
+        """
+        from deptrail import history
+        origin = self.origin_with_two_branches(tmp_path, "written-token")
+        repo = self.fresh(tmp_path, "written-token-clone")
+        monkeypatch.setattr(history, "_github_authorization",
+                            lambda url: "Authorization: Basic PRETEND")
+        seen: list[str] = []
+        real = history.subprocess.Popen
+
+        class Spy(real):
+            def __init__(self, args, **kwargs):
+                if isinstance(args, list) and "ls-remote" in args:
+                    probe = args[args.index("-C") + 1]
+                    seen.append((Path(probe) / ".git" / "config").read_text())
+                super().__init__(args, **kwargs)
+
+        monkeypatch.setattr(history.subprocess, "Popen", Spy)
+        heads = history._remote_heads(repo, "origin", trusted_url=str(origin))
+        assert heads is not None and "release/1.x" in heads, heads
+        assert "Authorization: Basic PRETEND" in seen[0], seen[0]
+        # No helper may run: that is the path that erases.
+        assert "helper =" in seen[0], seen[0]
+
+    def test_no_token_is_written_when_the_caller_says_not_to_authenticate(
+            self, tmp_path, monkeypatch):
+        """`--no-ci` withholds the token. It does not withhold the check: doing that
+        made the same clone exit 2 without the flag and 0 with it, with nothing in
+        the report to say why.
+        """
+        from deptrail import history
+        origin = self.origin_with_two_branches(tmp_path, "unauth")
+        repo = self.fresh(tmp_path, "unauth-clone")
+        monkeypatch.setattr(history, "_github_authorization",
+                            lambda url: "Authorization: Basic PRETEND")
+        seen: list[str] = []
+        real = history.subprocess.Popen
+
+        class Spy(real):
+            def __init__(self, args, **kwargs):
+                if isinstance(args, list) and "ls-remote" in args:
+                    probe = args[args.index("-C") + 1]
+                    seen.append((Path(probe) / ".git" / "config").read_text())
+                super().__init__(args, **kwargs)
+
+        monkeypatch.setattr(history.subprocess, "Popen", Spy)
+        heads = history._remote_heads(repo, "origin", trusted_url=str(origin),
+                                      authenticate=False)
+        assert heads is not None, "the named address is still asked"
+        assert "PRETEND" not in seen[0], seen[0]
+
+    def test_a_token_is_only_for_github_and_only_when_one_exists(self,
+                                                                 monkeypatch):
+        """The header is built for the operator's own forge and for nothing else,
+        and `gh auth token` stands in when the environment has none — the same tool
+        the scan already reads CI runs through.
+        """
+        from deptrail import history
+        monkeypatch.setenv("GH_TOKEN", "ghs_TESTTOKEN")
+        assert history._github_authorization("https://github.com/o/r.git")
+        assert history._github_authorization("https://evil.example/o/r.git") is None
+        monkeypatch.delenv("GH_TOKEN")
+        monkeypatch.setattr(history.subprocess, "run",
+                            lambda *a, **k: subprocess.CompletedProcess(a, 1, "", ""))
+        assert history._github_authorization("https://github.com/o/r.git") is None
+
     def test_the_token_is_not_attached_to_an_address_the_repository_chose(
             self, tmp_path, monkeypatch):
         """Keyed on the URL alone, a scan with `GH_TOKEN` in its environment — every
@@ -1720,63 +1793,6 @@ class TestPrecedenceAndDiagnostics:
         reason, _ = _ref_coverage(repo, None, str(origin))
         assert reason and reason.count("release/1.x") == 1, reason
         assert reason.startswith("1 branch(es)"), reason
-
-    def test_the_action_token_reaches_only_the_named_github_url(self, tmp_path,
-                                                                monkeypatch):
-        """In the shipped Action the token arrives as `GH_TOKEN`, which git does not
-        read, while `actions/checkout` leaves its own credential in the config of
-        the repository being scanned — the one config this probe refuses to read.
-        Without carrying it the check goes unauthenticated on a private repository,
-        which is where it was needed. It goes nowhere else, and never into argv,
-        which `ps` can read.
-        """
-        from deptrail import history
-        monkeypatch.setenv("GH_TOKEN", "ghs_TESTTOKEN")
-        assert history._github_authorization("https://github.com/o/r.git")
-        assert history._github_authorization("https://evil.example/o/r.git") is None
-        monkeypatch.delenv("GH_TOKEN")
-        assert history._github_authorization("https://github.com/o/r.git") is None
-
-        monkeypatch.setenv("GH_TOKEN", "ghs_TESTTOKEN")
-        monkeypatch.setenv("GIT_ALLOW_PROTOCOL", "https")
-        seen: list[list[str]] = []
-        real = history.subprocess.run
-
-        def record(args, **kwargs):
-            if isinstance(args, list):
-                seen.append(args)
-            return real(args, **kwargs)
-
-        monkeypatch.setattr(history.subprocess, "run", record)
-        repo = self.fresh(tmp_path, "action-token")
-        history._remote_heads(repo, "origin",
-                              trusted_url="https://github.com/o/r.git")
-        assert not any("ghs_TESTTOKEN" in part for args in seen for part in args)
-
-    def test_a_url_the_operator_named_is_asked_as_the_operator(self, tmp_path,
-                                                               monkeypatch):
-        """Carrying a credential was never the danger — carrying one to an address a
-        possibly compromised checkout chose was. When the operator names the
-        repository (`--org` builds the URL, `--slug` is typed), nothing about where
-        the query goes came from the repository, so their own config goes with it
-        and a private remote can answer at last.
-
-        The clone here points nowhere: only the operator's environment makes the
-        address resolve, so the heads coming back prove whose config was read. The
-        other half of the rule — that a repository-chosen address is asked as
-        nobody — is pinned by
-        `test_config_injected_by_the_environment_is_not_carried`.
-        """
-        from deptrail.history import _remote_heads
-        origin = self.origin_with_two_branches(tmp_path, "trusted")
-        repo = self.fresh(tmp_path, "trusted-clone")
-        monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
-        monkeypatch.setenv("GIT_CONFIG_KEY_0", f"url.{origin}.insteadOf")
-        monkeypatch.setenv("GIT_CONFIG_VALUE_0", "https://private.invalid/x.git")
-        monkeypatch.setenv("GIT_ALLOW_PROTOCOL", "https:file")
-        heads = _remote_heads(repo, "origin",
-                              trusted_url="https://private.invalid/x.git")
-        assert heads is not None and "release/1.x" in heads, heads
 
     def test_config_injected_by_the_environment_is_not_carried(self, tmp_path,
                                                                monkeypatch):

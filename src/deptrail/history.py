@@ -505,13 +505,21 @@ def _github_authorization(url: str) -> str | None:
         return None
     token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
     if not token:
+        # The same tool the scan already reads CI runs and secret names through, so
+        # it is the operator's own login and nothing new is being asked of them.
+        asked = subprocess.run(["gh", "auth", "token"], capture_output=True,
+                               text=True, check=False, timeout=LS_REMOTE_TIMEOUT,
+                               env=_git_env())
+        token = asked.stdout.strip() if asked.returncode == 0 else ""
+    if not token:
         return None
     pair = base64.b64encode(f"x-access-token:{token}".encode()).decode()
     return f"Authorization: Basic {pair}"
 
 
 def _remote_heads(repo: Path, remote: str = "origin", *,
-                  trusted_url: str | None = None) -> dict[str, str] | None:
+                  trusted_url: str | None = None,
+                  authenticate: bool = True) -> dict[str, str] | None:
     """The remote's branch names and tips, or ``None`` when it could not be asked.
 
     The repository under investigation may be the compromised one, so its
@@ -565,12 +573,11 @@ def _remote_heads(repo: Path, remote: str = "origin", *,
         # `HOME` at the empty probe says the same thing to every git that has ever
         # looked there — belt and braces, because a version that quietly ignored the
         # first pair would read the operator's credentials and never say so.
-        if trusted_url is None:
-            env = _without_injected_config(env)
-            env["GIT_CONFIG_GLOBAL"] = os.devnull
-            env["GIT_CONFIG_SYSTEM"] = os.devnull
-            env["GIT_CONFIG_NOSYSTEM"] = "1"
-            env["HOME"] = env["XDG_CONFIG_HOME"] = env["USERPROFILE"] = probe
+        env = _without_injected_config(env)
+        env["GIT_CONFIG_GLOBAL"] = os.devnull
+        env["GIT_CONFIG_SYSTEM"] = os.devnull
+        env["GIT_CONFIG_NOSYSTEM"] = "1"
+        env["HOME"] = env["XDG_CONFIG_HOME"] = env["USERPROFILE"] = probe
         started = subprocess.run(["git", "init", "-q", probe], env=env,
                                  capture_output=True, text=True, check=False)
         if started.returncode != 0:
@@ -595,8 +602,16 @@ def _remote_heads(repo: Path, remote: str = "origin", *,
         # with GH_TOKEN in its environment -- which is every Action, and `--no-ci`
         # among them -- attached the token to a github.com URL read from the
         # checkout's own config, which is an address the repository chose.
-        if trusted_url and (header := _github_authorization(url)) is not None:
-            settings += f'[http "{url}"]\n\textraHeader = "{header}"\n'
+        if trusted_url and authenticate:
+            if (header := _github_authorization(url)) is not None:
+                quoted_url = url.replace("\\", "\\\\").replace('"', '\\"')
+                settings += (f'[http "{quoted_url}"]\n\textraHeader = "{header}"\n')
+        # Never a credential helper. Letting one answer meant that when the token
+        # was stale GitHub replied 401, git asked the helper, git then ran
+        # `credential erase`, and a read-only scan deleted the operator's saved
+        # GitHub login -- from an ordinary run, and from `pytest` with every test
+        # green. The token below is the only credential this probe may hold.
+        settings += "[credential]\n\thelper = \n"
         config.write_text(config.read_text() + settings)
         # The advertisement lands in a file, not in this process: the timeout bounds
         # how long a hostile endpoint may talk, and nothing bounded how much, so a
@@ -739,7 +754,7 @@ def _heads_not_here(repo: Path, heads: dict[str, str]) -> list[str]:
 def incomplete_history(repo: Path,
                        coverage_cache: dict[str, tuple[str | None, str | None]]
                        | None = None,
-                       trusted_url: str | None = None,
+                       trusted_url: str | None = None, authenticate: bool = True,
                        ) -> tuple[list[str], list[str]]:
     """How much less this clone holds than the repository does, and what that costs.
 
@@ -792,7 +807,7 @@ def incomplete_history(repo: Path,
                 "demand; any that could not be read are listed as unreadable "
                 "snapshots"
             )
-    reason, note = _ref_coverage(repo, coverage_cache, trusted_url)
+    reason, note = _ref_coverage(repo, coverage_cache, trusted_url, authenticate)
     if reason:
         reasons.append(reason)
     if note:
@@ -802,7 +817,7 @@ def incomplete_history(repo: Path,
 
 def _ref_coverage(repo: Path,
                   cache: dict[str, tuple[str | None, str | None]] | None = None,
-                  trusted_url: str | None = None,
+                  trusted_url: str | None = None, authenticate: bool = True,
                   ) -> tuple[str | None, str | None]:
     """What the remotes' branch lists say about this clone: (reason, observation).
 
@@ -834,7 +849,8 @@ def _ref_coverage(repo: Path,
         asked.insert(0, (None, trusted_url))
     for remote, url in asked:
         try:
-            heads = _remote_heads(repo, remote or "origin", trusted_url=url)
+            heads = _remote_heads(repo, remote or "origin", trusted_url=url,
+                                  authenticate=authenticate)
         except (OSError, subprocess.SubprocessError):
             heads = None
         label = remote or "the repository you named"
@@ -1222,7 +1238,8 @@ def _scan_ref_chain(repo: Path, path: str, ref: str, chain: list[Commit],
 
 def scan_repo(repo: Path, query: WindowQuery,
               coverage_cache: dict[str, tuple[str | None, str | None]]
-              | None = None, trusted_url: str | None = None) -> RepoFinding:
+              | None = None, trusted_url: str | None = None,
+              authenticate: bool = True) -> RepoFinding:
     """Judge one repository across every ref; see the module docstring for the model.
 
     ``coverage_cache`` lets a caller that asks the same repository about many
@@ -1231,7 +1248,8 @@ def scan_repo(repo: Path, query: WindowQuery,
     finding = RepoFinding(repo=repo)
     warned: set[str] = set()
     try:
-        truncated, observed = incomplete_history(repo, coverage_cache, trusted_url)
+        truncated, observed = incomplete_history(repo, coverage_cache, trusted_url,
+                                                 authenticate)
         finding.incomplete.extend(truncated)
         finding.diagnostics.extend(observed)
         paths, foreign = discovered_lockfiles(repo)

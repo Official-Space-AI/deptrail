@@ -626,7 +626,7 @@ def scan_organization(repos: Iterable[tuple[str, Path]], plan: QueryPlan, *,
                       runs: RunsProvider, secrets: SecretsProvider | None = None,
                       allow_incomplete: bool = False,
                       remote_url: Callable[[str], str | None] | None = None,
-                      ) -> OrgReport:
+                      authenticate: bool = True) -> OrgReport:
     """Judge every repository against every package the advisory names.
 
     ``repos`` are (name, local clone path) pairs; ``runs`` and ``secrets`` are
@@ -660,7 +660,8 @@ def scan_organization(repos: Iterable[tuple[str, Path]], plan: QueryPlan, *,
             query = entry.query
             try:
                 finding = scan_repo(path, query, coverage_cache,
-                                    remote_url(name) if remote_url else None)
+                                    remote_url(name) if remote_url else None,
+                                    authenticate)
             except Exception as e:  # a failed repo must be visible, not silent
                 _record_failure(report, f"{name} ({query.package})", e)
                 continue
