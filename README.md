@@ -173,9 +173,12 @@ it when the scan knows which GitHub repository a clone is — `--org`, or
 `--repo` with `--slug` — and `--no-ci` is absent. A `--repo` scan with no
 `--slug` calls nothing and says so: the report marks CI evidence uncollected
 rather than silently assuming it. `--no-ci` withholds the token, not the
-checks, and on a **private** repository that is a difference you will see: the
-branch-coverage query is refused without a credential, and a scan that could
-not list the branches reports incomplete rather than clean. Install `gh` and run `gh auth login`
+checks, and where the scan knows which GitHub repository it is looking at —
+`--org`, or one `--repo` with `--slug` — and that repository is **private**,
+that is a difference you will see: the branch-coverage query is refused
+without a credential, and a scan that could not list the branches reports
+incomplete rather than clean. A `--repo` scan with no `--slug` has no address
+it can authenticate to, so there the same silence is only a caveat. Install `gh` and run `gh auth login`
 **before** incident day — `pip install` cannot do it for you, and a machine
 without it fails at the first API call, which is the worst moment to discover
 a prerequisite.
