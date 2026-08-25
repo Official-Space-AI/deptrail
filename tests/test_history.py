@@ -1718,10 +1718,10 @@ class TestPrecedenceAndDiagnostics:
         # the fallback instead — measured, deleting the GITHUB_TOKEN lookup
         # altogether left this test passing and the whole suite green. Its other job
         # is that the real token never reaches an assertion message.
-        called: list[list[str]] = []
+        called: list[tuple[list[str], dict]] = []
         monkeypatch.setattr(
             history.subprocess, "run",
-            lambda *a, **k: (called.append(a[0])
+            lambda *a, **k: (called.append((a[0], k.get("env") or {}))
                              or subprocess.CompletedProcess(a, 1, "", "")))
         monkeypatch.setenv("GH_TOKEN", "ghs_TESTTOKEN")
         assert history._github_authorization("https://github.com/o/r.git")
@@ -1741,16 +1741,25 @@ class TestPrecedenceAndDiagnostics:
         for name, value in (("GH_HOST", "ghe.example.com"),
                             ("GITHUB_SERVER_URL", "https://ghe.example.com")):
             monkeypatch.setenv(name, value)
+            called.clear()
             assert history._github_authorization("https://github.com/o/r.git") is None
+            # Refusing the variable is not enough while the fallback can read it
+            # back: measured, `GH_TOKEN=X GH_HOST=ghe gh auth token --hostname
+            # github.com` prints X, so `gh` handed back the exact credential
+            # refused above — the Action's own token, and on a GHES runner that
+            # instance's.
+            assert called, "the fallback was never reached"
+            _argv, env = called[0]
+            assert "GH_TOKEN" not in env and "GITHUB_TOKEN" not in env, sorted(env)
             monkeypatch.delenv(name)
         monkeypatch.delenv("GITHUB_TOKEN")
         called.clear()
         assert history._github_authorization("https://github.com/o/r.git") is None
         # Pinned to the host it will be sent to: `gh auth token` answers for
         # whatever `GH_HOST` names, so an operator logged in to a GitHub Enterprise
-        # instance had that instance's credential handed to github.com.
-        assert called and called[0] == ["gh", "auth", "token",
-                                        "--hostname", "github.com"], called
+        # instance had that instance's stored credential handed to github.com.
+        assert called and called[0][0] == ["gh", "auth", "token",
+                                           "--hostname", "github.com"], called
 
     def test_the_token_is_not_attached_to_an_address_the_repository_chose(
             self, tmp_path, monkeypatch):
