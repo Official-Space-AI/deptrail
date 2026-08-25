@@ -1334,7 +1334,10 @@ class TestPrecedenceAndDiagnostics:
         secret = "https://x-access-token:s3cr3t-token@example.invalid/x.git"
         repo = self.fresh(tmp_path, "tokened")
         git(repo, "remote", "add", "origin", secret)
-        assert history._remote_url(repo, "origin") == "https://example.invalid/x.git"
+        # The username survives — `ssh://git@github.com/...` needs its `git`, and a
+        # username is not a secret. The password is the part that is not carried.
+        assert (history._remote_url(repo, "origin")
+                == "https://x-access-token@example.invalid/x.git")
         seen: list[list[str]] = []
         real = history.subprocess.run
 
@@ -1490,6 +1493,88 @@ class TestPrecedenceAndDiagnostics:
         reasons, _ = incomplete_history(repo)
         assert any("single-branch clone" in r for r in reasons), reasons
         assert any("release/1.x" in r for r in reasons), reasons
+
+    def test_a_fork_checkout_is_judged_against_the_remote_it_came_from(self, tmp_path):
+        """`branch.<name>.remote` records where a branch *pulls from*, not where the
+        clone came from. Asking it first meant a fork checkout — `origin` the fork,
+        `upstream` the canonical repository — had every check pointed at upstream,
+        and origin's own unfetched branches stopped being looked at.
+        """
+        from deptrail.history import _clone_remote
+        origin = self.origin_with_two_branches(tmp_path, "fork")
+        repo = self.fresh(tmp_path, "fork-clone")
+        git(repo, "remote", "add", "origin", str(origin))
+        git(repo, "remote", "add", "upstream", str(origin))
+        git(repo, "fetch", "-q", "origin", "main")
+        git(repo, "checkout", "-qb", "main", "FETCH_HEAD")
+        git(repo, "config", "branch.main.remote", "upstream")
+        assert _clone_remote(repo) == "origin"
+
+    def test_a_network_url_is_not_resolved_against_the_checkout(self, tmp_path):
+        """`repo / url` turned `https://host/repo.git` into the candidate path
+        `<checkout>/https:/host/repo.git`. A compromised checkout can ship a bare
+        repository there advertising exactly the branches already held, and the
+        probe would have asked the decoy it was handed.
+        """
+        from deptrail.history import _remote_url
+        origin = self.origin_with_two_branches(tmp_path, "decoy")
+        repo = self.fresh(tmp_path, "decoy-clone")
+        decoy = repo / "https:/host"
+        decoy.mkdir(parents=True)
+        git(tmp_path, "clone", "-q", "--bare", str(origin), str(decoy / "repo.git"))
+        git(repo, "remote", "add", "origin", "https://host/repo.git")
+        assert _remote_url(repo, "origin") == "https://host/repo.git"
+
+    def test_an_ssh_username_is_kept_because_it_is_not_a_credential(self, tmp_path):
+        """`ssh://git@github.com/...` needs its `git`. Dropping it probed as whatever
+        OS user the responder happens to be, so a reachable remote came back
+        unreachable and its unfetched branches became a caveat instead of a reason.
+        """
+        from deptrail.history import _remote_url
+        repo = self.fresh(tmp_path, "sshuser")
+        git(repo, "remote", "add", "origin", "ssh://git@github.com/o/r.git")
+        assert _remote_url(repo, "origin") == "ssh://git@github.com/o/r.git"
+
+    def test_an_ambient_token_is_not_sent_to_the_remote_the_clone_names(
+            self, tmp_path, monkeypatch):
+        """The URL comes from a repository this code treats as hostile, and an
+        unscoped `http.extraHeader` in the operator's own global config is sent to
+        whatever host that URL names — measured, a bearer token reaching a server
+        the scanned checkout chose.
+        """
+        import http.server
+        import threading
+        from deptrail.history import _remote_heads
+
+        seen: list[str | None] = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                seen.append(self.headers.get("Authorization"))
+                self.send_response(404)
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+
+        home = tmp_path / "home"
+        home.mkdir()
+        (home / ".gitconfig").write_text(
+            "[http]\n\textraHeader = Authorization: Bearer LEAKME\n")
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("GIT_ALLOW_PROTOCOL", "http")
+        repo = self.fresh(tmp_path, "ambient")
+        git(repo, "remote", "add", "origin",
+            f"http://127.0.0.1:{server.server_address[1]}/x.git")
+        try:
+            assert _remote_heads(repo, "origin") is None
+            assert seen, "the probe never reached the server"
+            assert seen[0] is None, seen
+        finally:
+            server.shutdown()
 
     def test_a_rewritten_remote_is_asked_where_the_clone_actually_fetched(
             self, tmp_path):

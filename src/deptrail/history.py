@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import os
 import posixpath
+import re
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
@@ -309,6 +310,8 @@ LS_REMOTE_TIMEOUT = 10.0
 # that turns it back on is config the scanned repository carries. Named here so an
 # operator can narrow it further from the environment, which wins.
 REMOTE_PROTOCOLS = "https:http:git:ssh:file"
+# `user@host:path`, git's scp-like remote spelling: a remote, never a local path.
+_SCP_LIKE = re.compile(r"^[^/:]+(@[^/:]+)?:(?!//)")
 # Variables that name a repository. Inherited, they outrank both the directory the
 # query runs in and any ceiling set for it — a scan launched from a git hook, whose
 # GIT_DIR points at the very clone under investigation, had the isolation below
@@ -329,20 +332,24 @@ def _clone_remote(repo: Path) -> str | None:
     ref coverage. A single-branch checkout of a repository whose other branch held
     the pin went from exit 2 to exit 0 on that alone.
 
-    The current branch's own remote is the most direct answer; ``origin`` settles
-    the ordinary case; and a lone remote can only be the one. Several remotes with
-    no upstream branch and no ``origin`` is genuinely ambiguous — a fork checkout is
-    the usual shape — and the caller says so rather than picking.
+``origin`` settles the ordinary case and is asked first: the branch's own remote
+    records where it *pulls from*, not where the clone came from, and in a fork
+    checkout — ``origin`` the fork, ``upstream`` the canonical repository — taking
+    the branch's answer would have skipped every check against the remote this
+    clone actually is. A lone remote can only be the one. Anything else is
+    genuinely ambiguous, and the caller says so rather than picking.
     """
-    branch = _local_git(repo, ["rev-parse", "--abbrev-ref", "HEAD"], "").stdout.strip()
-    if branch and branch != "HEAD":
-        named = _config(repo, f"branch.{branch}.remote")
-        if named and named != ".":
-            return named.splitlines()[0]
     remotes = _local_git(repo, ["remote"], "").stdout.split()
     if "origin" in remotes:
         return "origin"
-    return remotes[0] if len(remotes) == 1 else None
+    if len(remotes) == 1:
+        return remotes[0]
+    branch = _local_git(repo, ["rev-parse", "--abbrev-ref", "HEAD"], "").stdout.strip()
+    if branch and branch != "HEAD":
+        named = _config(repo, f"branch.{branch}.remote")
+        if named and named != "." and named.splitlines()[0] in remotes:
+            return named.splitlines()[0]
+    return None
 
 
 def _remote_url(repo: Path, remote: str) -> str | None:
@@ -365,9 +372,15 @@ def _remote_url(repo: Path, remote: str) -> str | None:
     # written on, which is the one way a URL could become a setting.
     if not url or url.startswith("-") or any(c < " " or c == "\x7f" for c in url):
         return None
-    local = repo / url
-    if local.exists():
-        return str(local.resolve())
+    # Only something git would read as a local path may be resolved against the
+    # clone. Without the check, `https://host/repo.git` became the candidate path
+    # `<checkout>/https:/host/repo.git`, and a checkout carrying a bare repository
+    # there — one advertising exactly the branches already held — had its real
+    # remote's missing branches cleared by a decoy it shipped itself.
+    if "://" not in url and not _SCP_LIKE.match(url):
+        local = repo / url
+        if local.exists():
+            return str(local.resolve())
     return _without_userinfo(url)
 
 
@@ -384,11 +397,15 @@ def _without_userinfo(url: str) -> str:
     is the honest outcome and not a token this tool handed to a child process.
     """
     scheme, separator, rest = url.partition("://")
-    if not separator or "@" not in rest.split("/", 1)[0]:
+    authority, slash, tail = rest.partition("/")
+    userinfo, at, host = authority.rpartition("@")
+    # A username is not a credential — `ssh://git@github.com/...` needs its `git`,
+    # and dropping it probed as whatever OS user the responder happens to be, so a
+    # real remote came back unreachable and its unfetched branches became a caveat
+    # instead of a reason. A password is the part worth refusing to carry.
+    if not separator or not at or ":" not in userinfo:
         return url
-    authority, _, tail = rest.partition("/")
-    host = authority.rpartition("@")[2]
-    return f"{scheme}://{host}" + (f"/{tail}" if tail else "")
+    return f"{scheme}://{userinfo.partition(':')[0]}@{host}{slash}{tail}"
 
 
 def _remote_heads(repo: Path, remote: str = "origin") -> dict[str, str] | None:
@@ -443,7 +460,14 @@ def _remote_heads(repo: Path, remote: str = "origin") -> dict[str, str] | None:
         config.write_text(
             f'{config.read_text()}[remote "origin"]\n\turl = "{quoted}"\n')
         result = subprocess.run(
-            ["git", "-C", probe, "ls-remote", "--heads", "origin"],
+            # The URL comes from a repository this code treats as hostile, and an
+            # unscoped `http.extraHeader` in the operator's own global config is
+            # sent to whatever host that URL names — measured, a bearer token
+            # reaching a server the scanned checkout chose. Credential helpers stay:
+            # they answer per host, so a remote the operator has no credential for
+            # simply comes back unreachable.
+            ["git", "-C", probe, "-c", "http.extraHeader=",
+             "ls-remote", "--heads", "origin"],
             capture_output=True, text=True, encoding="utf-8",
             env=env, timeout=LS_REMOTE_TIMEOUT, check=False,
         )
