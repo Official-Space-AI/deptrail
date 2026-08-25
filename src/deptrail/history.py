@@ -309,6 +309,14 @@ LS_REMOTE_TIMEOUT = 10.0
 # that turns it back on is config the scanned repository carries. Named here so an
 # operator can narrow it further from the environment, which wins.
 REMOTE_PROTOCOLS = "https:http:git:ssh:file"
+# Variables that name a repository. Inherited, they outrank both the directory the
+# query runs in and any ceiling set for it — a scan launched from a git hook, whose
+# GIT_DIR points at the very clone under investigation, had the isolation below
+# undone and executed a command planted in that clone's config.
+GIT_LOCATION_VARS = frozenset({
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR", "GIT_NAMESPACE",
+})
 
 
 def _remote_url(repo: Path) -> str | None:
@@ -320,7 +328,9 @@ def _remote_url(repo: Path) -> str | None:
     """
     lines = _config(repo, "remote.origin.url").splitlines()
     url = lines[0].strip() if lines else ""
-    if not url or url.startswith("-"):
+    # A control character would let the value break out of the config line it is
+    # written on, which is the one way a URL could become a setting.
+    if not url or url.startswith("-") or any(c < " " or c == "\x7f" for c in url):
         return None
     local = repo / url
     return str(local.resolve()) if local.exists() else url
@@ -347,7 +357,6 @@ def _remote_heads(repo: Path) -> dict[str, str] | None:
     url = _remote_url(repo)
     if url is None:
         return None
-    neutral = tempfile.gettempdir()
     # An operator may narrow the transports; they may not widen them. `setdefault`
     # deferred to whatever was already in the environment, and a permissive value
     # there put `ext::` — which runs the command named in the URL, and the URL comes
@@ -355,24 +364,43 @@ def _remote_heads(repo: Path) -> dict[str, str] | None:
     allowed = set(REMOTE_PROTOCOLS.split(":"))
     if os.environ.get("GIT_ALLOW_PROTOCOL"):
         allowed &= set(os.environ["GIT_ALLOW_PROTOCOL"].split(":"))
-    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0",
-           "GIT_CEILING_DIRECTORIES": neutral,
-           "GIT_ALLOW_PROTOCOL": ":".join(sorted(allowed))}
-    result = subprocess.run(
-        ["git", "ls-remote", "--heads", url],
-        capture_output=True, text=True, encoding="utf-8", cwd=neutral,
-        env=env, timeout=LS_REMOTE_TIMEOUT, check=False,
-    )
+    env = {key: value for key, value in os.environ.items()
+           if key not in GIT_LOCATION_VARS}
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_ALLOW_PROTOCOL"] = ":".join(sorted(allowed))
+    with tempfile.TemporaryDirectory(prefix="deptrail-refs-") as probe:
+        started = subprocess.run(["git", "init", "-q", probe], env=env,
+                                 capture_output=True, text=True, check=False)
+        if started.returncode != 0:
+            return None
+        config = Path(probe) / ".git" / "config"
+        # The URL goes into a config file this code writes rather than onto a
+        # command line: a clone whose origin embeds a token — CI writes them that
+        # way — would otherwise show it to every `ps` on the machine for as long as
+        # the query runs. It is written last, so nothing follows it to be swallowed.
+        config.write_text(f'{config.read_text()}[remote "origin"]\n\turl = {url}\n')
+        result = subprocess.run(
+            ["git", "-C", probe, "ls-remote", "--heads", "origin"],
+            capture_output=True, text=True, encoding="utf-8",
+            env=env, timeout=LS_REMOTE_TIMEOUT, check=False,
+        )
     if result.returncode != 0:
         return None
-    heads = {}
+    heads: dict[str, str] = {}
     for line in result.stdout.splitlines():
         tip, _, ref = line.partition("\t")
-        # `--heads` still peels a branch that points at an annotated tag, and the
-        # `^{}` line names a ref that does not exist: reading it as a branch put a
-        # complete clone at exit 2 for a branch called `tagbranch^{}`.
-        if tip and ref.startswith("refs/heads/") and not ref.endswith("^{}"):
-            heads[ref[len("refs/heads/"):]] = tip
+        if not tip or not ref.startswith("refs/heads/"):
+            continue
+        name = ref[len("refs/heads/"):]
+        if name.endswith("^{}"):
+            # A branch pointing at an annotated tag advertises the tag object and
+            # then the commit it peels to. The commit is the one everything local is
+            # compared against: keeping the tag object instead, its id matched
+            # nothing and `rev-list` answered about the commit, so a branch the walk
+            # could not reach at all was read as covered.
+            heads[name[:-3]] = tip
+        else:
+            heads.setdefault(name, tip)
     return heads
 
 

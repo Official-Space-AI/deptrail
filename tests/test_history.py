@@ -1216,6 +1216,72 @@ class TestPrecedenceAndDiagnostics:
         self.rewind(tmp_path, origin, "release/1.x")
         assert incomplete_history(repo)[0] == []
 
+    def test_a_branch_pointing_at_an_annotated_tag_is_judged_by_its_commit(
+            self, tmp_path):
+        """`ls-remote` advertises such a branch twice: the tag object, then the
+        commit it peels to. Keeping the tag object made its id match nothing local
+        while `rev-list` answered about the commit — so a branch the walk cannot
+        reach at all came back covered.
+        """
+        from deptrail.history import _remote_heads, _heads_not_here
+        origin = self.origin_with_two_branches(tmp_path, "tagged")
+        work = tmp_path / "tagged-work"
+        git(work, "checkout", "-q", "-b", "aside")
+        self.write(work, "aside.md", "aside\n", "2025-11-26T10:00:00+00:00")
+        git(work, "tag", "-a", "atag", "-m", "annotated")
+        git(work, "push", "-q", "origin", "atag")
+        tag = subprocess.run(["git", "-C", str(work), "rev-parse", "atag"],
+                             check=True, capture_output=True, text=True).stdout.strip()
+        # Written by hand: git refuses to point a branch at a tag object itself.
+        (origin / "refs/heads/tagbranch").write_text(tag + "\n")
+
+        repo = self.fresh(tmp_path, "tagged-clone")
+        git(repo, "remote", "add", "origin", str(origin))
+        git(repo, "fetch", "-q", "origin", "main", "--tags")
+        git(repo, "checkout", "-qb", "main", "FETCH_HEAD")
+        heads = _remote_heads(repo)
+        # release/1.x is missing too, and honestly so — this clone fetched only main.
+        assert "tagbranch" in _heads_not_here(repo, heads), heads
+
+    def test_a_repository_named_by_the_environment_cannot_be_scanned_instead(
+            self, tmp_path, monkeypatch):
+        """`GIT_DIR` outranks both the directory a command runs in and any ceiling
+        set for it. Inherited from a scan launched inside a hook, it put the query
+        back in the repository under investigation, whose planted `core.sshCommand`
+        then ran.
+        """
+        from deptrail.history import _remote_heads
+        monkeypatch.delenv("GIT_ALLOW_PROTOCOL", raising=False)
+        marker = tmp_path / "ran-from-git-dir"
+        repo = self.fresh(tmp_path, "gitdir-hostile")
+        git(repo, "remote", "add", "origin", "ssh://git@example.invalid/x.git")
+        git(repo, "config", "core.sshCommand", f"touch {marker} ; false")
+        monkeypatch.setenv("GIT_DIR", str(repo / ".git"))
+        assert _remote_heads(repo) is None
+        assert not marker.exists()
+
+    def test_the_url_never_becomes_a_command_line_argument(self, tmp_path,
+                                                           monkeypatch):
+        """A clone written by CI can carry a token in its origin URL, and an argument
+        is visible to every `ps` on the machine while the query runs.
+        """
+        from deptrail import history
+        secret = "https://x-access-token:s3cr3t-token@example.invalid/x.git"
+        repo = self.fresh(tmp_path, "tokened")
+        git(repo, "remote", "add", "origin", secret)
+        seen: list[list[str]] = []
+        real = history.subprocess.run
+
+        def record(args, **kwargs):
+            if isinstance(args, list):
+                seen.append(args)
+            return real(args, **kwargs)
+
+        monkeypatch.setattr(history.subprocess, "run", record)
+        history._remote_heads(repo)
+        assert seen, "no command ran"
+        assert not any("s3cr3t-token" in part for args in seen for part in args), seen
+
     def test_a_permissive_environment_cannot_widen_the_transports(self, tmp_path,
                                                                   monkeypatch):
         """The allowlist is intersected with the environment, not defaulted to it: an
