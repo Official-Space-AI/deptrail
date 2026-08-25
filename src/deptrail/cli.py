@@ -398,8 +398,14 @@ def cmd_scan(args: argparse.Namespace) -> int:
 
     # Even when every repository was skipped, the report must carry why: dropping
     # the errors here would turn "we could not look" into "there was nothing".
+    # The address the operator named, never the one the checkout carries: `--org`
+    # builds it here and `--slug` is typed, so ref coverage can authenticate as
+    # them without the repository under suspicion choosing where that goes.
+    trusted = ((lambda name: f"https://github.com/{slug_of(name)}.git")
+               if slug_of is not None else None)
     report = scan_organization(repos, advisory.plan(), runs=runs, secrets=secrets,
-                               allow_incomplete=args.allow_incomplete_history)
+                               allow_incomplete=args.allow_incomplete_history,
+                               remote_url=trusted)
     report.errors[:0] = errors
     report.transient[:0] = transient
     written = _emit(report, args, advisory)

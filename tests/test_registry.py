@@ -97,7 +97,7 @@ class TestTheScanPathNeverReachesTheNetwork:
         # `org` binds the name at import, so this is where the call actually happens.
         original = org.scan_repo
 
-        def scan_repo(repo, query, coverage_cache=None):
+        def scan_repo(repo, query, coverage_cache=None, trusted_url=None):
             from deptrail.registry import fetch_packument
 
             try:

@@ -1465,7 +1465,8 @@ class TestPrecedenceAndDiagnostics:
         asked = []
         real = history._remote_heads
         monkeypatch.setattr(history, "_remote_heads",
-                            lambda r, name="origin": (asked.append(r), real(r, name))[1])
+                            lambda r, name="origin", **kw:
+                            (asked.append(r), real(r, name, **kw))[1])
         cache: dict = {}
         for _ in range(3):
             history.incomplete_history(repo, cache)
@@ -1632,6 +1633,31 @@ class TestPrecedenceAndDiagnostics:
             assert not witness.exists()
         finally:
             server.shutdown()
+
+    def test_a_url_the_operator_named_is_asked_as_the_operator(self, tmp_path,
+                                                               monkeypatch):
+        """Carrying a credential was never the danger — carrying one to an address a
+        possibly compromised checkout chose was. When the operator names the
+        repository (`--org` builds the URL, `--slug` is typed), nothing about where
+        the query goes came from the repository, so their own config goes with it
+        and a private remote can answer at last.
+
+        The clone here points nowhere: only the operator's environment makes the
+        address resolve, so the heads coming back prove whose config was read. The
+        other half of the rule — that a repository-chosen address is asked as
+        nobody — is pinned by
+        `test_config_injected_by_the_environment_is_not_carried`.
+        """
+        from deptrail.history import _remote_heads
+        origin = self.origin_with_two_branches(tmp_path, "trusted")
+        repo = self.fresh(tmp_path, "trusted-clone")
+        monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+        monkeypatch.setenv("GIT_CONFIG_KEY_0", f"url.{origin}.insteadOf")
+        monkeypatch.setenv("GIT_CONFIG_VALUE_0", "https://private.invalid/x.git")
+        monkeypatch.setenv("GIT_ALLOW_PROTOCOL", "https:file")
+        heads = _remote_heads(repo, "origin",
+                              trusted_url="https://private.invalid/x.git")
+        assert heads is not None and "release/1.x" in heads, heads
 
     def test_config_injected_by_the_environment_is_not_carried(self, tmp_path,
                                                                monkeypatch):
