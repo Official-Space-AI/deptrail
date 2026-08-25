@@ -843,7 +843,11 @@ def build_parser() -> argparse.ArgumentParser:
                            "clone that holds less than the repository cannot "
                            "establish what the repository did")
     scan.add_argument("--no-ci", action="store_true",
-                      help="skip CI and secret lookups (no token needed)")
+                      help="skip CI and secret lookups (no token needed). It "
+                           "withholds the token, not the checks: on a private "
+                           "repository the branch-coverage query is then refused, "
+                           "and a scan that could not list the branches reports "
+                           "incomplete rather than clean")
     add_output(scan)
     scan.set_defaults(func=cmd_scan)
 
