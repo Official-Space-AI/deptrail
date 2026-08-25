@@ -1649,6 +1649,7 @@ class TestPrecedenceAndDiagnostics:
         monkeypatch.setattr(history, "_github_authorization",
                             lambda url: "Authorization: Basic PRETEND")
         seen: list[str] = []
+        helpers: list[list[str]] = []
         real = history.subprocess.Popen
 
         class Spy(real):
@@ -1656,14 +1657,25 @@ class TestPrecedenceAndDiagnostics:
                 if isinstance(args, list) and "ls-remote" in args:
                     probe = args[args.index("-C") + 1]
                     seen.append((Path(probe) / ".git" / "config").read_text())
+                    # Asked of git, in the probe's own environment, rather than
+                    # read off the file: `"helper =" in text` is satisfied by
+                    # `helper = /bin/false` too, so it named a behaviour and
+                    # checked a substring.
+                    asked = subprocess.run(
+                        ["git", "-C", probe, "config", "--get-all",
+                         "credential.helper"],
+                        env=kwargs.get("env"), capture_output=True, text=True)
+                    helpers.append(asked.stdout.splitlines())
                 super().__init__(args, **kwargs)
 
         monkeypatch.setattr(history.subprocess, "Popen", Spy)
         heads = history._remote_heads(repo, "origin", trusted_url=str(origin))
         assert heads is not None and "release/1.x" in heads, heads
         assert "Authorization: Basic PRETEND" in seen[0], seen[0]
-        # No helper may run: that is the path that erases.
-        assert "helper =" in seen[0], seen[0]
+        # No helper may run: that is the path that erases. The list git reports is
+        # the reset entry and nothing after it — `[]` would mean the reset was
+        # dropped, and anything non-empty is a helper that can be asked.
+        assert helpers[0] == [""], helpers[0]
 
     def test_no_token_is_written_when_the_caller_says_not_to_authenticate(
             self, tmp_path, monkeypatch):
@@ -1702,10 +1714,25 @@ class TestPrecedenceAndDiagnostics:
         monkeypatch.setenv("GH_TOKEN", "ghs_TESTTOKEN")
         assert history._github_authorization("https://github.com/o/r.git")
         assert history._github_authorization("https://evil.example/o/r.git") is None
+        # Plain http would put the header on the wire before a redirect could
+        # upgrade it.
+        assert history._github_authorization("http://github.com/o/r.git") is None
         monkeypatch.delenv("GH_TOKEN")
-        monkeypatch.setattr(history.subprocess, "run",
-                            lambda *a, **k: subprocess.CompletedProcess(a, 1, "", ""))
+        # Both, or the fallback is never reached on a machine that exports the
+        # other one — and the assertion below then fails by printing the
+        # operator's real token, base64-encoded, into the test log.
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        called: list[list[str]] = []
+        monkeypatch.setattr(
+            history.subprocess, "run",
+            lambda *a, **k: (called.append(a[0])
+                             or subprocess.CompletedProcess(a, 1, "", "")))
         assert history._github_authorization("https://github.com/o/r.git") is None
+        # Pinned to the host it will be sent to: `gh auth token` answers for
+        # whatever `GH_HOST` names, so an operator logged in to a GitHub Enterprise
+        # instance had that instance's credential handed to github.com.
+        assert called and called[0] == ["gh", "auth", "token",
+                                        "--hostname", "github.com"], called
 
     def test_the_token_is_not_attached_to_an_address_the_repository_chose(
             self, tmp_path, monkeypatch):
@@ -1715,7 +1742,11 @@ class TestPrecedenceAndDiagnostics:
         """
         from deptrail import history
         monkeypatch.setenv("GH_TOKEN", "ghs_LEAKME")
-        monkeypatch.setenv("GIT_ALLOW_PROTOCOL", "https")
+        # No `GIT_ALLOW_PROTOCOL` of its own: the suite allows `file` and nothing
+        # else, so the transport is refused before any connection is made. What is
+        # under test is the config this code writes, which is written first and
+        # read by the spy below — overriding the guarantee to `https` sent this
+        # bogus credential to the real github.com on every run.
         repo = self.fresh(tmp_path, "tokenscope")
         git(repo, "remote", "add", "origin", "https://github.com/o/r.git")
         seen: list[str] = []
@@ -1735,6 +1766,42 @@ class TestPrecedenceAndDiagnostics:
         assert len(seen) == 2, seen
         assert "extraHeader" not in seen[0], seen[0]
         assert "extraHeader" in seen[1], seen[1]
+
+    def test_a_named_address_nobody_could_ask_is_a_reason_and_not_a_note(
+            self, tmp_path):
+        """Withholding the token withheld the answer. On a private repository the
+        unauthenticated query is refused, the clone's own remote is that same
+        address and is refused too, every source falls silent — and the check that
+        ran, found nothing to say, and cleared the clone. Measured end to end, the
+        same clone with the poisoned pin on an unfetched branch exited 2 without
+        `--no-ci` and 0 with it.
+        """
+        from deptrail.history import _ref_coverage
+        repo = self.fresh(tmp_path, "unanswerable")
+        gone = tmp_path / "no-such-repository.git"
+        git(repo, "remote", "add", "origin", str(gone))
+        reason, note = _ref_coverage(repo, None, str(gone), True)
+        assert reason is not None and "could not be asked" in reason, reason
+        # Said once. It was the reason, so repeating it as an observation would
+        # print the same sentence twice on every report.
+        assert note is None, note
+
+    def test_silence_beside_an_answer_says_what_the_answer_covered(self, tmp_path):
+        """"Coverage was not verified" is false on the shipped Action's ordinary
+        shape: the named address answers in full while the checkout's own `origin`,
+        whose credential lives in the config this probe refuses to read, cannot be
+        asked at all. The unqualified sentence fired on exactly the runs where the
+        feature was working.
+        """
+        from deptrail.history import _ref_coverage
+        origin = self.origin_with_two_branches(tmp_path, "beside")
+        repo = tmp_path / "beside-clone"
+        git(tmp_path, "clone", "-q", str(origin), str(repo))
+        git(repo, "remote", "add", "unreachable", str(tmp_path / "not-here.git"))
+        reason, note = _ref_coverage(repo, None, str(origin), True)
+        assert reason is None, reason
+        assert note is not None and "rests on" in note, note
+        assert "unreachable" in note, note
 
     def test_two_remotes_missing_the_same_name_at_different_tips_are_two_gaps(
             self, tmp_path):
