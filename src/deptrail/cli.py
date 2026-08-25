@@ -42,6 +42,7 @@ from pathlib import Path
 from . import __version__
 from .demo import advisory_path, build, runs_provider, secrets_provider
 from .grading import RunHistory, annotate_installs, runs_from_github
+from .history import _git_env
 from .ioc import (
     COVERAGE_VALUES,
     SCHEMA_VERSION,
@@ -264,7 +265,7 @@ def _clone_org(org: str, workdir: Path, *, limit: int,
         if (dest / ".git").exists():
             remote = subprocess.run(
                 ["git", "-C", str(dest), "remote", "get-url", "origin"],
-                capture_output=True, text=True,
+                capture_output=True, text=True, env=_git_env(),
             ).stdout.strip()
             if remote and not remote.rstrip("/").startswith(_expected_remote(org, name)):
                 errors.append(
@@ -272,6 +273,7 @@ def _clone_org(org: str, workdir: Path, *, limit: int,
                 )
                 continue
             fetch = subprocess.run(["git", "-C", str(dest), "fetch", "--prune", "--quiet"],
+                                   env=_git_env(),
                                    capture_output=True, text=True)
             if fetch.returncode != 0:
                 transient.append(
@@ -282,7 +284,7 @@ def _clone_org(org: str, workdir: Path, *, limit: int,
             print(f"cloning {org}/{name}", file=sys.stderr)
             clone = subprocess.run(
                 ["git", "clone", "--quiet", f"https://github.com/{org}/{name}.git",
-                 str(dest)], capture_output=True, text=True,
+                 str(dest)], capture_output=True, text=True, env=_git_env(),
             )
             if clone.returncode != 0:
                 transient.append(f"{name}: clone failed ({clone.stderr.strip()[:120]})")
@@ -593,9 +595,11 @@ def cmd_advisory_derive(args: argparse.Namespace) -> int:
     *narrow* what it will claim: an unreachable remote leaves ref coverage
     unverified, never established.
     """
-    # Imported here rather than at module scope: nothing on the scan path should be
-    # able to reach the network, and keeping urllib out of the import graph of every
-    # other command is what makes that checkable instead of merely intended.
+    # Imported here rather than at module scope: no scan should be able to read a
+    # registry, and keeping urllib out of the import graph of every other command is
+    # what makes that checkable instead of merely intended. A scan does reach the
+    # network — through git, for clones, runs and the branch list — and never for a
+    # value that could make a verdict cleaner.
     from .osv import OsvError
     from .registry import (
         PublishRecord,
