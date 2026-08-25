@@ -639,10 +639,14 @@ def scan_organization(repos: Iterable[tuple[str, Path]], plan: QueryPlan, *,
             continue
         run_cache: dict[str, RunHistory] = {}
         secret_cache: dict[str, tuple[str, ...] | None] = {}
+        # How complete the checkout is does not change between packages, and one of
+        # its checks asks the remote; without this the network call would repeat
+        # once per advisory package.
+        coverage_cache: dict[str, tuple[str | None, str | None]] = {}
         for entry in plan.entries:
             query = entry.query
             try:
-                finding = scan_repo(path, query)
+                finding = scan_repo(path, query, coverage_cache)
             except Exception as e:  # a failed repo must be visible, not silent
                 _record_failure(report, f"{name} ({query.package})", e)
                 continue
@@ -709,6 +713,15 @@ def scan_organization(repos: Iterable[tuple[str, Path]], plan: QueryPlan, *,
                 line = f"{name}: {reason}"
                 if line not in report.incomplete:
                     report.incomplete.append(line)
+            # An observation reached the report only through the rotation list, which
+            # is not built for a repository that needs no rotation -- so "ref coverage
+            # was not verified" was invisible on exactly the reports it qualifies, the
+            # clean ones. Deduplicated on the prefixed line, because the finding is
+            # rebuilt once per advisory package.
+            for observation in graded.diagnostics:
+                line = f"{name}: {observation}"
+                if line not in report.notes:
+                    report.notes.append(line)
             unread = [t for t in graded.unread_trees
                       if _is_installed_unread_tree(path, t)]
             set_aside_unread = [t for t in graded.unread_trees if t not in unread]

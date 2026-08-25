@@ -1094,6 +1094,11 @@ class TestPrecedenceAndDiagnostics:
         """Coverage is about what the walk can reach, not what the refs are called:
         a branch fetched into a ref of a different name is still walked, so naming it
         missing would be a reason with no cost behind it.
+
+        The remote-tracking ref the wildcard refspec writes anyway is deleted, or the
+        branch would be held under its ordinary name too and this would asserts
+        nothing — the first version of this test passed with the whole
+        name-independent path removed.
         """
         from deptrail.history import incomplete_history
         origin = self.origin_with_two_branches(tmp_path, "renamed")
@@ -1102,8 +1107,103 @@ class TestPrecedenceAndDiagnostics:
         git(repo, "fetch", "-q", "origin",
             "+refs/heads/main:refs/remotes/origin/main",
             "+refs/heads/release/1.x:refs/remotes/origin/kept-under-another-name")
+        git(repo, "update-ref", "-d", "refs/remotes/origin/release/1.x")
         git(repo, "checkout", "-qb", "main", "origin/main")
+        assert [r for r in incomplete_history(repo)[0] if "release/1.x" in r] == []
+
+    def test_a_planted_ssh_command_is_not_run_by_the_coverage_check(self, tmp_path,
+                                                                     monkeypatch):
+        """The repository being scanned may be the compromised one, so its config is
+        input and not settings: `core.sshCommand` planted there is executed by
+        `ls-remote` (measured), and `-c` on the command line outranks it.
+        """
+        from deptrail.history import _remote_heads
+        # The suite blocks ssh outright, which would refuse this before the planted
+        # command could run and leave the assertion passing for the wrong reason.
+        monkeypatch.delenv("GIT_ALLOW_PROTOCOL", raising=False)
+        marker = tmp_path / "executed"
+        repo = self.fresh(tmp_path, "hostile")
+        git(repo, "remote", "add", "origin", "ssh://git@example.invalid/x.git")
+        git(repo, "config", "core.sshCommand", f"touch {marker} ; false")
+        assert _remote_heads(repo) is None      # unreachable, as it should be
+        assert not marker.exists()
+
+    def test_an_exotic_transport_is_refused_even_if_the_repo_re_enables_it(
+            self, tmp_path, monkeypatch):
+        """`ext::` runs the command named in the URL, and the repository under
+        investigation is where the URL comes from.
+
+        This pins the outcome, not the mechanism: measured on git 2.x it holds on
+        git's own default with the allowlist removed, so it fails only if both locks
+        go. That is the assertion worth keeping — this must never execute — and the
+        allowlist is the one of the two this project controls.
+        """
+        from deptrail.history import _remote_heads
+        # Same trap: with the suite's own block in place this would pass without the
+        # allowlist the code sets for itself.
+        monkeypatch.delenv("GIT_ALLOW_PROTOCOL", raising=False)
+        marker = tmp_path / "executed-ext"
+        repo = self.fresh(tmp_path, "hostile-ext")
+        git(repo, "remote", "add", "origin", f'ext::sh -c "touch {marker}"')
+        git(repo, "config", "protocol.ext.allow", "always")
+        assert _remote_heads(repo) is None
+        assert not marker.exists()
+
+    def test_a_clone_that_fell_behind_the_remote_is_not_cleared(self, tmp_path):
+        """Coverage is about commits, and matching branch names hid that. A clone
+        whose `origin/release/1.x` is behind holds the name and not the tip, and
+        blessing the name cleared a repository at exit 0 while the pin that mattered
+        sat on the remote's own head — the same false all-clear #27 is about, one
+        fetch later.
+        """
+        from deptrail.history import incomplete_history
+        origin = self.origin_with_two_branches(tmp_path, "behind")
+        repo = tmp_path / "behind-clone"
+        git(tmp_path, "clone", "-q", str(origin), str(repo))
+        # The remote moves on: the same branch, commits this clone has never seen.
+        ahead = tmp_path / "behind-ahead"
+        git(tmp_path, "clone", "-q", str(origin), str(ahead))
+        git(ahead, "checkout", "-q", "release/1.x")
+        self.write(ahead, "package-lock.json", lock_json("5.6.3"),
+                   "2025-11-26T10:00:00+00:00")
+        git(ahead, "push", "-q", "origin", "release/1.x")
+        reasons, _ = incomplete_history(repo)
+        assert any("release/1.x" in r for r in reasons), reasons
+
+    def test_a_ref_that_moved_past_the_advertised_tip_still_covers_it(self, tmp_path):
+        """The other direction: a clone ahead of the remote reaches the advertised
+        tip through its own ref, so it is not accused of a gap it does not have.
+        """
+        from deptrail.history import incomplete_history
+        origin = self.origin_with_two_branches(tmp_path, "ahead")
+        repo = tmp_path / "ahead-clone"
+        git(tmp_path, "clone", "-q", str(origin), str(repo))
+        git(repo, "checkout", "-q", "-b", "local-release", "origin/release/1.x")
+        self.write(repo, "package-lock.json", lock_json("5.6.2"),
+                   "2025-11-27T10:00:00+00:00")
         assert incomplete_history(repo)[0] == []
+
+    def test_the_remote_is_asked_once_per_repository(self, tmp_path, monkeypatch):
+        """`scan_organization` rebuilds a finding once per advisory package, so the
+        one check here that leaves the machine has to be paid for once: a 180-package
+        advisory over 200 repositories would otherwise have asked 36,000 times.
+        """
+        from deptrail import history
+        origin = self.origin_with_two_branches(tmp_path, "asked-once")
+        repo = tmp_path / "asked-once-clone"
+        git(tmp_path, "clone", "-q", str(origin), str(repo))
+        asked = []
+        real = history._remote_heads
+        monkeypatch.setattr(history, "_remote_heads",
+                            lambda r: (asked.append(r), real(r))[1])
+        cache: dict = {}
+        for _ in range(3):
+            history.incomplete_history(repo, cache)
+        assert len(asked) == 1, asked
+        # And without a cache each call stands on its own, which is what a lone
+        # `scan_repo` needs.
+        history.incomplete_history(repo)
+        assert len(asked) == 2, asked
 
     def test_an_unreachable_remote_is_an_observation_and_not_a_reason(self, tmp_path):
         """A remote that cannot be reached leaves coverage unverified, which is worth

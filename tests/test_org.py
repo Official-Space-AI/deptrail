@@ -951,6 +951,21 @@ class TestCodexRegressions:
         assert "cannot prove absence" in text
 
 
+class TestRefCoverageReachesTheReport:
+    def test_an_unverified_coverage_note_is_a_caveat_on_a_clean_report(self, tmp_path,
+                                                                       plan):
+        """A finding's observations reached the report only through the rotation
+        list, which is not built when nothing needs rotating — so the note saying
+        ref coverage could not be verified was missing from exactly the reports it
+        qualifies: the clean ones, which are the ones a reader takes as an all-clear.
+        """
+        repo = make_repo(tmp_path, "api", [("2025-11-25T10:00:00+00:00", None)])
+        git(repo, "remote", "add", "origin", str(tmp_path / "gone-for-good.git"))
+        report = scan_organization([("api", repo)], plan, runs=no_runs)
+        assert any("ref coverage was not verified" in c for c in report.caveats), \
+            report.caveats
+
+
 class TestEnvironmentSecrets:
     def test_environment_is_named_because_its_secrets_are_not_listed(self, tmp_path, plan):
         workflow = ("name: CI\non: [push]\njobs:\n  ship:\n    environment: production\n"

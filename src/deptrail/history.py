@@ -303,54 +303,96 @@ def _config(repo: Path, key: str) -> str:
 LS_REMOTE_TIMEOUT = 10.0
 
 
+# Transports a repository under investigation may send us to. The allowlist is the
+# point, not its contents: `ext::` runs a command named in the URL, and a config
+# that turns it back on is config the scanned repository carries. Named here so an
+# operator can narrow it further from the environment, which wins.
+REMOTE_PROTOCOLS = "https:http:git:ssh:file"
+
+
 def _remote_heads(repo: Path) -> dict[str, str] | None:
     """The remote's branch names and tips, or ``None`` when it could not be asked.
 
-    ``GIT_TERMINAL_PROMPT=0`` is the load-bearing part: a private remote whose
+    This is the one place the walk runs git *against a remote*, and the repository
+    it runs in is the one under investigation — so its `.git/config` is input from
+    a possibly compromised source, not settings to obey. ``core.sshCommand`` is the
+    proven case: a value planted there is executed by ``ls-remote``, measured, so it
+    is overridden on the command line, where `-c` outranks the repository's own
+    config. What that costs is a custom ssh invocation (a deploy key, say) losing
+    its coverage answer, which degrades to "not verified" and nothing worse. The
+    ``credential.helper`` form of the same trick is left alone deliberately —
+    clearing it would take ref coverage away from every private remote — and is
+    tracked separately.
+
+    ``GIT_TERMINAL_PROMPT=0`` is the other load-bearing part: a private remote whose
     credentials this machine does not hold would otherwise stop the scan at an
     interactive password prompt. With it, the same remote fails in well under a
     second and the caller reports that coverage is unverified.
     """
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    env.setdefault("GIT_ALLOW_PROTOCOL", REMOTE_PROTOCOLS)
     result = subprocess.run(
-        ["git", "-C", str(repo), "ls-remote", "--heads", "origin"],
+        ["git", "-C", str(repo), "-c", "core.sshCommand=ssh",
+         "ls-remote", "--heads", "origin"],
         capture_output=True, text=True, encoding="utf-8",
-        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
-        timeout=LS_REMOTE_TIMEOUT, check=False,
+        env=env, timeout=LS_REMOTE_TIMEOUT, check=False,
     )
     if result.returncode != 0:
         return None
     heads = {}
     for line in result.stdout.splitlines():
         tip, _, ref = line.partition("\t")
-        if ref.startswith("refs/heads/") and tip:
+        # `--heads` still peels a branch that points at an annotated tag, and the
+        # `^{}` line names a ref that does not exist: reading it as a branch put a
+        # complete clone at exit 2 for a branch called `tagbranch^{}`.
+        if tip and ref.startswith("refs/heads/") and not ref.endswith("^{}"):
             heads[ref[len("refs/heads/"):]] = tip
     return heads
+
+
+def _reaches(repo: Path, commit: str, refs: list[str]) -> bool:
+    """Whether any ref the walk enumerates leads to this commit.
+
+    ``rev-list`` stops at the first commit reachable from ``commit`` and from no
+    ref, so a held branch costs one early exit rather than a full traversal. A
+    commit this clone does not have at all makes it fail, which is the answer.
+    """
+    result = subprocess.run(
+        ["git", "-C", str(repo), "rev-list", "--max-count=1", "--stdin"],
+        input="\n".join([commit, *(f"^{ref}" for ref in refs)]),
+        capture_output=True, text=True, encoding="utf-8", check=False,
+    )
+    return result.returncode == 0 and not result.stdout.strip()
 
 
 def _heads_not_here(repo: Path, heads: dict[str, str]) -> list[str]:
     """Which of the remote's branches this clone cannot walk.
 
-    A branch counts as held under any name the walk enumerates — its
-    remote-tracking ref, a local branch of the same name, or any ref pointing at
-    the same tip, because a checkout that fetched it under a different name still
-    holds it. Anything left over is a branch ``_refs`` will never hand to the
-    walker, and the exposure it may carry cannot be seen from here.
+    The question is reachability, not naming: what the walk can testify about is
+    the commits its refs lead to. Matching branch *names* looked equivalent and is
+    not — a clone whose ``origin/feature`` is behind the remote holds the name and
+    not the commits, and blessing it cleared a repository at exit 0 while the
+    malicious pin sat on the remote's own tip. So each advertised tip is asked for
+    directly: held under another name still counts, a ref that has moved past it
+    still counts, and a tip nothing leads to is a branch this clone cannot judge.
+
+    The exact-tip set answers most branches without a subprocess at all, because a
+    clone that fetched a branch and has not fallen behind points a ref straight at
+    it; only the ones that diverge cost a ``rev-list``.
     """
-    names, tips = set(), set()
+    refs, tips = [], set()
     for line in _git(repo, "for-each-ref", "--format=%(objectname) %(refname)",
                      "refs/heads", "refs/remotes").splitlines():
         tip, _, ref = line.partition(" ")
-        names.add(ref)
+        refs.append(ref)
         tips.add(tip)
-    return sorted(
-        name for name, tip in heads.items()
-        if f"refs/remotes/origin/{name}" not in names
-        and f"refs/heads/{name}" not in names
-        and tip not in tips
-    )
+    return sorted(name for name, tip in heads.items()
+                  if tip not in tips and not _reaches(repo, tip, refs))
 
 
-def incomplete_history(repo: Path) -> tuple[list[str], list[str]]:
+def incomplete_history(repo: Path,
+                       coverage_cache: dict[str, tuple[str | None, str | None]]
+                       | None = None) -> tuple[list[str], list[str]]:
     """How much less this clone holds than the repository does, and what that costs.
 
     Returns (reasons that stop an all-clear, observations that only inform).
@@ -398,30 +440,53 @@ def incomplete_history(repo: Path) -> tuple[list[str], list[str]]:
             f"partial clone ({filtered}): lockfile contents were fetched on demand; "
             "any that could not be read are listed as unreadable snapshots"
         )
-    if _config(repo, "remote.origin.url"):
-        try:
-            heads = _remote_heads(repo)
-        except (OSError, subprocess.SubprocessError):
-            heads = None
-        if heads is None:
-            notes.append(
-                "ref coverage was not verified: origin could not be reached, so a "
-                "checkout that fetched only some branches cannot be told from a "
-                "complete one"
-            )
-        elif (missing := _heads_not_here(repo, heads)):
-            # The names are the point — they are what a responder re-fetches — but a
-            # repository can have hundreds of branches, and a reason that prints them
-            # all is a reason nobody reads.
-            shown = ", ".join(missing[:5])
-            if len(missing) > 5:
-                shown += f", and {len(missing) - 5} more"
-            reasons.append(
-                f"{len(missing)} branch(es) on origin were never fetched ({shown}): "
-                "a branch nobody fetched cannot testify, and exposure on it is still "
-                "exposure"
-            )
+    reason, note = _ref_coverage(repo, coverage_cache)
+    if reason:
+        reasons.append(reason)
+    if note:
+        notes.append(note)
     return reasons, notes
+
+
+def _ref_coverage(repo: Path,
+                  cache: dict[str, tuple[str | None, str | None]] | None = None,
+                  ) -> tuple[str | None, str | None]:
+    """What the remote's branch list says about this clone: (reason, observation).
+
+    ``cache`` is keyed by repository because the answer is a property of the
+    checkout and not of the advisory: ``scan_organization`` walks every repository
+    once per advisory package, and without it a 180-package advisory over 200
+    repositories would have asked 36,000 times.
+    """
+    if not _config(repo, "remote.origin.url"):
+        return None, None
+    key = str(repo)
+    if cache is not None and key in cache:
+        return cache[key]
+    try:
+        heads = _remote_heads(repo)
+    except (OSError, subprocess.SubprocessError):
+        heads = None
+    if heads is None:
+        outcome = (None,
+                   "ref coverage was not verified: origin could not be reached, so "
+                   "a checkout that fetched only some branches cannot be told from "
+                   "a complete one")
+    elif (missing := _heads_not_here(repo, heads)):
+        # The names are the point — they are what a responder re-fetches — but a
+        # repository can have hundreds of branches, and a reason that prints them
+        # all is a reason nobody reads.
+        shown = ", ".join(missing[:5])
+        if len(missing) > 5:
+            shown += f", and {len(missing) - 5} more"
+        outcome = (f"{len(missing)} branch(es) on origin are not in this clone "
+                   f"({shown}): a branch this clone cannot walk cannot testify, "
+                   "and exposure on it is still exposure", None)
+    else:
+        outcome = (None, None)
+    if cache is not None:
+        cache[key] = outcome
+    return outcome
 
 
 def _paths_with_basename(repo: Path, basenames: tuple[str, ...]) -> list[str]:
@@ -772,12 +837,18 @@ def _scan_ref_chain(repo: Path, path: str, ref: str, chain: list[Commit],
             ))
 
 
-def scan_repo(repo: Path, query: WindowQuery) -> RepoFinding:
-    """Judge one repository across every ref; see the module docstring for the model."""
+def scan_repo(repo: Path, query: WindowQuery,
+              coverage_cache: dict[str, tuple[str | None, str | None]]
+              | None = None) -> RepoFinding:
+    """Judge one repository across every ref; see the module docstring for the model.
+
+    ``coverage_cache`` lets a caller that asks the same repository about many
+    packages pay for the remote's branch list once; a lone call needs none.
+    """
     finding = RepoFinding(repo=repo)
     warned: set[str] = set()
     try:
-        truncated, observed = incomplete_history(repo)
+        truncated, observed = incomplete_history(repo, coverage_cache)
         finding.incomplete.extend(truncated)
         finding.diagnostics.extend(observed)
         paths, foreign = discovered_lockfiles(repo)

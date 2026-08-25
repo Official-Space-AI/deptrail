@@ -51,6 +51,14 @@ class TestTheScanPathNeverReachesTheNetwork:
     exits 2 — so adding a real `fetch_packument()` call to `history.scan_repo` left
     every test here green. A recorder cannot be swallowed that way, and the exit code
     is not what is being asserted.
+
+    What this recorder does *not* see, since #27: `git ls-remote`, which the walk runs
+    to learn which branches the remote has. It is a subprocess, so no in-process patch
+    of `urlopen` or `socket` observes it — and it is meant to be there. The rule it
+    still enforces is the one about *values*: no scan reads the registry, so no verdict
+    moves because a third party answered. `tests/conftest.py` keeps the git call itself
+    off the network during tests, and `tests/test_history.py` pins what it does when the
+    remote cannot be reached.
     """
 
     @pytest.fixture
@@ -89,7 +97,7 @@ class TestTheScanPathNeverReachesTheNetwork:
         # `org` binds the name at import, so this is where the call actually happens.
         original = org.scan_repo
 
-        def scan_repo(repo, query):
+        def scan_repo(repo, query, coverage_cache=None):
             from deptrail.registry import fetch_packument
 
             try:
