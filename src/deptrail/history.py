@@ -362,7 +362,10 @@ def _remote_heads(repo: Path) -> dict[str, str] | None:
     # there put `ext::` — which runs the command named in the URL, and the URL comes
     # from the repository under investigation — back within reach.
     allowed = set(REMOTE_PROTOCOLS.split(":"))
-    if os.environ.get("GIT_ALLOW_PROTOCOL"):
+    # Empty is git's own way of saying "allow nothing", so it is a setting and not
+    # an absence: reading it as unset inverted the strictest narrowing into the
+    # broadest list.
+    if os.environ.get("GIT_ALLOW_PROTOCOL") is not None:
         allowed &= set(os.environ["GIT_ALLOW_PROTOCOL"].split(":"))
     env = {key: value for key, value in os.environ.items()
            if key not in GIT_LOCATION_VARS}
@@ -444,8 +447,14 @@ def _heads_not_here(repo: Path, heads: dict[str, str]) -> list[str]:
     tips = set()
     for line in _git(repo, "for-each-ref", "--format=%(objectname) %(refname)",
                      "refs/heads", "refs/remotes").splitlines():
-        tip, _, _ref = line.partition(" ")
-        tips.add(tip)
+        tip, _, ref = line.partition(" ")
+        # Exactly the refs `_refs` hands the walker, or this answers for refs nobody
+        # walks: it drops every name ending in `/HEAD` as the alias it usually is,
+        # and a remote branch *called* `HEAD` lands there too — fetched, counted
+        # here as held, and never walked. A pin on it was reported at exit 0, which
+        # is #27 again through the check written to close it.
+        if not ref.endswith("/HEAD"):
+            tips.add(tip)
     # HEAD only once it resolves. An unborn HEAD — a clone that fetched but never
     # checked out — made `^HEAD` a fatal argument, and one fatal argument was read
     # below as "nothing is reachable", so a complete clone was told it was missing
@@ -453,26 +462,31 @@ def _heads_not_here(repo: Path, heads: dict[str, str]) -> list[str]:
     head = _local_git(repo, ["rev-parse", "--verify", "--quiet", "HEAD"], "")
     if head.returncode == 0 and head.stdout.strip():
         tips.add(head.stdout.strip())
-    candidates = {name: tip for name, tip in heads.items() if tip not in tips}
-    if not candidates:
+    if not heads:
         return []
-    # One batch decides what this clone holds at all — of the tips asked about and
-    # of its own refs. Excluding by object rather than by name is what keeps a
-    # single broken ref (a pruned clone leaves them) from making `rev-list` fatal
-    # and every diverged branch read as missing.
+    # One batch decides what this clone holds at all — the tips asked about and its
+    # own refs together. Both sides need it: a ref can name an object that is not
+    # here (a pruned or interrupted fetch leaves them behind), and matching a remote
+    # tip against such a ref proved coverage by a commit nobody has. Excluding by
+    # object rather than by name is the other half, and keeps one such ref from
+    # making `rev-list` fatal and every diverged branch read as missing.
     here = set()
     known = _local_git(repo, ["cat-file", "--batch-check"],
-                       "\n".join({*candidates.values(), *tips}) + "\n")
+                       "\n".join({*heads.values(), *tips}) + "\n")
     for line in known.stdout.splitlines():
         name, _, rest = line.partition(" ")
         if rest and not rest.startswith("missing"):
             here.add(name)
+    held = tips & here
+    candidates = {name: tip for name, tip in heads.items() if tip not in held}
+    if not candidates:
+        return []
     wanted = {tip for tip in candidates.values() if tip in here}
     unreachable = {tip for tip in candidates.values() if tip not in here}
     if wanted:
         walked = _local_git(
             repo, ["rev-list", "--no-walk", "--stdin"],
-            "\n".join([*wanted, *(f"^{tip}" for tip in tips & here)]) + "\n")
+            "\n".join([*wanted, *(f"^{tip}" for tip in held)]) + "\n")
         # A refusal is not evidence of coverage: read it as nothing reachable.
         unreachable |= (set(walked.stdout.split()) if walked.returncode == 0
                         else wanted)

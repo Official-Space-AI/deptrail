@@ -1216,6 +1216,67 @@ class TestPrecedenceAndDiagnostics:
         self.rewind(tmp_path, origin, "release/1.x")
         assert incomplete_history(repo)[0] == []
 
+    def test_a_branch_called_head_is_not_counted_as_covered(self, tmp_path):
+        """`_refs` drops every ref whose name ends in `/HEAD`, taking it for the
+        alias it usually is — so a remote branch actually *called* `HEAD` is fetched,
+        never walked, and used to be counted here as held. A pin on it was reported
+        at exit 0, which is #27 again through the check written to close it.
+        """
+        from deptrail.history import _remote_heads, _heads_not_here, _refs
+        origin = self.origin_with_two_branches(tmp_path, "headname")
+        work = tmp_path / "headname-work"
+        git(work, "push", "-q", "origin", "release/1.x:refs/heads/carrier")
+        tip = subprocess.run(
+            ["git", "-C", str(work), "rev-parse", "refs/heads/release/1.x"],
+            check=True, capture_output=True, text=True).stdout.strip()
+        # Written by hand, and only once the object is there: git will not create a
+        # branch under this name, and a ref naming an absent object breaks the push.
+        (origin / "refs/heads/HEAD").write_text(tip + "\n")
+        git(origin, "update-ref", "-d", "refs/heads/carrier")
+        # Only this ref may hold that commit, or an ordinary branch would cover it
+        # and the dropped name would never be the deciding one.
+        git(origin, "update-ref", "-d", "refs/heads/release/1.x")
+
+        repo = self.fresh(tmp_path, "headname-clone")
+        git(repo, "remote", "add", "origin", str(origin))
+        git(repo, "fetch", "-q", "origin", "+refs/heads/*:refs/remotes/origin/*")
+        git(repo, "checkout", "-qb", "main", "origin/main")
+        assert "refs/remotes/origin/HEAD" not in _refs(repo)
+        assert "HEAD" in _heads_not_here(repo, _remote_heads(repo))
+
+    def test_a_ref_naming_an_absent_object_does_not_prove_coverage(self, tmp_path):
+        """A pruned or interrupted fetch leaves a ref pointing at an object the clone
+        does not have. Matching an advertised tip against one of those said the
+        branch was held by a commit nobody has.
+        """
+        from deptrail.history import _remote_heads, _heads_not_here
+        origin = self.origin_with_two_branches(tmp_path, "leftover")
+        repo = self.fresh(tmp_path, "leftover-clone")
+        git(repo, "remote", "add", "origin", str(origin))
+        git(repo, "fetch", "-q", "origin", "main")
+        git(repo, "checkout", "-qb", "main", "FETCH_HEAD")
+        tip = subprocess.run(
+            ["git", "-C", str(origin), "rev-parse", "refs/heads/release/1.x"],
+            check=True, capture_output=True, text=True).stdout.strip()
+        leftover = repo / ".git/refs/remotes/origin/release-leftover"
+        leftover.parent.mkdir(parents=True, exist_ok=True)
+        leftover.write_text(tip + "\n")
+        assert "release/1.x" in _heads_not_here(repo, _remote_heads(repo))
+
+    def test_an_operator_may_forbid_every_transport(self, tmp_path, monkeypatch):
+        """Empty is git's own way of saying "allow nothing", so it is a setting and
+        not an absence — read as unset, the strictest narrowing became the broadest
+        list.
+        """
+        from deptrail.history import _remote_heads
+        origin = self.origin_with_two_branches(tmp_path, "forbidden")
+        repo = self.fresh(tmp_path, "forbidden-clone")
+        git(repo, "remote", "add", "origin", str(origin))
+        # Set last: the fixtures above are built with git, which would be forbidden
+        # its own transports too.
+        monkeypatch.setenv("GIT_ALLOW_PROTOCOL", "")
+        assert _remote_heads(repo) is None
+
     def test_a_branch_pointing_at_an_annotated_tag_is_judged_by_its_commit(
             self, tmp_path):
         """`ls-remote` advertises such a branch twice: the tag object, then the
@@ -1361,6 +1422,10 @@ class TestPrecedenceAndDiagnostics:
         git(repo, "checkout", "-q", "-b", "local-release", "origin/release/1.x")
         self.write(repo, "package-lock.json", lock_json("5.6.2"),
                    "2025-11-27T10:00:00+00:00")
+        # The tracking ref still sits on the advertised tip, and the exact-tip path
+        # would answer before the reachability query ran — leaving the branch held
+        # only by a ref that has moved past it, which is the case under test.
+        git(repo, "update-ref", "-d", "refs/remotes/origin/release/1.x")
         assert incomplete_history(repo)[0] == []
 
     def test_the_remote_is_asked_once_per_repository(self, tmp_path, monkeypatch):
