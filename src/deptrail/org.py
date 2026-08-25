@@ -624,12 +624,21 @@ class OrgReport:
 
 def scan_organization(repos: Iterable[tuple[str, Path]], plan: QueryPlan, *,
                       runs: RunsProvider, secrets: SecretsProvider | None = None,
-                      allow_incomplete: bool = False) -> OrgReport:
+                      allow_incomplete: bool = False,
+                      remote_url: Callable[[str], str | None] | None = None,
+                      ) -> OrgReport:
     """Judge every repository against every package the advisory names.
 
     ``repos`` are (name, local clone path) pairs; ``runs`` and ``secrets`` are
     injected so the scan is testable without a network and so a caller can supply
     cached data for a large organization.
+
+    ``remote_url`` answers "where did the operator say this repository lives", and
+    is injected the same way for the same reason. It is what makes ref coverage
+    work on a private repository: the address comes from the command line rather
+    than from the checkout under suspicion, so the operator's own credentials can
+    go with the query. Absent, coverage falls back to asking the checkout's own
+    remotes with no credential at all.
     """
     report = OrgReport(advisory_id=plan.advisory_id, advisory_name=plan.advisory_name,
                        partial_coverage=not plan.proves_absence)
@@ -650,7 +659,8 @@ def scan_organization(repos: Iterable[tuple[str, Path]], plan: QueryPlan, *,
         for entry in plan.entries:
             query = entry.query
             try:
-                finding = scan_repo(path, query, coverage_cache)
+                finding = scan_repo(path, query, coverage_cache,
+                                    remote_url(name) if remote_url else None)
             except Exception as e:  # a failed repo must be visible, not silent
                 _record_failure(report, f"{name} ({query.package})", e)
                 continue

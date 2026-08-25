@@ -492,7 +492,8 @@ def _without_userinfo(url: str) -> str:
     return f"{scheme}://{host}{slash}{tail}"
 
 
-def _remote_heads(repo: Path, remote: str = "origin") -> dict[str, str] | None:
+def _remote_heads(repo: Path, remote: str = "origin", *,
+                  trusted_url: str | None = None) -> dict[str, str] | None:
     """The remote's branch names and tips, or ``None`` when it could not be asked.
 
     The repository under investigation may be the compromised one, so its
@@ -519,7 +520,12 @@ def _remote_heads(repo: Path, remote: str = "origin") -> dict[str, str] | None:
     ``GIT_TERMINAL_PROMPT=0`` keeps the same remote from stopping the scan at an
     interactive password prompt; it fails in well under a second instead.
     """
-    url = _remote_url(repo, remote)
+    # A trusted URL is one the *operator* named — `--org` builds it, `--slug` is
+    # typed — so nothing about where this query goes came from the repository under
+    # suspicion, and the operator's own credentials can go with it. That is the
+    # whole difference: carrying a credential was never the danger, carrying one to
+    # an address a possibly compromised checkout chose was.
+    url = trusted_url if trusted_url else _remote_url(repo, remote)
     if url is None:
         return None
     # An operator may narrow the transports; they may not widen them. `setdefault`
@@ -541,11 +547,12 @@ def _remote_heads(repo: Path, remote: str = "origin") -> dict[str, str] | None:
         # `HOME` at the empty probe says the same thing to every git that has ever
         # looked there — belt and braces, because a version that quietly ignored the
         # first pair would read the operator's credentials and never say so.
-        env = _without_injected_config(env)
-        env["GIT_CONFIG_GLOBAL"] = os.devnull
-        env["GIT_CONFIG_SYSTEM"] = os.devnull
-        env["GIT_CONFIG_NOSYSTEM"] = "1"
-        env["HOME"] = env["XDG_CONFIG_HOME"] = env["USERPROFILE"] = probe
+        if trusted_url is None:
+            env = _without_injected_config(env)
+            env["GIT_CONFIG_GLOBAL"] = os.devnull
+            env["GIT_CONFIG_SYSTEM"] = os.devnull
+            env["GIT_CONFIG_NOSYSTEM"] = "1"
+            env["HOME"] = env["XDG_CONFIG_HOME"] = env["USERPROFILE"] = probe
         started = subprocess.run(["git", "init", "-q", probe], env=env,
                                  capture_output=True, text=True, check=False)
         if started.returncode != 0:
@@ -701,7 +708,9 @@ def _heads_not_here(repo: Path, heads: dict[str, str]) -> list[str]:
 
 def incomplete_history(repo: Path,
                        coverage_cache: dict[str, tuple[str | None, str | None]]
-                       | None = None) -> tuple[list[str], list[str]]:
+                       | None = None,
+                       trusted_url: str | None = None,
+                       ) -> tuple[list[str], list[str]]:
     """How much less this clone holds than the repository does, and what that costs.
 
     Returns (reasons that stop an all-clear, observations that only inform).
@@ -753,7 +762,7 @@ def incomplete_history(repo: Path,
                 "demand; any that could not be read are listed as unreadable "
                 "snapshots"
             )
-    reason, note = _ref_coverage(repo, coverage_cache)
+    reason, note = _ref_coverage(repo, coverage_cache, trusted_url)
     if reason:
         reasons.append(reason)
     if note:
@@ -763,6 +772,7 @@ def incomplete_history(repo: Path,
 
 def _ref_coverage(repo: Path,
                   cache: dict[str, tuple[str | None, str | None]] | None = None,
+                  trusted_url: str | None = None,
                   ) -> tuple[str | None, str | None]:
     """What the remotes' branch lists say about this clone: (reason, observation).
 
@@ -782,15 +792,22 @@ def _ref_coverage(repo: Path,
         return cache[key]
     missing: list[str] = []
     silent: list[str] = []
-    for remote in _remotes(repo):
+    # When the operator has said which repository this is, that is the one asked and
+    # the only one: they have named it, the same assertion that already governs its
+    # CI evidence, and the clone's other remotes are forks and mirrors they did not.
+    asked = [(None, trusted_url)] if trusted_url else [
+        (remote, None) for remote in _remotes(repo)]
+    for remote, url in asked:
         try:
-            heads = _remote_heads(repo, remote)
+            heads = _remote_heads(repo, remote or "origin", trusted_url=url)
         except (OSError, subprocess.SubprocessError):
             heads = None
+        label = remote or "the repository you named"
         if heads is None:
-            silent.append(remote)
+            silent.append(label)
             continue
-        missing += [f"{remote}/{branch}" for branch in _heads_not_here(repo, heads)]
+        missing += [f"{label}/{branch}" if remote else branch
+                    for branch in _heads_not_here(repo, heads)]
     reason = note = None
     if missing:
         # The names are the point — they are what a responder re-fetches — but a
@@ -1163,7 +1180,7 @@ def _scan_ref_chain(repo: Path, path: str, ref: str, chain: list[Commit],
 
 def scan_repo(repo: Path, query: WindowQuery,
               coverage_cache: dict[str, tuple[str | None, str | None]]
-              | None = None) -> RepoFinding:
+              | None = None, trusted_url: str | None = None) -> RepoFinding:
     """Judge one repository across every ref; see the module docstring for the model.
 
     ``coverage_cache`` lets a caller that asks the same repository about many
@@ -1172,7 +1189,7 @@ def scan_repo(repo: Path, query: WindowQuery,
     finding = RepoFinding(repo=repo)
     warned: set[str] = set()
     try:
-        truncated, observed = incomplete_history(repo, coverage_cache)
+        truncated, observed = incomplete_history(repo, coverage_cache, trusted_url)
         finding.incomplete.extend(truncated)
         finding.diagnostics.extend(observed)
         paths, foreign = discovered_lockfiles(repo)
