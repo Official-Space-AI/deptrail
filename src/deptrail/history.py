@@ -526,13 +526,25 @@ def _github_authorization(url: str) -> str | None:
     if not token:
         # The same tool the scan already reads CI runs and secret names through, so
         # it is the operator's own login and nothing new is being asked of them.
-        # Pinned to the host it will be sent to: `gh auth token` answers for
-        # whatever `GH_HOST` names, so an operator logged in to a GitHub Enterprise
-        # instance had that instance's credential handed to github.com.
+        # Pinned to the host it will be sent to: `gh auth token` otherwise answers
+        # for whatever `GH_HOST` names, so an operator logged in to a GitHub
+        # Enterprise instance had that instance's stored credential handed to
+        # github.com.
+        #
+        # And asked with the environment's tokens taken away, because the flag does
+        # not outrank them: measured, `GH_TOKEN=X GH_HOST=ghe.example.com gh auth
+        # token --hostname github.com` prints X. Leaving them in handed back the
+        # exact credential the check above had just refused — including the Action's
+        # own `GH_TOKEN`, which on a GHES runner is that instance's. The two sources
+        # are disjoint: if the environment's token were ours to use, it was used
+        # above, so here it is only in the way.
+        env = _git_env()
+        env.pop("GH_TOKEN", None)
+        env.pop("GITHUB_TOKEN", None)
         asked = subprocess.run(["gh", "auth", "token", "--hostname", "github.com"],
                                capture_output=True,
                                text=True, check=False, timeout=LS_REMOTE_TIMEOUT,
-                               env=_git_env())
+                               env=env)
         token = asked.stdout.strip() if asked.returncode == 0 else ""
     if not token:
         return None
