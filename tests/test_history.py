@@ -1334,10 +1334,10 @@ class TestPrecedenceAndDiagnostics:
         secret = "https://x-access-token:s3cr3t-token@example.invalid/x.git"
         repo = self.fresh(tmp_path, "tokened")
         git(repo, "remote", "add", "origin", secret)
-        # The username survives — `ssh://git@github.com/...` needs its `git`, and a
-        # username is not a secret. The password is the part that is not carried.
-        assert (history._remote_url(repo, "origin")
-                == "https://x-access-token@example.invalid/x.git")
+        # Nothing from the userinfo survives over https: a token in the username
+        # with an empty password is the documented spelling, and git sends it as
+        # Basic auth. Over ssh the username is an account, and it does survive.
+        assert history._remote_url(repo, "origin") == "https://example.invalid/x.git"
         seen: list[list[str]] = []
         real = history.subprocess.run
 
@@ -1494,42 +1494,6 @@ class TestPrecedenceAndDiagnostics:
         assert any("single-branch clone" in r for r in reasons), reasons
         assert any("release/1.x" in r for r in reasons), reasons
 
-    def test_a_fork_checkout_is_judged_against_the_remote_it_came_from(self, tmp_path):
-        """`branch.<name>.remote` records where a branch *pulls from*, not where the
-        clone came from. Asking it first meant a fork checkout — `origin` the fork,
-        `upstream` the canonical repository — had every check pointed at upstream,
-        and origin's own unfetched branches stopped being looked at.
-        """
-        from deptrail.history import _clone_remote
-        origin = self.origin_with_two_branches(tmp_path, "fork")
-        repo = self.fresh(tmp_path, "fork-clone")
-        git(repo, "remote", "add", "origin", str(origin))
-        git(repo, "remote", "add", "upstream", str(origin))
-        git(repo, "fetch", "-q", "origin", "main")
-        git(repo, "checkout", "-qb", "main", "FETCH_HEAD")
-        git(repo, "config", "branch.main.remote", "upstream")
-        assert _clone_remote(repo) == "origin"
-
-    def test_several_remotes_without_origin_are_ambiguous(self, tmp_path):
-        """`branch.<name>.remote` records where a branch pulls from, not where the
-        clone came from, so it cannot stand in for the clone's source: a branch
-        reconfigured later names a remote this clone never came from, and the
-        coverage answer would be about the wrong repository while reading as
-        verified. Ambiguity is said out loud instead.
-        """
-        from deptrail.history import _clone_remote, incomplete_history
-        origin = self.origin_with_two_branches(tmp_path, "ambiguous")
-        repo = self.fresh(tmp_path, "ambiguous-clone")
-        git(repo, "remote", "add", "one", str(origin))
-        git(repo, "remote", "add", "two", str(origin))
-        git(repo, "fetch", "-q", "one", "main")
-        git(repo, "checkout", "-qb", "main", "FETCH_HEAD")
-        git(repo, "config", "branch.main.remote", "two")
-        assert _clone_remote(repo) is None
-        reasons, notes = incomplete_history(repo)
-        assert reasons == []
-        assert any("several remotes" in n for n in notes), notes
-
     def test_a_remote_with_no_url_says_so(self, tmp_path):
         """A remote section whose URL was unset is not the same as no remote at all,
         and silence there reads as coverage nobody checked.
@@ -1543,6 +1507,62 @@ class TestPrecedenceAndDiagnostics:
         reasons, notes = incomplete_history(repo)
         assert reasons == []
         assert any("no URL to ask" in n for n in notes), notes
+
+    def test_every_remote_is_asked_because_none_of_them_records_the_source(
+            self, tmp_path):
+        """Picking one remote produced three separate false all-clears in turn --
+        the name `origin` assumed, then `origin` preferred over the remote a
+        `-o upstream` clone came from, then the branch's own upstream, which names
+        where a branch pulls from and not where the clone came from. Nothing records
+        the source, so every remote is asked and a branch none of them accounts for
+        is one the walk cannot testify about.
+        """
+        from deptrail.history import incomplete_history
+        origin = self.origin_with_two_branches(tmp_path, "everyremote")
+        empty = tmp_path / "empty.git"
+        git(tmp_path, "init", "-q", "--bare", str(empty))
+        repo = self.fresh(tmp_path, "everyremote-clone")
+        # The remote holding the unfetched branch is not called origin, and is not
+        # the one the current branch tracks.
+        git(repo, "remote", "add", "origin", str(empty))
+        git(repo, "remote", "add", "upstream", str(origin))
+        git(repo, "fetch", "-q", "upstream", "main")
+        git(repo, "checkout", "-qb", "main", "FETCH_HEAD")
+        git(repo, "config", "branch.main.remote", "origin")
+        reasons, _ = incomplete_history(repo)
+        assert any("upstream/release/1.x" in r for r in reasons), reasons
+
+    def test_a_remote_defined_the_old_way_is_still_a_remote(self, tmp_path):
+        """`$GIT_DIR/remotes/<name>` predates the config sections, git still fetches
+        through it, and `git remote` does not list it — so a clone using one looked
+        like a clone with no remote at all, which costs nothing and says nothing.
+        """
+        from deptrail.history import incomplete_history
+        origin = self.origin_with_two_branches(tmp_path, "legacy")
+        repo = self.fresh(tmp_path, "legacy-clone")
+        remotes = repo / ".git" / "remotes"
+        remotes.mkdir(parents=True)
+        (remotes / "origin").write_text(
+            f"URL: {origin}\nPull: refs/heads/main:refs/remotes/origin/main\n")
+        git(repo, "fetch", "-q", "origin", "main")
+        git(repo, "checkout", "-qb", "main", "FETCH_HEAD")
+        reasons, _ = incomplete_history(repo)
+        assert any("release/1.x" in r for r in reasons), reasons
+
+    def test_a_tags_refspec_does_not_make_a_narrow_clone_look_wide(self, tmp_path):
+        """The refspec is one per line, and each line is judged on its own: testing
+        the whole blob for a `*` meant that adding the documented tags refspec to a
+        single-branch clone — one line, no other change — silenced the reason.
+        """
+        from deptrail.history import incomplete_history
+        origin = self.origin_with_two_branches(tmp_path, "tagspec")
+        repo = tmp_path / "tagspec-clone"
+        git(tmp_path, "clone", "-q", "--single-branch", "--branch", "main",
+            str(origin), str(repo))
+        git(repo, "config", "--add", "remote.origin.fetch",
+            "+refs/tags/*:refs/tags/*")
+        reasons, _ = incomplete_history(repo)
+        assert any("single-branch clone" in r for r in reasons), reasons
 
     def test_a_network_url_is_not_resolved_against_the_checkout(self, tmp_path):
         """`repo / url` turned `https://host/repo.git` into the candidate path

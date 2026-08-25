@@ -131,10 +131,25 @@ class Verdict(str, Enum):
     INDETERMINATE = "INDETERMINATE"
 
 
+def _git_env(**extra: str) -> dict[str, str]:
+    """The environment every git call here runs in.
+
+    ``GIT_DIR`` and its relatives name a repository, and they outrank both ``-C``
+    and the working directory. Inherited — from a hook, or a wrapper — they pointed
+    every one of these commands at a repository other than the one being scanned,
+    and the answers were about that one. The probe was taught this first and was
+    the only caller taught it, which left three subprocesses to be redirected.
+    """
+    env = {key: value for key, value in os.environ.items()
+           if key not in GIT_LOCATION_VARS}
+    env.update(extra)
+    return env
+
+
 def _git(repo: Path, *args: str) -> str:
     result = subprocess.run(
         ["git", "-C", str(repo), *args], capture_output=True,
-        text=True, encoding="utf-8",
+        text=True, encoding="utf-8", env=_git_env(),
     )
     if result.returncode != 0:
         raise GitError(f"git {args[0]} failed: {result.stderr.strip()[:200]}")
@@ -294,7 +309,7 @@ def _config(repo: Path, key: str) -> str:
     """One git config value, empty when unset. Never raises for a missing key."""
     result = subprocess.run(
         ["git", "-C", str(repo), "config", "--get-all", key],
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=_git_env(),
     )
     return result.stdout.strip() if result.returncode == 0 else ""
 
@@ -325,33 +340,52 @@ GIT_LOCATION_VARS = frozenset({
 })
 
 
-def _clone_remote(repo: Path) -> str | None:
-    """The remote this clone came from, whatever it is called.
+def _remotes(repo: Path) -> list[str]:
+    """Every remote this clone is configured with.
 
-    Every completeness check that reads config used to spell the name ``origin``,
-    and a clone made with ``-o upstream`` — or on a machine with
-    ``clone.defaultRemoteName`` set, which is one global config line — answered
-    none of them: not the single-branch refspec, not the partial-clone filter, not
-    ref coverage. A single-branch checkout of a repository whose other branch held
-    the pin went from exit 2 to exit 0 on that alone.
+    Choosing one was the mistake, and three false all-clears came out of it in
+    turn: the name ``origin`` was assumed and a clone made with ``-o upstream``
+    answered nothing; then ``origin`` was preferred and a fork added afterwards
+    took every check away from the remote the clone came from; then the branch's
+    own upstream was consulted and named a remote the clone had never seen. There
+    is no field that records where a checkout came from, so no answer to pick —
+    what a clone holds is compared against every remote it has, and a branch none
+    of them can account for is one the walk cannot testify about.
 
-``origin`` settles the ordinary case, and a lone remote can only be the one.
-    Nothing else is asked. ``branch.<name>.remote`` looked like a good third
-    answer and is not one: it records where a branch *pulls from*, not where the
-    clone came from, so in a fork checkout it named the canonical repository
-    instead of the fork, and a branch reconfigured later named a remote the clone
-    never came from at all — either way the coverage answer would be about the
-    wrong repository while reading as verified. Several remotes with no ``origin``
-    is genuinely ambiguous, and the caller says so rather than picking.
+    ``$GIT_DIR/remotes/<name>`` is read too. It predates the config sections, git
+    still honours it for fetching, and ``git remote`` does not list it — a clone
+    using one looked to this code like a clone with no remote at all, which costs
+    nothing and says nothing.
     """
-    remotes = _local_git(repo, ["remote"], "").stdout.split()
-    if "origin" in remotes:
-        return "origin"
-    return remotes[0] if len(remotes) == 1 else None
+    names = {line.strip()
+             for line in _local_git(repo, ["remote"], "").stdout.splitlines()
+             if line.strip()}
+    git_dir = _local_git(repo, ["rev-parse", "--git-dir"], "").stdout.strip()
+    if git_dir:
+        legacy = Path(git_dir)
+        legacy = (legacy if legacy.is_absolute() else repo / legacy) / "remotes"
+        if legacy.is_dir():
+            names |= {entry.name for entry in legacy.iterdir() if entry.is_file()}
+    return sorted(names)
+
+
+def _fetches_every_head(refspec: str) -> bool:
+    """Whether this remote's refspec brings every branch the remote has.
+
+    One refspec per line, and each line judged on its own: testing the whole blob
+    for a ``*`` meant that adding the documented tags refspec to a single-branch
+    clone — one line, no other change — made it look like a full one.
+    """
+    for line in refspec.splitlines():
+        source = line.strip().lstrip("+").partition(":")[0]
+        if source == "refs/*" or (source.startswith("refs/heads/")
+                                  and source.endswith("*")):
+            return True
+    return False
 
 
 def _remote_url(repo: Path, remote: str) -> str | None:
-    """``origin``'s URL as a value, or ``None`` when there is nothing safe to use.
+    """A remote's URL as a value, or ``None`` when there is nothing safe to use.
 
     A URL beginning with ``-`` would reach git as an option rather than a remote,
     and a relative local path is written against the clone, so it is resolved here
@@ -383,27 +417,29 @@ def _remote_url(repo: Path, remote: str) -> str | None:
 
 
 def _without_userinfo(url: str) -> str:
-    """The same URL with any embedded credentials dropped.
+    """The same URL with any embedded credential dropped.
 
     Writing the URL to a config file instead of a command line does not keep a
     token out of process listings, because git hands the full URL to its own
     transport helper: ``git remote-https origin https://user:token@host/path``
-    shows in ``ps`` and in ``GIT_TRACE`` whatever this code does. So the credential
-    is not carried at all. Where the operator's own credential helper knows the
-    host — the ordinary case on a machine that cloned the repository — the query
-    still authenticates; where it does not, coverage comes back unverified, which
-    is the honest outcome and not a token this tool handed to a child process.
+    shows in ``ps`` and in ``GIT_TRACE`` whatever this code does.
+
+    Over http and https the username is a credential slot, not a name: a personal
+    access token with an empty password is the documented spelling, and keeping
+    "the username, since a username is not a secret" sent one as Basic auth to a
+    host the scanned repository chose — measured against a local server. Nothing
+    from the userinfo survives there. Over ssh it does: authentication is by key,
+    the ``git`` in ``ssh://git@github.com/…`` is the account being reached rather
+    than a secret, and dropping it probed as whatever OS user the responder is.
     """
     scheme, separator, rest = url.partition("://")
     authority, slash, tail = rest.partition("/")
     userinfo, at, host = authority.rpartition("@")
-    # A username is not a credential — `ssh://git@github.com/...` needs its `git`,
-    # and dropping it probed as whatever OS user the responder happens to be, so a
-    # real remote came back unreachable and its unfetched branches became a caveat
-    # instead of a reason. A password is the part worth refusing to carry.
-    if not separator or not at or ":" not in userinfo:
+    if not separator or not at:
         return url
-    return f"{scheme}://{userinfo.partition(':')[0]}@{host}{slash}{tail}"
+    if scheme.endswith("ssh"):
+        return f"{scheme}://{userinfo.partition(':')[0]}@{host}{slash}{tail}"
+    return f"{scheme}://{host}{slash}{tail}"
 
 
 def _remote_heads(repo: Path, remote: str = "origin") -> dict[str, str] | None:
@@ -413,16 +449,22 @@ def _remote_heads(repo: Path, remote: str = "origin") -> dict[str, str] | None:
     ``.git/config`` is input and not settings — and git config is a place where
     commands hide. Both ``core.sshCommand`` and ``remote.origin.uploadpack`` were
     measured executing a planted value during ``ls-remote``, and overriding each in
-    turn is a game with no last move: the fix is to stop reading that config at all.
-    The URL is taken out as a *value* and the query runs from a neutral directory,
-    where only the operator's own global config applies. A remote whose settings
-    lived in the clone (a deploy key in ``core.sshCommand``, say) loses its coverage
-    answer, which degrades to "not verified" and nothing worse.
+    turn is a game with no last move: the URL is taken out as a *value* and the
+    query runs from a throwaway repository elsewhere, so that config is never read.
 
-    ``GIT_TERMINAL_PROMPT=0`` is the other load-bearing part: a private remote whose
-    credentials this machine does not hold would otherwise stop the scan at an
-    interactive password prompt. With it, the same remote fails in well under a
-    second and the caller reports that coverage is unverified.
+    The operator's own config is not read either, and that is the harder half. It
+    is where credentials live, and the URL being asked about comes from the
+    repository under suspicion: an unscoped ``http.extraHeader`` was measured
+    reaching a host the scanned checkout named, and clearing that one key by name
+    does not work — a URL-scoped header outranks the override, still goes out, and
+    takes the unscoped one with it. So the probe authenticates as nobody. What it
+    costs is real: a private remote comes back unverified rather than answered, as
+    does one behind a proxy the operator configured globally. The alternative is
+    handing whatever the machine holds to whatever address a compromised
+    repository writes down, and "unverified" is a caveat while that is a breach.
+
+    ``GIT_TERMINAL_PROMPT=0`` keeps the same remote from stopping the scan at an
+    interactive password prompt; it fails in well under a second instead.
     """
     url = _remote_url(repo, remote)
     if url is None:
@@ -437,11 +479,19 @@ def _remote_heads(repo: Path, remote: str = "origin") -> dict[str, str] | None:
     # broadest list.
     if os.environ.get("GIT_ALLOW_PROTOCOL") is not None:
         allowed &= set(os.environ["GIT_ALLOW_PROTOCOL"].split(":"))
-    env = {key: value for key, value in os.environ.items()
-           if key not in GIT_LOCATION_VARS}
+    env = _git_env()
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["GIT_ALLOW_PROTOCOL"] = ":".join(sorted(allowed))
     with tempfile.TemporaryDirectory(prefix="deptrail-refs-") as probe:
+        # No config but the one written below. `GIT_CONFIG_GLOBAL` and
+        # `GIT_CONFIG_SYSTEM` say it outright on git 2.32 and later, and pointing
+        # `HOME` at the empty probe says the same thing to every git that has ever
+        # looked there — belt and braces, because a version that quietly ignored the
+        # first pair would read the operator's credentials and never say so.
+        env["GIT_CONFIG_GLOBAL"] = os.devnull
+        env["GIT_CONFIG_SYSTEM"] = os.devnull
+        env["GIT_CONFIG_NOSYSTEM"] = "1"
+        env["HOME"] = env["XDG_CONFIG_HOME"] = env["USERPROFILE"] = probe
         started = subprocess.run(["git", "init", "-q", probe], env=env,
                                  capture_output=True, text=True, check=False)
         if started.returncode != 0:
@@ -463,14 +513,7 @@ def _remote_heads(repo: Path, remote: str = "origin") -> dict[str, str] | None:
         sink = Path(probe) / "advertisement"
         with sink.open("wb") as buffered:
             result = subprocess.run(
-                # The URL comes from a repository this code treats as hostile, and
-                # an unscoped `http.extraHeader` in the operator's own global config
-                # is sent to whatever host that URL names — measured, a bearer token
-                # reaching a server the scanned checkout chose. Credential helpers
-                # stay: they answer per host, so a remote the operator has no
-                # credential for simply comes back unreachable.
-                ["git", "-C", probe, "-c", "http.extraHeader=",
-                 "ls-remote", "--heads", "origin"],
+                ["git", "-C", probe, "ls-remote", "--heads", "origin"],
                 stdout=buffered, stderr=subprocess.DEVNULL,
                 env=env, timeout=LS_REMOTE_TIMEOUT, check=False,
             )
@@ -509,7 +552,7 @@ def _local_git(repo: Path, args: list[str], stdin: str) -> subprocess.CompletedP
     return subprocess.run(
         ["git", "-C", str(repo), *args], input=stdin,
         capture_output=True, text=True, encoding="utf-8", check=False,
-        env={**os.environ, "GIT_NO_LAZY_FETCH": "1"},
+        env=_git_env(GIT_NO_LAZY_FETCH="1"),
     )
 
 
@@ -622,21 +665,23 @@ def incomplete_history(repo: Path,
         reasons.append(
             "shallow clone: history is truncated, absence of exposure is not evidence"
         )
-    remote = _clone_remote(repo)
-    fetch = _config(repo, f"remote.{remote}.fetch") if remote else ""
-    if fetch and "*" not in fetch:
-        reasons.append(
-            f"single-branch clone ({fetch}): other refs, if the remote has any, were "
-            "not fetched, and exposure on a branch nobody fetched is still exposure"
-        )
-    if remote and _config(repo, f"remote.{remote}.promisor") == "true":
-        filtered = (_config(repo, f"remote.{remote}.partialclonefilter")
-                    or "unknown filter")
-        notes.append(
-            f"partial clone ({filtered}): lockfile contents were fetched on demand; "
-            "any that could not be read are listed as unreadable snapshots"
-        )
-    reason, note = _ref_coverage(repo, remote, coverage_cache)
+    for remote in _remotes(repo):
+        fetch = _config(repo, f"remote.{remote}.fetch")
+        if fetch and not _fetches_every_head(fetch):
+            reasons.append(
+                f"single-branch clone ({remote}: {fetch.splitlines()[0]}): other "
+                "refs, if the remote has any, were not fetched, and exposure on a "
+                "branch nobody fetched is still exposure"
+            )
+        if _config(repo, f"remote.{remote}.promisor") == "true":
+            filtered = (_config(repo, f"remote.{remote}.partialclonefilter")
+                        or "unknown filter")
+            notes.append(
+                f"partial clone ({filtered}): lockfile contents were fetched on "
+                "demand; any that could not be read are listed as unreadable "
+                "snapshots"
+            )
+    reason, note = _ref_coverage(repo, coverage_cache)
     if reason:
         reasons.append(reason)
     if note:
@@ -644,10 +689,16 @@ def incomplete_history(repo: Path,
     return reasons, notes
 
 
-def _ref_coverage(repo: Path, remote: str | None,
+def _ref_coverage(repo: Path,
                   cache: dict[str, tuple[str | None, str | None]] | None = None,
                   ) -> tuple[str | None, str | None]:
-    """What the remote's branch list says about this clone: (reason, observation).
+    """What the remotes' branch lists say about this clone: (reason, observation).
+
+    Every remote is asked, and a branch none of them can account for is one the
+    walk cannot testify about. A fork checkout is told that its upstream's
+    unfetched branches are unfetched, which is true and is waivable with
+    ``--allow-incomplete-history``; the alternative — picking one remote — was
+    three separate false all-clears.
 
     ``cache`` is keyed by repository because the answer is a property of the
     checkout and not of the advisory: ``scan_organization`` walks every repository
@@ -657,47 +708,34 @@ def _ref_coverage(repo: Path, remote: str | None,
     key = str(repo)
     if cache is not None and key in cache:
         return cache[key]
-    if remote is None:
-        # Several remotes, no upstream branch, no `origin`: which one this clone
-        # came from is not recorded anywhere, and picking would be a guess.
-        outcome: tuple[str | None, str | None] = (
-            (None, "ref coverage was not verified: this clone has several remotes "
-                   "and none of them is the one it came from, so there is nothing "
-                   "to compare its refs against")
-            if _local_git(repo, ["remote"], "").stdout.split() else (None, None))
-        if cache is not None:
-            cache[key] = outcome
-        return outcome
-    if not _config(repo, f"remote.{remote}.url"):
-        # A remote section with no URL is not the same as no remote: something was
-        # unset, and silence there reads as coverage nobody checked.
-        outcome = (None, f"ref coverage was not verified: {remote} has no URL to "
-                         "ask, so what this clone holds could not be compared "
-                         "against what the repository has")
-        if cache is not None:
-            cache[key] = outcome
-        return outcome
-    try:
-        heads = _remote_heads(repo, remote)
-    except (OSError, subprocess.SubprocessError):
-        heads = None
-    if heads is None:
-        outcome = (None,
-                   f"ref coverage was not verified: {remote} could not be reached, so "
-                   "a checkout that fetched only some branches cannot be told from "
-                   "a complete one")
-    elif (missing := _heads_not_here(repo, heads)):
+    missing: list[str] = []
+    silent: list[str] = []
+    for remote in _remotes(repo):
+        try:
+            heads = _remote_heads(repo, remote)
+        except (OSError, subprocess.SubprocessError):
+            heads = None
+        if heads is None:
+            silent.append(remote)
+            continue
+        missing += [f"{remote}/{branch}" for branch in _heads_not_here(repo, heads)]
+    reason = note = None
+    if missing:
         # The names are the point — they are what a responder re-fetches — but a
         # repository can have hundreds of branches, and a reason that prints them
         # all is a reason nobody reads.
-        shown = ", ".join(missing[:5])
+        shown = ", ".join(sorted(missing)[:5])
         if len(missing) > 5:
             shown += f", and {len(missing) - 5} more"
-        outcome = (f"{len(missing)} branch(es) on {remote} are not in this clone "
-                   f"({shown}): a branch this clone cannot walk cannot testify, "
-                   "and exposure on it is still exposure", None)
-    else:
-        outcome = (None, None)
+        reason = (f"{len(missing)} branch(es) on this clone's remote(s) are not in "
+                  f"it ({shown}): a branch this clone cannot walk cannot testify, "
+                  "and exposure on it is still exposure")
+    if silent:
+        note = (f"ref coverage was not verified against {', '.join(silent)}: a "
+                "remote that cannot be reached, or has no URL to ask, leaves a "
+                "checkout that fetched only some branches looking like a complete "
+                "one")
+    outcome = (reason, note)
     if cache is not None:
         cache[key] = outcome
     return outcome
