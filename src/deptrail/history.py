@@ -348,9 +348,16 @@ def _remote_heads(repo: Path) -> dict[str, str] | None:
     if url is None:
         return None
     neutral = tempfile.gettempdir()
+    # An operator may narrow the transports; they may not widen them. `setdefault`
+    # deferred to whatever was already in the environment, and a permissive value
+    # there put `ext::` — which runs the command named in the URL, and the URL comes
+    # from the repository under investigation — back within reach.
+    allowed = set(REMOTE_PROTOCOLS.split(":"))
+    if os.environ.get("GIT_ALLOW_PROTOCOL"):
+        allowed &= set(os.environ["GIT_ALLOW_PROTOCOL"].split(":"))
     env = {**os.environ, "GIT_TERMINAL_PROMPT": "0",
-           "GIT_CEILING_DIRECTORIES": neutral}
-    env.setdefault("GIT_ALLOW_PROTOCOL", REMOTE_PROTOCOLS)
+           "GIT_CEILING_DIRECTORIES": neutral,
+           "GIT_ALLOW_PROTOCOL": ":".join(sorted(allowed))}
     result = subprocess.run(
         ["git", "ls-remote", "--heads", url],
         capture_output=True, text=True, encoding="utf-8", cwd=neutral,
@@ -406,33 +413,41 @@ def _heads_not_here(repo: Path, heads: dict[str, str]) -> list[str]:
     no ref leads to. Asking per branch instead cost a process per unfetched tip,
     which on an origin with hundreds of branches is the case this check exists for.
     """
-    refs, tips = ["HEAD"], set()
+    tips = set()
     for line in _git(repo, "for-each-ref", "--format=%(objectname) %(refname)",
                      "refs/heads", "refs/remotes").splitlines():
-        tip, _, ref = line.partition(" ")
-        refs.append(ref)
+        tip, _, _ref = line.partition(" ")
         tips.add(tip)
+    # HEAD only once it resolves. An unborn HEAD — a clone that fetched but never
+    # checked out — made `^HEAD` a fatal argument, and one fatal argument was read
+    # below as "nothing is reachable", so a complete clone was told it was missing
+    # every branch it had.
     head = _local_git(repo, ["rev-parse", "--verify", "--quiet", "HEAD"], "")
-    if head.returncode == 0:
+    if head.returncode == 0 and head.stdout.strip():
         tips.add(head.stdout.strip())
     candidates = {name: tip for name, tip in heads.items() if tip not in tips}
     if not candidates:
         return []
+    # One batch decides what this clone holds at all — of the tips asked about and
+    # of its own refs. Excluding by object rather than by name is what keeps a
+    # single broken ref (a pruned clone leaves them) from making `rev-list` fatal
+    # and every diverged branch read as missing.
     here = set()
     known = _local_git(repo, ["cat-file", "--batch-check"],
-                       "\n".join(candidates.values()) + "\n")
+                       "\n".join({*candidates.values(), *tips}) + "\n")
     for line in known.stdout.splitlines():
         name, _, rest = line.partition(" ")
         if rest and not rest.startswith("missing"):
             here.add(name)
+    wanted = {tip for tip in candidates.values() if tip in here}
     unreachable = {tip for tip in candidates.values() if tip not in here}
-    if here:
+    if wanted:
         walked = _local_git(
             repo, ["rev-list", "--no-walk", "--stdin"],
-            "\n".join([*here, *(f"^{ref}" for ref in refs)]) + "\n")
+            "\n".join([*wanted, *(f"^{tip}" for tip in tips & here)]) + "\n")
         # A refusal is not evidence of coverage: read it as nothing reachable.
         unreachable |= (set(walked.stdout.split()) if walked.returncode == 0
-                        else here)
+                        else wanted)
     return sorted(name for name, tip in candidates.items() if tip in unreachable)
 
 
@@ -504,11 +519,14 @@ def _ref_coverage(repo: Path,
     once per advisory package, and without it a 180-package advisory over 200
     repositories would have asked 36,000 times.
     """
-    if not _config(repo, "remote.origin.url"):
-        return None, None
     key = str(repo)
     if cache is not None and key in cache:
         return cache[key]
+    if not _config(repo, "remote.origin.url"):
+        outcome: tuple[str | None, str | None] = (None, None)
+        if cache is not None:
+            cache[key] = outcome
+        return outcome
     try:
         heads = _remote_heads(repo)
     except (OSError, subprocess.SubprocessError):
