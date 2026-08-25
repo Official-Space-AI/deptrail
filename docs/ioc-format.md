@@ -232,7 +232,7 @@ A version the registry has no publish time for stops the import rather than bein
 skipped. A malicious version silently missing from a feed is the difference between
 a repository being reported and being cleared.
 
-**This is the only command that touches the network, and it is not a scan.** It
+**This is the only command that reads the registry, and it is not a scan.** It
 writes a file you read and then pass to `scan`. A verdict must not depend on a
 registry the incident may itself have taken down, and a window that differs between
 two runs of the same scan is not evidence.

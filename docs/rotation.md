@@ -64,8 +64,9 @@ The run exits `2` and says what it could not read.
 
 **The clone itself held less than the repository does** — shallow (including the
 default `actions/checkout`, which fetches depth 1), partial (`--filter=blob:none`,
-which has the commits but not the blobs), or single-branch (a refspec with no
-wildcard, so "every ref testifies" is false). Each is named, each forces exit `2`, and
+which has the commits but not the blobs), single-branch (a refspec with no
+wildcard, so "every ref testifies" is false), or missing branches the remote has
+(named by asking `origin`, because a one-branch `fetch` looks complete locally). Each is named, each forces exit `2`, and
 none of them raises a credential. The remedy is a deeper clone, which is why this is
 kept apart from an unreadable artifact: nothing fixes a corrupt lockfile, and
 `--allow-incomplete-history` may waive only this kind — off by default, and the reason

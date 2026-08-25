@@ -112,9 +112,11 @@ deptrail advisory derive \
 
 Each window start is read from that package's registry publish time and cited by
 URL; each end is left `null`, because no registry records a removal time. This is
-the one command that touches the network, and it is not a scan — it writes a file
+the only command that reads the registry, and it is not a scan — it writes a file
 you then pass to `scan`, so a verdict never depends on a registry the incident may
-itself have taken down.
+itself have taken down. A scan reaches the network for its own evidence — cloning,
+CI runs, and `origin`'s branch list — but never for a value that could make a
+verdict cleaner than the repository warrants.
 
 Or write one by hand — the alternative to the above, not a step after it, when you
 have no version list to derive from:
@@ -219,10 +221,12 @@ read as a scan that found nothing.
   `--allow-incomplete-history` — off by default, and it still prints the reason. A
   partial clone (`--filter=blob:none`) is fine as long as its blobs can be fetched; any
   snapshot that could not be read is listed instead.
-- **A one-branch `fetch` cannot be told from a full clone.** `git init` + `git fetch
-  origin <branch>` keeps a wildcard refspec, so a branch that was never fetched looks
-  like a branch that does not exist. Deciding this needs the remote's ref list
-  ([#27](https://github.com/Official-Space-AI/deptrail/issues/27)).
+  A one-branch `fetch` — `git init` + `git fetch origin <branch>`, which keeps the
+  wildcard refspec and so looks complete locally — is caught by asking the remote:
+  the branches it has that this clone never fetched are named, and they stop the
+  all-clear too. **When `origin` cannot be reached, ref coverage is left unverified**
+  and the report says so rather than guessing; the exit code is unchanged, so an
+  offline scan of a complete clone is not accused of a gap it does not have.
 - **A pull-request run installed a tree that is in no branch.** GitHub synthesises
   `refs/pull/N/merge` for `pull_request` events, and it is reachable from no ref in a
   normal clone, so what such a run installed is currently graded from the head commit
