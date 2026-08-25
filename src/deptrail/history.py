@@ -57,6 +57,7 @@ from __future__ import annotations
 import os
 import posixpath
 import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
@@ -310,31 +311,49 @@ LS_REMOTE_TIMEOUT = 10.0
 REMOTE_PROTOCOLS = "https:http:git:ssh:file"
 
 
+def _remote_url(repo: Path) -> str | None:
+    """``origin``'s URL as a value, or ``None`` when there is nothing safe to use.
+
+    A URL beginning with ``-`` would reach git as an option rather than a remote,
+    and a relative local path is written against the clone, so it is resolved here
+    while that is still meaningful.
+    """
+    lines = _config(repo, "remote.origin.url").splitlines()
+    url = lines[0].strip() if lines else ""
+    if not url or url.startswith("-"):
+        return None
+    local = repo / url
+    return str(local.resolve()) if local.exists() else url
+
+
 def _remote_heads(repo: Path) -> dict[str, str] | None:
     """The remote's branch names and tips, or ``None`` when it could not be asked.
 
-    This is the one place the walk runs git *against a remote*, and the repository
-    it runs in is the one under investigation — so its `.git/config` is input from
-    a possibly compromised source, not settings to obey. ``core.sshCommand`` is the
-    proven case: a value planted there is executed by ``ls-remote``, measured, so it
-    is overridden on the command line, where `-c` outranks the repository's own
-    config. What that costs is a custom ssh invocation (a deploy key, say) losing
-    its coverage answer, which degrades to "not verified" and nothing worse. The
-    ``credential.helper`` form of the same trick is left alone deliberately —
-    clearing it would take ref coverage away from every private remote — and is
-    tracked separately.
+    The repository under investigation may be the compromised one, so its
+    ``.git/config`` is input and not settings — and git config is a place where
+    commands hide. Both ``core.sshCommand`` and ``remote.origin.uploadpack`` were
+    measured executing a planted value during ``ls-remote``, and overriding each in
+    turn is a game with no last move: the fix is to stop reading that config at all.
+    The URL is taken out as a *value* and the query runs from a neutral directory,
+    where only the operator's own global config applies. A remote whose settings
+    lived in the clone (a deploy key in ``core.sshCommand``, say) loses its coverage
+    answer, which degrades to "not verified" and nothing worse.
 
     ``GIT_TERMINAL_PROMPT=0`` is the other load-bearing part: a private remote whose
     credentials this machine does not hold would otherwise stop the scan at an
     interactive password prompt. With it, the same remote fails in well under a
     second and the caller reports that coverage is unverified.
     """
-    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    url = _remote_url(repo)
+    if url is None:
+        return None
+    neutral = tempfile.gettempdir()
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0",
+           "GIT_CEILING_DIRECTORIES": neutral}
     env.setdefault("GIT_ALLOW_PROTOCOL", REMOTE_PROTOCOLS)
     result = subprocess.run(
-        ["git", "-C", str(repo), "-c", "core.sshCommand=ssh",
-         "ls-remote", "--heads", "origin"],
-        capture_output=True, text=True, encoding="utf-8",
+        ["git", "ls-remote", "--heads", url],
+        capture_output=True, text=True, encoding="utf-8", cwd=neutral,
         env=env, timeout=LS_REMOTE_TIMEOUT, check=False,
     )
     if result.returncode != 0:
@@ -350,19 +369,19 @@ def _remote_heads(repo: Path) -> dict[str, str] | None:
     return heads
 
 
-def _reaches(repo: Path, commit: str, refs: list[str]) -> bool:
-    """Whether any ref the walk enumerates leads to this commit.
+def _local_git(repo: Path, args: list[str], stdin: str) -> subprocess.CompletedProcess:
+    """A local query in the clone, with lazy fetching off.
 
-    ``rev-list`` stops at the first commit reachable from ``commit`` and from no
-    ref, so a held branch costs one early exit rather than a full traversal. A
-    commit this clone does not have at all makes it fail, which is the answer.
+    A promisor clone asked about an object it does not hold goes and fetches it,
+    which would put an unbounded network call — no timeout, no prompt guard —
+    inside what is supposed to be a local membership test, and would write to the
+    repository besides. Absent is the answer here, not something to go and fix.
     """
-    result = subprocess.run(
-        ["git", "-C", str(repo), "rev-list", "--max-count=1", "--stdin"],
-        input="\n".join([commit, *(f"^{ref}" for ref in refs)]),
+    return subprocess.run(
+        ["git", "-C", str(repo), *args], input=stdin,
         capture_output=True, text=True, encoding="utf-8", check=False,
+        env={**os.environ, "GIT_NO_LAZY_FETCH": "1"},
     )
-    return result.returncode == 0 and not result.stdout.strip()
 
 
 def _heads_not_here(repo: Path, heads: dict[str, str]) -> list[str]:
@@ -376,18 +395,45 @@ def _heads_not_here(repo: Path, heads: dict[str, str]) -> list[str]:
     directly: held under another name still counts, a ref that has moved past it
     still counts, and a tip nothing leads to is a branch this clone cannot judge.
 
-    The exact-tip set answers most branches without a subprocess at all, because a
-    clone that fetched a branch and has not fallen behind points a ref straight at
-    it; only the ones that diverge cost a ``rev-list``.
+    ``HEAD`` is enumerated with the refs because ``_refs`` walks it: a detached
+    checkout can be the only thing holding a tip, and leaving it out reported a
+    complete clone as missing every branch it had.
+
+    Two subprocesses answer the whole remote, whatever its size. The exact-tip set
+    settles most branches without either — a clone that fetched a branch and has
+    not fallen behind points a ref straight at it — then one ``cat-file`` says
+    which of the rest are here at all, and one ``rev-list`` says which of *those*
+    no ref leads to. Asking per branch instead cost a process per unfetched tip,
+    which on an origin with hundreds of branches is the case this check exists for.
     """
-    refs, tips = [], set()
+    refs, tips = ["HEAD"], set()
     for line in _git(repo, "for-each-ref", "--format=%(objectname) %(refname)",
                      "refs/heads", "refs/remotes").splitlines():
         tip, _, ref = line.partition(" ")
         refs.append(ref)
         tips.add(tip)
-    return sorted(name for name, tip in heads.items()
-                  if tip not in tips and not _reaches(repo, tip, refs))
+    head = _local_git(repo, ["rev-parse", "--verify", "--quiet", "HEAD"], "")
+    if head.returncode == 0:
+        tips.add(head.stdout.strip())
+    candidates = {name: tip for name, tip in heads.items() if tip not in tips}
+    if not candidates:
+        return []
+    here = set()
+    known = _local_git(repo, ["cat-file", "--batch-check"],
+                       "\n".join(candidates.values()) + "\n")
+    for line in known.stdout.splitlines():
+        name, _, rest = line.partition(" ")
+        if rest and not rest.startswith("missing"):
+            here.add(name)
+    unreachable = {tip for tip in candidates.values() if tip not in here}
+    if here:
+        walked = _local_git(
+            repo, ["rev-list", "--no-walk", "--stdin"],
+            "\n".join([*here, *(f"^{ref}" for ref in refs)]) + "\n")
+        # A refusal is not evidence of coverage: read it as nothing reachable.
+        unreachable |= (set(walked.stdout.split()) if walked.returncode == 0
+                        else here)
+    return sorted(name for name, tip in candidates.items() if tip in unreachable)
 
 
 def incomplete_history(repo: Path,
