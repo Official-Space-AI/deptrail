@@ -230,9 +230,15 @@ read as a scan that found nothing.
   A one-branch `fetch` — `git init` + `git fetch origin <branch>`, which keeps the
   wildcard refspec and so looks complete locally — is caught by asking the remote:
   the branches it has that this clone never fetched are named, and they stop the
-  all-clear too. **When `origin` cannot be reached, ref coverage is left unverified**
-  and the report says so rather than guessing; the exit code is unchanged, so an
-  offline scan of a complete clone is not accused of a gap it does not have.
+  all-clear too. **When the address the operator named — `--org`, or one `--repo`
+  with `--slug` — cannot be asked, that stops the all-clear as well**: no other
+  remote can answer for it, because the scanned repository is the one that chooses
+  those. When a remote the *repository* names cannot be reached and no address was
+  given, ref coverage is left unverified and the report says so rather than
+  guessing; the exit code is unchanged there, so an offline `--repo` scan of a
+  complete clone is not accused of a gap it does not have
+  ([#106](https://github.com/Official-Space-AI/deptrail/issues/106) is the argument
+  that it should be).
 - **A pull-request run installed a tree that is in no branch.** GitHub synthesises
   `refs/pull/N/merge` for `pull_request` events, and it is reachable from no ref in a
   normal clone, so what such a run installed is currently graded from the head commit

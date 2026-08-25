@@ -550,6 +550,39 @@ class TestOneSlugCannotSpeakForSeveralRepositories:
         assert all(url == "https://github.com/acme/api-server.git"
                    for url in urls), urls
 
+    def test_an_org_names_every_repository_it_cloned(self, tmp_path, monkeypatch,
+                                                     capsys):
+        """`--org` is the other arm of the same condition, and it was the untested
+        one: dropping `args.org` from it turned ref coverage over a named address
+        off for every organization scan — on a private org, every source then falls
+        silent, silence without a named address is only a caveat, and #27 re-opens
+        at exit 0 for the whole organization. The suite stayed green.
+        """
+        from deptrail.demo import advisory_path, build
+        import deptrail.org as org
+
+        build(tmp_path / "demo")
+        advisory = advisory_path(tmp_path / "demo")
+        cache = tmp_path / "cache"
+        TestOrgCacheSafety()._fake_gh(monkeypatch, ["api", "docs"])
+        for name in ("api", "docs"):
+            TestOrgCacheSafety()._seed(cache, "acme", name)
+        seen: list[str | None] = []
+        original = org.scan_repo
+
+        def record(repo, query, cache=None, trusted_url=None, authenticate=True):
+            seen.append(trusted_url)
+            return original(repo, query, cache, trusted_url, authenticate)
+
+        monkeypatch.setattr(org, "scan_repo", record)
+        main(["scan", "--ioc", str(advisory), "--org", "acme", "--no-ci",
+              "--workdir", str(cache)])
+        capsys.readouterr()
+        # Each clone is asked about at the address built from the org and its own
+        # name, never one repository's address for another's.
+        assert set(seen) == {"https://github.com/acme/api.git",
+                             "https://github.com/acme/docs.git"}, seen
+
 
 class TestReportEncoding:
     def test_non_ascii_report_is_written_as_utf8(self, tmp_path):
