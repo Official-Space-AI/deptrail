@@ -1693,11 +1693,19 @@ class TestPrecedenceAndDiagnostics:
         probe would have asked the decoy it was handed.
         """
         from deptrail.history import _remote_url
-        origin = self.origin_with_two_branches(tmp_path, "decoy")
         repo = self.fresh(tmp_path, "decoy-clone")
-        decoy = repo / "https:/host"
-        decoy.mkdir(parents=True)
-        git(tmp_path, "clone", "-q", "--bare", str(origin), str(decoy / "repo.git"))
+        if os.name == "nt":
+            # Windows has no name a scheme can be written as, so the path the
+            # naive join produces cannot be planted at all — and `exists()` on
+            # it answers False rather than raising. The decoy is unavailable to
+            # an attacker there; what is left to hold is the return value.
+            assert not (repo / "https:" / "host" / "repo.git").exists()
+        else:
+            origin = self.origin_with_two_branches(tmp_path, "decoy")
+            decoy = repo / "https:/host"
+            decoy.mkdir(parents=True)
+            git(tmp_path, "clone", "-q", "--bare", str(origin),
+                str(decoy / "repo.git"))
         git(repo, "remote", "add", "origin", "https://host/repo.git")
         assert _remote_url(repo, "origin") == "https://host/repo.git"
 
