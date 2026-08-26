@@ -346,36 +346,36 @@ GIT_LOCATION_VARS = frozenset({
 # than a file, so blanking `HOME` and the config files does not touch them. The
 # askpass pair hands over a stored password on request; the ssh pair names a
 # command this code would then run against an address the scanned repository
-# chose; `GIT_CONFIG_COUNT` and its numbered keys are config with no file at all,
-# and an inherited `http.extraHeader` was measured going out through them.
+# chose; `GIT_CONFIG_COUNT` and `GIT_CONFIG_PARAMETERS` are config with no file at
+# all, and both were measured putting an `http.extraHeader` and a live
+# `credential.helper` into the probe -- git exports the second to every child of a
+# `git -c` command, so a scan run from an alias or a hook carries it.
 #
-# `GIT_CONFIG_PARAMETERS` is the same thing under a second name, and the more
-# likely one to be inherited: git writes it for every child process whenever the
-# parent was run as `git -c key=value`, so a scan launched from an alias, a hook
-# or `git rebase --exec` carries it. Measured, it survived every isolation above
-# — `http.extraHeader`, `http.sslVerify` and `credential.helper` all arrived in
-# the probe through it. It is command scope, so it also outranks the config file
-# this probe writes: a helper set this way is a helper the probe has, in a
-# directory that was meant to have none.
-#
-# `GIT_SSL_NO_VERIFY` is here because the probe now carries a credential. It turns
-# off certificate verification, so whoever is on the path receives the token, and
-# it cannot be answered from the config this probe writes: measured, an explicit
-# `http.sslVerify = true` in the probe's own file loses to it. `GIT_SSL_CAINFO`
-# and the proxy variables are deliberately *kept* — an operator behind a
-# TLS-intercepting proxy has no other way to make the query work, since the probe
-# refuses to read the global config where their CA is named, and naming a CA still
-# verifies against it.
-#: How the address the operator named is spoken about in a report. A clone may
-#: name one of its own remotes this, so the two are told apart by role and the
-#: collision is renamed where it is printed.
-NAMED_ADDRESS = "the repository you named"
-
+# `GIT_SSL_NO_VERIFY` is here because the probe carries a credential now and
+# unverified TLS hands it to whoever is on the path. `GIT_SSL_CAINFO` and the
+# proxy variables are deliberately kept: naming a CA still verifies, and they are
+# the only way a network behind an intercepting proxy works at all.
 PROBE_STRIPPED_VARS = frozenset({
     "GIT_CONFIG", "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS", "GIT_ASKPASS",
     "SSH_ASKPASS", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_PROXY_COMMAND",
     "SSH_AUTH_SOCK", "GIT_SSL_NO_VERIFY",
 })
+
+# What a report calls the address the operator named. A clone may name one of its
+# own remotes this, so the two are told apart by role and the collision is renamed
+# where it is printed.
+NAMED_ADDRESS = "the repository you named"
+
+# The only hosts a token may be sent to, and the only ones whose ambient token is
+# taken to be theirs.
+GITHUB_HOSTS = ("github.com", "www.github.com")
+
+
+# What a repository's ref coverage came out as, keyed by the checkout, the
+# address the operator named and whether a credential may go with the query --
+# the three things the answer is a function of.
+CoverageCache = dict[tuple[str, str | None, bool],
+                     tuple[str | None, str | None]]
 
 
 def _without_injected_config(env: dict[str, str]) -> dict[str, str]:
@@ -507,6 +507,19 @@ def _without_userinfo(url: str) -> str:
     return f"{scheme}://{host}{slash}{tail}"
 
 
+def _host_of(value: str) -> str:
+    """The hostname in a URL, or in a bare ``host[:port]``, lowercased.
+
+    Anything unrecognisable comes back as itself rather than as the empty string.
+    Read as ``partition("://")[2]``, a value with no scheme — ``ghe.example.com``,
+    which is how an operator would type it — yielded ``""``, which was taken for
+    "nobody named a host" and sent an enterprise token to github.com.
+    """
+    scheme, separator, rest = value.partition("://")
+    authority = (rest if separator else scheme).partition("/")[0]
+    return authority.rpartition("@")[2].partition(":")[0].lower()
+
+
 def _github_authorization(url: str) -> str | None:
     """A Basic header for a GitHub URL when the environment holds a token.
 
@@ -514,71 +527,41 @@ def _github_authorization(url: str) -> str | None:
     a trusted URL is that nothing about where this goes came from the repository,
     and a token is worth carrying only under exactly that condition.
     """
-    # Over plain http the header goes out before any redirect can upgrade it, so a
-    # token would be on the wire in the clear. Only the scheme that carries it
-    # inside TLS may carry it at all — the shipped CLI builds `https://` and
-    # nothing else, and this keeps that true for any other caller of the injected
-    # `remote_url`.
-    if not url.startswith("https://"):
-        return None
-    host = url.partition("://")[2].partition("/")[0].rpartition("@")[2]
-    if host not in ("github.com", "www.github.com"):
+    # Over plain http the header is on the wire before a redirect could upgrade it,
+    # so only the scheme that carries it inside TLS may carry it at all.
+    if not url.startswith("https://") or _host_of(url) not in GITHUB_HOSTS:
         return None
     # `GH_TOKEN` and `GITHUB_TOKEN` are github.com credentials by `gh`'s own rule —
-    # "used when a command targets either github.com or a subdomain of ghe.com",
-    # while a GitHub Enterprise Server host is served by `GH_ENTERPRISE_TOKEN`,
-    # which this code never reads. `GH_HOST` picks the default *target* when no
-    # `--hostname` is given; it does not re-home a token, and testing it here
-    # refused a github.com PAT for github.com. Measured, an operator who exports
-    # `GH_HOST` for their enterprise — following `gh`'s documented split exactly,
-    # enterprise token in `GH_ENTERPRISE_TOKEN` — had a complete, correct scan of a
-    # private github.com repository turned from exit 0 into exit 2.
+    # a GitHub Enterprise Server host is served by `GH_ENTERPRISE_TOKEN`, which this
+    # code never reads — so `GH_HOST` must not withhold them: it picks `gh`'s
+    # default target, not a token's home, and testing it here refused a github.com
+    # PAT for github.com and turned a correct scan from exit 0 into exit 2.
     #
-    # `GITHUB_SERVER_URL` is the one that does say where a token lives: Actions
-    # sets it to the instance that minted the run's token, so on a GHES runner
-    # `GH_TOKEN: ${{ github.token }}` — which this project's own `action.yml`
-    # writes — is that instance's credential and not github.com's. `gh` never
-    # consults it, so the `--hostname` pin below cannot catch that one.
+    # `GITHUB_SERVER_URL` is the one that does say where a token lives: Actions sets
+    # it to the instance that minted the run's token, so on a GHES runner
+    # `GH_TOKEN: ${{ github.token }}` — which this project's own `action.yml` writes
+    # — is that instance's. `gh` never consults it, so the `--hostname` pin below
+    # cannot catch that one.
     server = (os.environ.get("GITHUB_SERVER_URL") or "").strip()
-    # Parsed so that anything unrecognisable withholds rather than passes. Read as
-    # `partition("://")[2]`, a value with no scheme — `ghe.example.com`, which is
-    # how an operator would type it — yielded the empty string, was taken for
-    # "nobody named a host", and sent the enterprise token to github.com.
-    if server:
-        after = server.partition("://")
-        home = (after[2] if after[1] else after[0])
-        home = home.partition("/")[0].rpartition("@")[2].partition(":")[0].lower()
-    else:
-        home = "github.com"
     token = ""
-    if home in ("github.com", "www.github.com"):
+    if not server or _host_of(server) in GITHUB_HOSTS:
         token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN") or ""
     if not token:
-        # The same tool the scan already reads CI runs and secret names through, so
-        # it is the operator's own login and nothing new is being asked of them.
-        # Pinned to the host it will be sent to: `gh auth token` otherwise answers
-        # for whatever `GH_HOST` names, so an operator logged in to a GitHub
-        # Enterprise instance had that instance's stored credential handed to
-        # github.com.
-        #
-        # And asked with the environment's tokens taken away, because the flag does
-        # not outrank them: measured, `GH_TOKEN=X GH_HOST=ghe.example.com gh auth
-        # token --hostname github.com` prints X. Leaving them in handed back the
-        # exact credential the check above had just refused — including the Action's
-        # own `GH_TOKEN`, which on a GHES runner is that instance's. The two sources
-        # are disjoint: if the environment's token were ours to use, it was used
-        # above, so here it is only in the way.
+        # The operator's own login, through the tool this scan already reads CI runs
+        # and secret names with, so nothing new is being asked of them. Pinned to the
+        # host it will be sent to, and asked with the environment's tokens taken
+        # away: the flag does not outrank them, so `gh` handed straight back the
+        # credential the check above had just refused. If that one were ours to use
+        # it was used above, so here it is only in the way.
         env = _git_env()
         env.pop("GH_TOKEN", None)
         env.pop("GITHUB_TOKEN", None)
-        # An absent credential helper is an absent credential, not a statement
-        # about the remote. Unguarded, `gh` merely not being installed raised
-        # `FileNotFoundError` out of here, out of `_remote_heads` *before*
-        # `ls-remote` was ever built, and `_ref_coverage` read it as the named
-        # address falling silent — so `pip install deptrail` on a box without `gh`
-        # reported a public, complete clone as incomplete, and told the operator to
-        # go and set a token. A `gh` that hangs reaches the same place through
-        # `TimeoutExpired`, which the `timeout=` below makes reachable.
+        # An absent credential helper is an absent credential, not a statement about
+        # the remote. Unguarded, `gh` merely not being installed raised out of here
+        # and out of `_remote_heads` before `ls-remote` was ever built, and
+        # `_ref_coverage` read that as the named address falling silent — so a
+        # public, complete clone was reported incomplete on a box without `gh`, with
+        # advice to go and set a token. A `gh` that hangs arrives by `TimeoutExpired`.
         try:
             asked = subprocess.run(
                 ["gh", "auth", "token", "--hostname", "github.com"],
@@ -610,8 +593,9 @@ def _remote_heads(repo: Path, remote: str = "origin", *,
     repository under suspicion: an unscoped ``http.extraHeader`` was measured
     reaching a host the scanned checkout named, and clearing that one key by name
     does not work — a URL-scoped header outranks the override, still goes out, and
-    takes the unscoped one with it. So the probe carries no credential it can be given: no git config from a
-    file, none injected through the environment, no askpass, and nothing from a
+    takes the unscoped one with it. So the probe carries no credential it can be
+    given: no git config from a file, none injected through the environment, no
+    askpass, and nothing from a
     URL's userinfo. An ssh key on the account's own disk is the exception the
     docstring on ``_without_injected_config`` records. What it
     costs is real: a private remote comes back unverified rather than answered, as
@@ -673,11 +657,11 @@ def _remote_heads(repo: Path, remote: str = "origin", *,
         # the repository being scanned -- the one config this probe refuses to read.
         # Without this the Action's whole reason for the check goes unauthenticated
         # on a private repository, which is exactly where it was needed. It is
-        # written to the file rather than passed as an argument: `ps` sees argv.
-        # Only for an address the operator named. Keyed on the URL alone, a scan
-        # with GH_TOKEN in its environment -- which is every Action, and `--no-ci`
-        # among them -- attached the token to a github.com URL read from the
-        # checkout's own config, which is an address the repository chose.
+        # written to the file rather than passed as an argument, because `ps` sees
+        # argv, and only for an address the operator named: keyed on the URL alone,
+        # a scan with GH_TOKEN in its environment -- every Action, and `--no-ci`
+        # among them -- attached it to a github.com URL read from the checkout's own
+        # config, which is an address the repository chose.
         if trusted_url and authenticate:
             if (header := _github_authorization(url)) is not None:
                 quoted_url = url.replace("\\", "\\\\").replace('"', '\\"')
@@ -686,17 +670,14 @@ def _remote_heads(repo: Path, remote: str = "origin", *,
         # was stale GitHub replied 401, git asked the helper, git then ran
         # `credential erase`, and a read-only scan deleted the operator's saved
         # GitHub login -- from an ordinary run, and from `pytest` with every test
-        # green. The token below is the only credential this probe may hold.
+        # green. The header above is the only credential this probe may hold.
         settings += "[credential]\n\thelper = \n"
-        # Verified, and going nowhere else. Git's default `followRedirects = initial`
-        # lets the first request be redirected and then rebases the remote URL on the
-        # target: measured, the header this code writes for the address the operator
-        # named was stripped by curl on the redirect leg and then sent in full on the
-        # protocol-v2 POST that followed — to a different host, which also became the
-        # source of the branch list. `sslVerify` is pinned for what it says rather
-        # than what it enforces; the variable that actually turns verification off is
-        # taken away in `PROBE_STRIPPED_VARS`, because it outranks this line.
-        settings += "[http]\n\tfollowRedirects = false\n\tsslVerify = true\n"
+        # And it goes to the address it was written for and nowhere else. Git's
+        # default `followRedirects = initial` rebases the remote URL on the redirect
+        # target: measured, curl stripped the header on the redirect leg and then
+        # sent it in full on the protocol-v2 POST that followed, to a different host
+        # -- which also became the source of the branch list.
+        settings += "[http]\n\tfollowRedirects = false\n"
         config.write_text(config.read_text() + settings)
         # The advertisement lands in a file, not in this process: the timeout bounds
         # how long a hostile endpoint may talk, and nothing bounded how much, so a
@@ -837,7 +818,7 @@ def _heads_not_here(repo: Path, heads: dict[str, str]) -> list[str]:
 
 
 def incomplete_history(repo: Path,
-                       coverage_cache: dict[tuple[str, str | None, bool], tuple[str | None, str | None]]
+                       coverage_cache: CoverageCache
                        | None = None,
                        trusted_url: str | None = None, authenticate: bool = True,
                        ) -> tuple[list[str], list[str]]:
@@ -904,7 +885,7 @@ def incomplete_history(repo: Path,
 
 
 def _ref_coverage(repo: Path,
-                  cache: dict[tuple[str, str | None, bool], tuple[str | None, str | None]] | None = None,
+                  cache: CoverageCache | None = None,
                   trusted_url: str | None = None, authenticate: bool = True,
                   ) -> tuple[str | None, str | None]:
     """What the remotes' branch lists say about this clone: (reason, observation).
@@ -932,7 +913,6 @@ def _ref_coverage(repo: Path,
     if cache is not None and key in cache:
         return cache[key]
     found: dict[tuple[str, str], str] = {}
-    silent: list[str] = []
     # The address the operator named is asked *as well as* the clone's own remotes,
     # never instead of them. Replacing them looked reasonable -- they named it, so
     # it is the authority -- and it put #27 back: when the named address could not
@@ -952,28 +932,23 @@ def _ref_coverage(repo: Path,
         except (OSError, subprocess.SubprocessError):
             heads = None
         # A remote's name is a config section or a filename, so a clone can call one
-        # of its own remotes exactly what this code calls the operator's address.
-        # Then the report said "not verified against the repository you named, and
-        # rests on the repository you named", attributed that remote's gaps to the
-        # operator's address, and — with the named address silent too — dropped the
-        # colliding source out of the sentence entirely. It takes write access to
-        # `$GIT_DIR`, which is the same access every other planted-config defence
-        # here assumes, so the name is disambiguated rather than trusted.
+        # of its own remotes exactly what this code calls the operator's address --
+        # and the report then said "not verified against the repository you named,
+        # and rests on the repository you named" and filed that remote's gaps under
+        # the operator's address. Planting it needs write access to `$GIT_DIR`, which
+        # is what every other defence here already assumes, so the name is
+        # disambiguated rather than trusted.
         label = (NAMED_ADDRESS if url is not None
                  else f'remote "{remote}"' if remote == NAMED_ADDRESS else remote)
         if heads is None:
-            # `url` is set only for the address the operator named, and the roles are
-            # kept apart here rather than recovered by comparing label text later:
-            # the reason speaks about that address alone, and interpolating the whole
-            # silent list into "the address you named could not be asked" named the
-            # clone's own remotes as addresses the operator had chosen.
+            # `url` is set only for the address the operator named. The two roles are
+            # kept in separate lists rather than recovered afterwards by comparing
+            # label text, which is the same collision again.
             (silent_named if url is not None else silent_own).append(label)
-            silent.append(label)
             continue
-        # An empty advertisement is a source that said nothing, and the note below
-        # tells the operator what coverage rests on. A remote serving no refs at all
-        # — or one whose URL resolves to the checkout itself — counted as an answer,
-        # so the report named it as the thing standing behind a clean result.
+        # An empty advertisement is a source that said nothing. Counted as an answer,
+        # a remote serving no refs -- or one whose URL resolves to the checkout
+        # itself -- was named below as what a clean result rested on.
         if heads:
             answered.append(label)
         # One line per gap, and a gap is a branch *at a tip*: the named address and
@@ -996,26 +971,19 @@ def _ref_coverage(repo: Path,
         reason = (f"{len(missing)} branch(es) on this clone's remote(s) are not in "
                   f"it ({shown}): a branch this clone cannot walk cannot testify, "
                   "and exposure on it is still exposure")
+    silent = silent_named + silent_own
     if silent_named:
-        # Withholding the token withheld the *answer*, and an answer nobody got is
-        # not an answer nobody needed. On a private repository the unauthenticated
-        # query is refused, the clone's own remote is the same address and is
-        # refused too, and every source falls silent -- so the check ran, found
-        # nothing to say, and the clone was cleared. Measured, the same clone with
-        # an unfetched branch holding the poisoned pin exited 2 without `--no-ci`
-        # and 0 with it, which is the split this path was added to close.
+        # Withholding the token withheld the *answer*: on a private repository the
+        # unauthenticated query is refused, the clone's own remote is that same
+        # address and is refused too, so the check ran, had nothing to say, and the
+        # clone was cleared -- measured, exit 2 without `--no-ci` and 0 with it, over
+        # a poisoned pin on an unfetched branch. Nor does another remote answering
+        # stand in for the named one, which was the first attempt at this: the
+        # *scanned repository* chooses which remotes it has, so a stale mirror or a
+        # plain decoy was enough to clear the clone.
         #
-        # Another remote answering does not stand in for it, and letting it was the
-        # first attempt at this: the *scanned repository* chooses which remotes it
-        # has, so a public fork, a stale mirror or a plain decoy -- any address
-        # whose heads the clone already holds -- was enough to turn the named
-        # repository's silence back into a note and clear the clone.
-        #
-        # The remedy is only named where it is known to be the remedy. Every
-        # unreachable address arrives here -- a deleted repository, a mistyped
-        # slug, no network, a proxy this probe refuses to read -- and telling an
-        # operator whose repository is public and complete to go and set a token
-        # prescribes a fix for something that is not wrong.
+        # The remedy is named only where it is known to be one -- a deleted
+        # repository, a mistyped slug and no network all arrive here too.
         remedy = (" A private repository needs a token — GH_TOKEN, GITHUB_TOKEN or "
                   "`gh auth token` — and `--no-ci` withholds it." if not authenticate
                   else " It was unreachable, or it refused the query: check the "
@@ -1028,17 +996,17 @@ def _ref_coverage(repo: Path,
                    "told from one that fetched them all, and no other remote can "
                    "answer for it — the scanned repository chooses those." + remedy)
         # Both block, and the branches are the actionable half, so the gaps stay the
-        # reason and the silence is still said rather than said twice.
+        # reason and the silence is said beside them rather than twice.
         if reason is None:
             reason = silence
         else:
             note = silence
     elif silent and answered:
-        # Saying "coverage was not verified" is false on the shipped Action's
-        # ordinary shape: the named address answers in full while the checkout's own
-        # `origin` -- whose credential lives in the config this probe refuses to
-        # read -- cannot be asked at all. The unqualified sentence fired on exactly
-        # the runs where the feature was working.
+        # "Coverage was not verified" is false on the shipped Action's ordinary
+        # shape, where the named address answers in full and only the checkout's own
+        # `origin` -- whose credential lives in the config this probe refuses to read
+        # -- cannot be asked. Unqualified, it fired on exactly the runs where the
+        # feature was working.
         note = (f"ref coverage was not verified against {', '.join(silent)}, and "
                 f"rests on {', '.join(answered)}: a branch that exists only on a "
                 "remote none of those could speak for would not have been seen")
@@ -1402,7 +1370,7 @@ def _scan_ref_chain(repo: Path, path: str, ref: str, chain: list[Commit],
 
 
 def scan_repo(repo: Path, query: WindowQuery,
-              coverage_cache: dict[tuple[str, str | None, bool], tuple[str | None, str | None]]
+              coverage_cache: CoverageCache
               | None = None, trusted_url: str | None = None,
               authenticate: bool = True) -> RepoFinding:
     """Judge one repository across every ref; see the module docstring for the model.

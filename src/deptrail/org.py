@@ -43,6 +43,7 @@ from .grading import (
     grade_finding,
 )
 from .history import (
+    CoverageCache,
     Exposure,
     GitError,
     UnreadTree,
@@ -655,7 +656,7 @@ def scan_organization(repos: Iterable[tuple[str, Path]], plan: QueryPlan, *,
         # How complete the checkout is does not change between packages, and one of
         # its checks asks the remote; without this the network call would repeat
         # once per advisory package.
-        coverage_cache: dict[tuple[str, str | None, bool], tuple[str | None, str | None]] = {}
+        coverage_cache: CoverageCache = {}
         for entry in plan.entries:
             query = entry.query
             try:

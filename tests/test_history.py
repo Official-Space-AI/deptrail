@@ -1705,25 +1705,35 @@ class TestPrecedenceAndDiagnostics:
         assert heads is not None, "the named address is still asked"
         assert "PRETEND" not in seen[0], seen[0]
 
-    def test_a_token_is_only_for_github_and_only_when_one_exists(self,
-                                                                 monkeypatch):
-        """The header is built for the operator's own forge and for nothing else,
-        and `gh auth token` stands in when the environment has none — the same tool
-        the scan already reads CI runs through.
+    @pytest.fixture
+    def no_gh(self, monkeypatch):
+        """`gh` never really runs, and no ambient host speaks for a token.
+
+        With the operator's own login answering, every assertion about the
+        *environment* is satisfied by the fallback instead — measured, deleting the
+        `GITHUB_TOKEN` lookup altogether left these tests passing and the whole
+        suite green. It also keeps a real token out of an assertion message.
+
+        Yields the list of `(argv, env)` the fallback was called with.
         """
         from deptrail import history
         monkeypatch.delenv("GH_HOST", raising=False)
         monkeypatch.delenv("GITHUB_SERVER_URL", raising=False)
-        # `gh` never really runs, from the first line: with the operator's own login
-        # answering, every assertion below about the *environment* is satisfied by
-        # the fallback instead — measured, deleting the GITHUB_TOKEN lookup
-        # altogether left this test passing and the whole suite green. Its other job
-        # is that the real token never reaches an assertion message.
+        monkeypatch.delenv("GH_TOKEN", raising=False)
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
         called: list[tuple[list[str], dict]] = []
         monkeypatch.setattr(
             history.subprocess, "run",
             lambda *a, **k: (called.append((a[0], k.get("env") or {}))
                              or subprocess.CompletedProcess(a, 1, "", "")))
+        return called
+
+    def test_a_token_is_only_for_github_and_only_over_https(self, monkeypatch,
+                                                            no_gh):
+        """The header is built for the operator's own forge and for nothing else,
+        under both names the environment spells a token.
+        """
+        from deptrail import history
         monkeypatch.setenv("GH_TOKEN", "ghs_TESTTOKEN")
         assert history._github_authorization("https://github.com/o/r.git")
         assert history._github_authorization("https://evil.example/o/r.git") is None
@@ -1735,38 +1745,44 @@ class TestPrecedenceAndDiagnostics:
         monkeypatch.delenv("GH_TOKEN")
         monkeypatch.setenv("GITHUB_TOKEN", "ghs_SECONDNAME")
         assert history._github_authorization("https://github.com/o/r.git")
-        # `GH_HOST` picks `gh`'s default *target*; it does not re-home a token.
-        # `GH_TOKEN`/`GITHUB_TOKEN` are github.com credentials by `gh`'s own rule,
-        # and a GitHub Enterprise host is served by `GH_ENTERPRISE_TOKEN`, which
-        # this code never reads. Testing `GH_HOST` here refused a github.com PAT for
-        # github.com: an operator who exported it for their enterprise had a
-        # complete scan of a private github.com repository turned from 0 into 2.
+
+    def test_an_ambient_token_belongs_to_the_server_that_minted_it(
+            self, monkeypatch, no_gh):
+        """`GH_HOST` picks `gh`'s default *target*; it does not re-home a token, and
+        testing it refused a github.com PAT for github.com — an operator who exported
+        it for their enterprise had a complete scan of a private github.com
+        repository turned from 0 into 2. `GITHUB_SERVER_URL` is the one that does say
+        where a token lives: Actions sets it to the instance that minted the run's
+        token, so on a GHES runner `GH_TOKEN: ${{ github.token }}` — which this
+        project's own action.yml writes — is that instance's. `gh` never consults it,
+        so pinning `--hostname` cannot catch this one.
+        """
+        from deptrail import history
+        # Both, or asserting that the fallback was not handed one of them is
+        # satisfied by its never having been set: measured, dropping the
+        # `GITHUB_TOKEN` pop from that environment left this test passing.
+        monkeypatch.setenv("GH_TOKEN", "ghs_TESTTOKEN")
+        monkeypatch.setenv("GITHUB_TOKEN", "ghs_SECONDNAME")
         for value in ("ghe.example.com", "github.com", "user@github.com", ""):
             monkeypatch.setenv("GH_HOST", value)
             assert history._github_authorization(
                 "https://github.com/o/r.git"), f"GH_HOST={value!r}"
         monkeypatch.delenv("GH_HOST")
-        # `GITHUB_SERVER_URL` is the one that says where a token lives: Actions sets
-        # it to the instance that minted the run's token, so on a GHES runner
-        # `GH_TOKEN: ${{ github.token }}` — which this project's own action.yml
-        # writes — is that instance's. `gh` never consults it, so the `--hostname`
-        # pin below cannot catch this one.
-        withheld = ("https://ghe.example.com", "https://ghe.example.com/",
-                    # No scheme is how an operator would type it, and reading the
-                    # host as `partition("://")[2]` made it the empty string, took
-                    # that for "nobody named a host", and sent the enterprise token.
-                    "ghe.example.com", "ghe.example.com/x",
-                    "https:/ghe.example.com", "://", "not a url")
-        for value in withheld:
+        for value in ("https://ghe.example.com", "https://ghe.example.com/",
+                      # No scheme is how an operator would type it, and reading the
+                      # host as `partition("://")[2]` made it the empty string, took
+                      # that for "nobody named a host", and sent the enterprise token.
+                      "ghe.example.com", "ghe.example.com/x",
+                      "https:/ghe.example.com", "://", "not a url"):
             monkeypatch.setenv("GITHUB_SERVER_URL", value)
-            called.clear()
+            no_gh.clear()
             assert history._github_authorization(
                 "https://github.com/o/r.git") is None, f"GITHUB_SERVER_URL={value!r}"
             # Refusing the variable is not enough while the fallback can read it
-            # back: measured, `GH_TOKEN=X gh auth token --hostname github.com`
-            # prints X, so `gh` handed back the exact credential refused above.
-            assert called, f"the fallback was never reached for {value!r}"
-            _argv, env = called[0]
+            # back: measured, `GH_TOKEN=X gh auth token --hostname github.com` prints
+            # X, so `gh` handed back the exact credential refused here.
+            assert no_gh, f"the fallback was never reached for {value!r}"
+            _argv, env = no_gh[0]
             assert "GH_TOKEN" not in env and "GITHUB_TOKEN" not in env, sorted(env)
         # And the shipped Action's own environment still gets a token. Every earlier
         # test deleted these rather than setting them to a github.com value, so a
@@ -1778,15 +1794,16 @@ class TestPrecedenceAndDiagnostics:
             monkeypatch.setenv("GITHUB_SERVER_URL", value)
             assert history._github_authorization(
                 "https://github.com/o/r.git"), f"GITHUB_SERVER_URL={value!r}"
-        monkeypatch.delenv("GITHUB_SERVER_URL")
-        monkeypatch.delenv("GITHUB_TOKEN")
-        called.clear()
+
+    def test_the_stored_login_is_asked_for_the_host_it_will_be_sent_to(self, no_gh):
+        """`gh auth token` answers for whatever `GH_HOST` names, so an operator
+        logged in to a GitHub Enterprise instance had that instance's stored
+        credential handed to github.com.
+        """
+        from deptrail import history
         assert history._github_authorization("https://github.com/o/r.git") is None
-        # Pinned to the host it will be sent to: `gh auth token` answers for
-        # whatever `GH_HOST` names, so an operator logged in to a GitHub Enterprise
-        # instance had that instance's stored credential handed to github.com.
-        assert called and called[0][0] == ["gh", "auth", "token",
-                                           "--hostname", "github.com"], called
+        assert no_gh and no_gh[0][0] == ["gh", "auth", "token",
+                                         "--hostname", "github.com"], no_gh
 
     def test_the_token_is_not_attached_to_an_address_the_repository_chose(
             self, tmp_path, monkeypatch):
