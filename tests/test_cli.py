@@ -570,6 +570,51 @@ class TestOneSlugCannotSpeakForSeveralRepositories:
         assert all(url == "https://github.com/acme/api-server.git"
                    for url in urls), urls
 
+    def test_two_worktrees_of_one_repository_are_one_repository(self, tmp_path):
+        """Two linked worktrees resolve to different directories while one `--slug`
+        is right for both, so counting checkout paths read them as several, withheld
+        the named address from each, and took the blocking half of ref coverage with
+        it. The common git directory is what the slug is actually asking about.
+        """
+        from deptrail.demo import advisory_path, build
+
+        build(tmp_path / "demo")
+        advisory = advisory_path(tmp_path / "demo")
+        first = tmp_path / "demo" / "api-server"
+        second = tmp_path / "second-worktree"
+        subprocess.run(["git", "-C", str(first), "worktree", "add", "-q",
+                        "--detach", str(second)], check=True, capture_output=True)
+        urls = self._trusted_urls(
+            ["scan", "--ioc", str(advisory), "--no-ci",
+             "--repo", str(first), "--repo", str(second),
+             "--slug", "acme/api-server"])
+        assert urls, "no repository was scanned"
+        assert all(url == "https://github.com/acme/api-server.git"
+                   for url in urls), urls
+
+    def test_a_slug_does_not_name_a_github_com_repository_on_another_forge(
+            self, tmp_path, monkeypatch):
+        """A slug names a repository on the forge in play. On a GitHub Enterprise
+        runner that is not github.com, and building a github.com address for it is
+        worse than useless: a public repository of the same owner/name answers, its
+        heads are compared against a clone of a different repository, and where it
+        is a mirror the coverage reads as verified while the real origin's silence
+        stays a caveat. #107 is the rest of that story.
+        """
+        from deptrail.demo import advisory_path, build
+
+        build(tmp_path / "demo")
+        advisory = advisory_path(tmp_path / "demo")
+        argv = ["scan", "--ioc", str(advisory), "--no-ci",
+                "--repo", str(tmp_path / "demo" / "api-server"),
+                "--slug", "acme/api-server"]
+        monkeypatch.setenv("GITHUB_SERVER_URL", "https://ghe.example.com")
+        assert all(url is None for url in self._trusted_urls(argv))
+        # And the ordinary runner is unaffected.
+        monkeypatch.setenv("GITHUB_SERVER_URL", "https://github.com")
+        assert all(url == "https://github.com/acme/api-server.git"
+                   for url in self._trusted_urls(argv))
+
     def test_an_org_names_every_repository_it_cloned(self, tmp_path, monkeypatch,
                                                      capsys):
         """`--org` is the other arm of the same condition, and it was the untested

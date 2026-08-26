@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import errno
 import json
+import os
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
@@ -42,7 +43,7 @@ from pathlib import Path
 from . import __version__
 from .demo import advisory_path, build, runs_provider, secrets_provider
 from .grading import RunHistory, annotate_installs, runs_from_github
-from .history import _git_env
+from .history import GITHUB_HOSTS, _git_env, _host_of
 from .ioc import (
     COVERAGE_VALUES,
     SCHEMA_VERSION,
@@ -327,6 +328,36 @@ def _github_secrets(slug_of):
     return provider
 
 
+def _repository_identity(path: Path) -> str:
+    """What makes two ``--repo`` paths the same repository.
+
+    The checkout path is not it: two linked worktrees of one repository resolve to
+    different directories while a single ``--slug`` is right for both, and reading
+    them as several repositories withheld the named address from each — which is
+    the whole blocking half of ref coverage. The common git directory is shared by
+    every worktree, so it answers the question the slug is asking. A path that is
+    not a repository at all keeps its own name, since it cannot share one, and an
+    absent or unrunnable ``git`` answers the same way rather than raising: this is
+    asked before the scan, so letting it out turned "no git on PATH" into a
+    traceback where the report was supposed to say so.
+    """
+    try:
+        found = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "--git-common-dir"],
+            capture_output=True, text=True, check=False, env=_git_env())
+    except OSError:
+        return str(path)
+    if found.returncode != 0 or not found.stdout.strip():
+        return str(path)
+    common = Path(found.stdout.strip())
+    if not common.is_absolute():
+        common = path / common
+    try:
+        return str(common.resolve())
+    except (OSError, RuntimeError):
+        return str(common)
+
+
 def _uncollected_runs(reason: str):
     def provider(path: Path, name: str) -> RunHistory:
         return RunHistory(source=reason)
@@ -402,16 +433,26 @@ def cmd_scan(args: argparse.Namespace) -> int:
     # cannot speak for several `--repo` paths -- it names one repository, so a second
     # clone would be compared against a repository it is not and every branch of the
     # named one would read as a branch that clone is missing -- but "several" counts
-    # repositories and not arguments: reading `--repo P --repo P` as several
-    # withheld the named address, and with it the whole blocking path, so that clone
-    # went from exit 2 to exit 0 on the duplicate alone. The paths are resolved
-    # above, so the set is exact. (That one `--slug` also answers for every `--repo`
-    # on the CI and secrets path is older and separate: #105.)
+    # repositories and not arguments: reading `--repo P --repo P` as several withheld
+    # the named address, and with it the whole blocking path, so that clone went from
+    # exit 2 to exit 0 on the duplicate alone. (That one `--slug` also answers for
+    # every `--repo` on the CI and secrets path is older and separate: #105.)
+    #
+    # A slug only names a github.com repository when that is the forge in play. On a
+    # GitHub Enterprise runner it names one on that instance, and building a
+    # github.com address for it is worse than useless: a public repository of the
+    # same owner/name answers, its heads are compared against a clone of a different
+    # repository, and where it is a mirror the coverage reads as verified while the
+    # real origin's silence stays a caveat. So there is no named address there, which
+    # is where this check stood before, and #107 is the rest of that story.
     #
     # `--no-ci` is documented as "no token needed", so it withholds the token, not
     # the check: withholding the check meant the same clone exited 2 without the
     # flag and 0 with it, with nothing in the report to say why.
-    named = args.org or (args.slug and len({str(path) for _n, path in repos}) == 1)
+    forge = _host_of(os.environ.get("GITHUB_SERVER_URL") or "")
+    one_repository = len({_repository_identity(path) for _n, path in repos}) == 1
+    named = (forge in ("", *GITHUB_HOSTS)
+             and (args.org or (args.slug and one_repository)))
     trusted = ((lambda name: f"https://github.com/{slug_of(name)}.git")
                if slug_of is not None and named else None)
     report = scan_organization(repos, advisory.plan(), runs=runs, secrets=secrets,
