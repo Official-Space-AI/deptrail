@@ -947,17 +947,19 @@ def _ref_coverage(repo: Path,
         # disambiguated rather than trusted.
         label = (NAMED_ADDRESS if url is not None
                  else f'remote "{remote}"' if remote == NAMED_ADDRESS else remote)
-        if heads is None:
-            # `url` is set only for the address the operator named. The two roles are
-            # kept in separate lists rather than recovered afterwards by comparing
-            # label text, which is the same collision again.
+        # No branch list, whether because the source could not be asked (`None`) or
+        # because it answered with no branches at all (`{}`). Either way it cannot
+        # testify, and the two were split for a while: an empty advertisement was
+        # neither silent nor an answer, so a named address that produced one skipped
+        # the blocking path entirely and the clone came back clean.
+        #
+        # `url` is set only for the address the operator named. The two roles are
+        # kept in separate lists rather than recovered afterwards by comparing label
+        # text, which is the same collision again.
+        if not heads:
             (silent_named if url is not None else silent_own).append(label)
             continue
-        # An empty advertisement is a source that said nothing. Counted as an answer,
-        # a remote serving no refs -- or one whose URL resolves to the checkout
-        # itself -- was named below as what a clean result rested on.
-        if heads:
-            answered.append(label)
+        answered.append(label)
         # One line per gap, and a gap is a branch *at a tip*: the named address and
         # a remote of the clone are usually the same repository, so the same branch
         # at the same commit is one gap and saying it twice reads as two. Two
@@ -990,16 +992,18 @@ def _ref_coverage(repo: Path,
         # plain decoy was enough to clear the clone.
         #
         # The remedy is named only where it is known to be one -- a deleted
-        # repository, a mistyped slug and no network all arrive here too.
+        # repository, a mistyped slug, a repository with no branches at all and no
+        # network all arrive here too.
         remedy = (" A private repository needs a token — GH_TOKEN, GITHUB_TOKEN or "
                   "`gh auth token` — and `--no-ci` withholds it." if not authenticate
-                  else " It was unreachable, or it refused the query: check the "
-                       "address, and for a private repository that GH_TOKEN, "
-                       "GITHUB_TOKEN or `gh auth token` holds a credential for it.")
-        beside = (f" ({', '.join(silent_own)} could not be asked either)"
+                  else " It was unreachable, refused the query, or has no branches: "
+                       "check the address, and for a private repository that "
+                       "GH_TOKEN, GITHUB_TOKEN or `gh auth token` holds a credential "
+                       "for it.")
+        beside = (f" ({', '.join(silent_own)} produced none either)"
                   if silent_own else "")
-        silence = (f"the address you named could not be asked{beside}: without its "
-                   "branch list, a clone that fetched only some of them cannot be "
+        silence = (f"the address you named produced no branch list{beside}: without "
+                   "one, a clone that fetched only some of the branches cannot be "
                    "told from one that fetched them all, and no other remote can "
                    "answer for it — the scanned repository chooses those." + remedy)
         # Both block, and the branches are the actionable half, so the gaps stay the
