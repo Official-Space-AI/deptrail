@@ -1883,6 +1883,35 @@ class TestPrecedenceAndDiagnostics:
         reason, _ = history._ref_coverage(repo, None, str(origin), True)
         assert reason is None, reason
 
+    def test_a_named_address_is_still_checked_like_any_other_url(
+            self, tmp_path, monkeypatch):
+        """Trusted means the *address* is the operator's, not that the string is
+        safe. Taken as given it skipped the checks a remote's URL gets: a value
+        beginning with `-` reaches git as an option, a control character breaks out
+        of the config line it is written on, and an embedded credential is handed
+        whole to git's transport helper, where `ps` and `GIT_TRACE` see it.
+        """
+        from deptrail import history
+        repo = self.fresh(tmp_path, "checked")
+        seen: list[str] = []
+        real = history.subprocess.Popen
+
+        class Spy(real):
+            def __init__(self, args, **kwargs):
+                if isinstance(args, list) and "ls-remote" in args:
+                    probe = args[args.index("-C") + 1]
+                    seen.append((Path(probe) / ".git" / "config").read_text())
+                super().__init__(args, **kwargs)
+
+        monkeypatch.setattr(history.subprocess, "Popen", Spy)
+        for hostile in ("--upload-pack=touch pwned",
+                        'https://github.com/o/r.git"\n[core]\n\tpager = touch pwned'):
+            assert history._remote_heads(repo, "origin", trusted_url=hostile) is None
+        assert not seen, seen
+        history._remote_heads(
+            repo, "origin", trusted_url="https://user:PAT@github.com/o/r.git")
+        assert seen and "PAT" not in seen[0], seen
+
     def test_the_probe_does_not_follow_a_redirect_to_another_host(
             self, tmp_path, monkeypatch):
         """Git's default `followRedirects = initial` rebases the remote URL on the

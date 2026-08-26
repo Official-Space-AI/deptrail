@@ -611,9 +611,16 @@ def _remote_heads(repo: Path, remote: str = "origin", *,
     # suspicion, and the operator's own credentials can go with it. That is the
     # whole difference: carrying a credential was never the danger, carrying one to
     # an address a possibly compromised checkout chose was.
+    # It is still checked the way a remote's URL is. `_remote_url` is what rejects a
+    # value that would reach git as an option or break out of the config line it is
+    # written on, and what drops an embedded credential -- git hands the whole URL
+    # to its transport helper, so `ps` and `GIT_TRACE` see a token in one however it
+    # was written here. Trusted means the *address* is the operator's, not that the
+    # string is safe.
     url = trusted_url if trusted_url else _remote_url(repo, remote)
-    if url is None:
+    if url is None or url.startswith("-") or any(c < " " or c == "\x7f" for c in url):
         return None
+    url = _without_userinfo(url)
     # An operator may narrow the transports; they may not widen them. `setdefault`
     # deferred to whatever was already in the environment, and a permissive value
     # there put `ext::` — which runs the command named in the URL, and the URL comes
