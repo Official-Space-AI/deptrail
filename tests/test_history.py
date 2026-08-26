@@ -1983,7 +1983,29 @@ class TestPrecedenceAndDiagnostics:
         first, _ = _ref_coverage(repo, cache, None, True)
         assert first is None, first
         second, _ = _ref_coverage(repo, cache, str(gone), True)
-        assert second is not None and "could not be asked" in second, second
+        assert second is not None and "produced no branch list" in second, second
+
+    def test_a_named_address_with_no_branches_blocks_like_one_that_was_silent(
+            self, tmp_path):
+        """`None` meant "could not be asked" and a non-empty dict meant "answered",
+        and an empty advertisement was neither — so a named address that produced one
+        went into no list at all, skipped the blocking path, and the clone came back
+        clean with an unwalkable branch on its own origin.
+        """
+        from deptrail.history import _ref_coverage
+        empty = tmp_path / "no-branches.git"
+        git(tmp_path, "init", "-q", "--bare", str(empty))
+        origin = self.origin_with_two_branches(tmp_path, "branchless")
+        repo = self.fresh(tmp_path, "branchless-clone")
+        git(repo, "remote", "add", "origin", str(origin))
+        git(repo, "fetch", "-q", "origin", "main")
+        git(repo, "checkout", "-qb", "main", "FETCH_HEAD")
+        # The clone is missing `release/1.x`, and neither source can say so: its own
+        # origin is out of reach and the named address has nothing to advertise.
+        git(repo, "remote", "set-url", "origin", str(tmp_path / "moved-away.git"))
+        reason, _ = _ref_coverage(repo, None, str(empty), True)
+        assert reason is not None, reason
+        assert "produced no branch list" in reason, reason
 
     def test_a_source_that_advertises_nothing_has_not_answered(self, tmp_path):
         """`_remote_heads` returns an empty dict, not None, for a remote serving no
@@ -2041,7 +2063,7 @@ class TestPrecedenceAndDiagnostics:
         gone = tmp_path / "no-such-repository.git"
         git(repo, "remote", "add", "origin", str(gone))
         reason, note = _ref_coverage(repo, None, str(gone), False)
-        assert reason is not None and "could not be asked" in reason, reason
+        assert reason is not None and "produced no branch list" in reason, reason
         # Said once. It was the reason, so repeating it as an observation would
         # print the same sentence twice on every report.
         assert note is None, note
@@ -2050,7 +2072,7 @@ class TestPrecedenceAndDiagnostics:
         # Counted, not just located: adding a second parenthetical that lists every
         # silent source leaves "could not be asked either" intact, so a test looking
         # only for that clause cannot tell the two sentences apart.
-        assert "(origin could not be asked either)" in reason, reason
+        assert "(origin produced none either)" in reason, reason
         assert reason.count("origin") == 1, reason
         # The token is the remedy for the case that is known to be about a token.
         assert "`--no-ci` withholds it" in reason, reason
@@ -2081,7 +2103,7 @@ class TestPrecedenceAndDiagnostics:
         # reason: the decoy is not it.
         reason, _ = _ref_coverage(repo, None, str(tmp_path / "named-but-gone.git"),
                                   True)
-        assert reason is not None and "could not be asked" in reason, reason
+        assert reason is not None and "produced no branch list" in reason, reason
 
     def test_silence_beside_an_answer_says_what_the_answer_covered(self, tmp_path):
         """"Coverage was not verified" is false on the shipped Action's ordinary
@@ -2148,7 +2170,7 @@ class TestPrecedenceAndDiagnostics:
         assert reason and "release/1.x" in reason, (reason, note)
         # Both block, so the branches — the actionable half — stay the reason and
         # the silence is still said, once, beside them.
-        assert note and "the address you named could not be asked" in note, note
+        assert note and "the address you named produced no branch list" in note, note
 
     def test_a_branch_both_sources_miss_is_reported_once(self, tmp_path):
         """The named address and a remote of the clone are usually the same
