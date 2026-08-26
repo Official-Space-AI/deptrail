@@ -396,33 +396,29 @@ def cmd_scan(args: argparse.Namespace) -> int:
             "CI evidence not collected (no --slug given, so no repository to query)"
         )
 
-    # Even when every repository was skipped, the report must carry why: dropping
-    # the errors here would turn "we could not look" into "there was nothing".
     # The address the operator named, never the one the checkout carries: `--org`
-    # builds it here and `--slug` is typed, so ref coverage can authenticate as
-    # them without the repository under suspicion choosing where that goes.
+    # builds it here and `--slug` is typed, so ref coverage can authenticate as them
+    # without the repository under suspicion choosing where that goes. One `--slug`
+    # cannot speak for several `--repo` paths -- it names one repository, so a second
+    # clone would be compared against a repository it is not and every branch of the
+    # named one would read as a branch that clone is missing -- but "several" counts
+    # repositories and not arguments: reading `--repo P --repo P` as several
+    # withheld the named address, and with it the whole blocking path, so that clone
+    # went from exit 2 to exit 0 on the duplicate alone. The paths are resolved
+    # above, so the set is exact. (That one `--slug` also answers for every `--repo`
+    # on the CI and secrets path is older and separate: #105.)
     #
-    # One `--slug` cannot speak for several `--repo` paths: it names one repository
-    # and would be handed to each clone in turn, so the second is compared against a
-    # repository it is not. Every branch of the named one then reads as a branch
-    # that clone is missing — invented gaps, and exit 2 for a checkout with nothing
-    # wrong with it. (That the same `--slug` also answers for every `--repo` on the
-    # CI and secrets path is older and separate: #105.)
-    # `--no-ci` is documented as "no token needed", so it withholds the token --
-    # not the check. Withholding the check meant the same clone exited 2 without
-    # the flag and 0 with it, and the report said nothing about why.
-    # Counted as repositories, not as arguments. `len(args.repo) == 1` read the
-    # same clone passed twice — `--repo P --repo P`, which a wrapper assembling its
-    # arguments from two sources produces — as "several repositories", withheld the
-    # named address, and with it the whole blocking path: measured, that clone with
-    # a poisoned pin on an unfetched branch went from exit 2 to exit 0 on the
-    # duplicate alone. The paths are already resolved above, so the set is exact.
+    # `--no-ci` is documented as "no token needed", so it withholds the token, not
+    # the check: withholding the check meant the same clone exited 2 without the
+    # flag and 0 with it, with nothing in the report to say why.
     named = args.org or (args.slug and len({str(path) for _n, path in repos}) == 1)
     trusted = ((lambda name: f"https://github.com/{slug_of(name)}.git")
                if slug_of is not None and named else None)
     report = scan_organization(repos, advisory.plan(), runs=runs, secrets=secrets,
                                allow_incomplete=args.allow_incomplete_history,
                                remote_url=trusted, authenticate=not args.no_ci)
+    # Even when every repository was skipped, the report must carry why: dropping
+    # the errors here would turn "we could not look" into "there was nothing".
     report.errors[:0] = errors
     report.transient[:0] = transient
     written = _emit(report, args, advisory)
