@@ -1983,34 +1983,33 @@ class TestPrecedenceAndDiagnostics:
         first, _ = _ref_coverage(repo, cache, None, True)
         assert first is None, first
         second, _ = _ref_coverage(repo, cache, str(gone), True)
-        assert second is not None and "produced no branch list" in second, second
+        assert second is not None and "returned no branch list" in second, second
 
-    def test_a_named_address_with_no_branches_blocks_like_one_that_was_silent(
-            self, tmp_path):
-        """`None` meant "could not be asked" and a non-empty dict meant "answered",
-        and an empty advertisement was neither — so a named address that produced one
-        went into no list at all, skipped the blocking path, and the clone came back
-        clean with an unwalkable branch on its own origin.
+    def test_an_empty_advertisement_is_an_answer_and_not_a_silence(self, tmp_path):
+        """The question a source is asked is whether every head it advertises is
+        reachable here, and one with no heads answers it. Reading that as silence was
+        an attempt to stop a branchless repository clearing a clone — but that is a
+        question about identity rather than emptiness, and it caught only the
+        degenerate case: an unrelated repository whose tips happen to be reachable
+        here clears the clone just the same (#111). It also blocked an operator whose
+        repository legitimately has no branches yet.
         """
         from deptrail.history import _ref_coverage
         empty = tmp_path / "no-branches.git"
         git(tmp_path, "init", "-q", "--bare", str(empty))
-        origin = self.origin_with_two_branches(tmp_path, "branchless")
         repo = self.fresh(tmp_path, "branchless-clone")
-        git(repo, "remote", "add", "origin", str(origin))
-        git(repo, "fetch", "-q", "origin", "main")
-        git(repo, "checkout", "-qb", "main", "FETCH_HEAD")
-        # The clone is missing `release/1.x`, and neither source can say so: its own
-        # origin is out of reach and the named address has nothing to advertise.
-        git(repo, "remote", "set-url", "origin", str(tmp_path / "moved-away.git"))
-        reason, _ = _ref_coverage(repo, None, str(empty), True)
-        assert reason is not None, reason
-        assert "produced no branch list" in reason, reason
+        git(repo, "remote", "add", "origin", str(empty))
+        reason, note = _ref_coverage(repo, None, str(empty), True)
+        assert reason is None, reason
+        # It answered, so it is what coverage rests on -- weakly, and the sentence
+        # says so itself.
+        assert note is None or "returned no branch list" not in note, note
 
-    def test_a_source_that_advertises_nothing_has_not_answered(self, tmp_path):
-        """`_remote_heads` returns an empty dict, not None, for a remote serving no
-        refs, so it counted as an answer and the note named it as what a clean
-        result rested on. It had said nothing.
+    def test_a_source_that_advertises_nothing_still_leaves_the_others_named(
+            self, tmp_path):
+        """An empty advertisement answers for itself and for nothing else: a remote
+        that could not be asked at all is still named, and the note still says what
+        the clean half rests on.
         """
         from deptrail.history import _ref_coverage
         empty = tmp_path / "empty-origin.git"
@@ -2020,8 +2019,14 @@ class TestPrecedenceAndDiagnostics:
         git(repo, "remote", "add", "unreachable", str(tmp_path / "not-there.git"))
         reason, note = _ref_coverage(repo, None)
         assert reason is None, reason
-        assert note is not None and "unreachable" in note, note
-        assert "rests on" not in note, note
+        assert note is not None, note
+        # `unreachable` returned nothing; `hollow` answered. The two must not swap
+        # places -- naming the silent one as what coverage rests on is the false
+        # sentence this note exists to avoid.
+        not_verified, _, rests_on = note.partition("rests on")
+        assert "unreachable" in not_verified, note
+        assert "hollow" in rests_on, note
+        assert "unreachable" not in rests_on, note
 
     def test_a_remote_cannot_take_the_name_the_report_uses_for_the_operator(
             self, tmp_path):
@@ -2063,7 +2068,7 @@ class TestPrecedenceAndDiagnostics:
         gone = tmp_path / "no-such-repository.git"
         git(repo, "remote", "add", "origin", str(gone))
         reason, note = _ref_coverage(repo, None, str(gone), False)
-        assert reason is not None and "produced no branch list" in reason, reason
+        assert reason is not None and "returned no branch list" in reason, reason
         # Said once. It was the reason, so repeating it as an observation would
         # print the same sentence twice on every report.
         assert note is None, note
@@ -2072,17 +2077,17 @@ class TestPrecedenceAndDiagnostics:
         # Counted, not just located: adding a second parenthetical that lists every
         # silent source leaves "could not be asked either" intact, so a test looking
         # only for that clause cannot tell the two sentences apart.
-        assert "(origin produced none either)" in reason, reason
+        assert "(origin returned none either)" in reason, reason
         assert reason.count("origin") == 1, reason
         # The token is the remedy for the case that is known to be about a token.
-        assert "`--no-ci` withholds it" in reason, reason
+        assert "`--no-ci` withholds the token" in reason, reason
         reachable, _ = _ref_coverage(repo, None, str(gone), True)
         # And not for the rest of them: a deleted repository, a mistyped slug or no
         # network all arrive here, and telling that operator to set a token
         # prescribes a fix for something that is not wrong.
         assert reachable is not None, reachable
-        assert "`--no-ci` withholds it" not in reachable, reachable
-        assert "It was unreachable" in reachable, reachable
+        assert "`--no-ci` withholds the token" not in reachable, reachable
+        assert "Check the address" in reachable, reachable
 
     def test_another_remote_cannot_answer_for_the_address_the_operator_named(
             self, tmp_path):
@@ -2103,7 +2108,7 @@ class TestPrecedenceAndDiagnostics:
         # reason: the decoy is not it.
         reason, _ = _ref_coverage(repo, None, str(tmp_path / "named-but-gone.git"),
                                   True)
-        assert reason is not None and "produced no branch list" in reason, reason
+        assert reason is not None and "returned no branch list" in reason, reason
 
     def test_silence_beside_an_answer_says_what_the_answer_covered(self, tmp_path):
         """"Coverage was not verified" is false on the shipped Action's ordinary
@@ -2170,7 +2175,7 @@ class TestPrecedenceAndDiagnostics:
         assert reason and "release/1.x" in reason, (reason, note)
         # Both block, so the branches — the actionable half — stay the reason and
         # the silence is still said, once, beside them.
-        assert note and "the address you named produced no branch list" in note, note
+        assert note and "the address you named returned no branch list" in note, note
 
     def test_a_branch_both_sources_miss_is_reported_once(self, tmp_path):
         """The named address and a remote of the clone are usually the same
