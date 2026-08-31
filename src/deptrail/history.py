@@ -947,16 +947,19 @@ def _ref_coverage(repo: Path,
         # disambiguated rather than trusted.
         label = (NAMED_ADDRESS if url is not None
                  else f'remote "{remote}"' if remote == NAMED_ADDRESS else remote)
-        # No branch list, whether because the source could not be asked (`None`) or
-        # because it answered with no branches at all (`{}`). Either way it cannot
-        # testify, and the two were split for a while: an empty advertisement was
-        # neither silent nor an answer, so a named address that produced one skipped
-        # the blocking path entirely and the clone came back clean.
+        # `None` is a source that did not answer. An empty advertisement is not the
+        # same thing: the question here is whether every head a source advertises is
+        # reachable in this clone, and a source with no heads answers it. Reading it
+        # as silence was an attempt to stop a repository with no branches clearing a
+        # clone -- but a clean verdict resting on a vacuous answer is a question
+        # about *identity*, not about emptiness, and singling out zero branches
+        # catches only its degenerate case: an unrelated repository whose tips happen
+        # to be reachable here clears the clone just the same. That is #111.
         #
         # `url` is set only for the address the operator named. The two roles are
         # kept in separate lists rather than recovered afterwards by comparing label
         # text, which is the same collision again.
-        if not heads:
+        if heads is None:
             (silent_named if url is not None else silent_own).append(label)
             continue
         answered.append(label)
@@ -991,18 +994,19 @@ def _ref_coverage(repo: Path,
         # *scanned repository* chooses which remotes it has, so a stale mirror or a
         # plain decoy was enough to clear the clone.
         #
-        # The remedy is named only where it is known to be one -- a deleted
-        # repository, a mistyped slug, a repository with no branches at all and no
-        # network all arrive here too.
-        remedy = (" A private repository needs a token — GH_TOKEN, GITHUB_TOKEN or "
-                  "`gh auth token` — and `--no-ci` withholds it." if not authenticate
-                  else " It was unreachable, refused the query, or has no branches: "
-                       "check the address, and for a private repository that "
+        # Nothing here knows *why*. A deleted repository, a mistyped slug, a
+        # timeout, a blocked transport and no network all arrive at the same place,
+        # and `authenticate=False` proves only that no token was attached -- not
+        # that a token was what the address wanted. So the remedy is offered as a
+        # condition rather than asserted as the cause.
+        remedy = (" `--no-ci` withholds the token, so if this repository is private "
+                  "that is why." if not authenticate
+                  else " Check the address, and if the repository is private, that "
                        "GH_TOKEN, GITHUB_TOKEN or `gh auth token` holds a credential "
                        "for it.")
-        beside = (f" ({', '.join(silent_own)} produced none either)"
+        beside = (f" ({', '.join(silent_own)} returned none either)"
                   if silent_own else "")
-        silence = (f"the address you named produced no branch list{beside}: without "
+        silence = (f"the address you named returned no branch list{beside}: without "
                    "one, a clone that fetched only some of the branches cannot be "
                    "told from one that fetched them all, and no other remote can "
                    "answer for it — the scanned repository chooses those." + remedy)
@@ -1023,9 +1027,9 @@ def _ref_coverage(repo: Path,
                 "remote none of those could speak for would not have been seen")
     elif silent:
         note = (f"ref coverage was not verified against {', '.join(silent)}: a "
-                "remote that cannot be reached, or has no URL to ask, leaves a "
-                "checkout that fetched only some branches looking like a complete "
-                "one")
+                "remote that returns no branch list -- unreachable, refusing, too "
+                "slow, or with no URL to ask -- leaves a checkout that fetched only "
+                "some branches looking like a complete one")
     outcome = (reason, note)
     if cache is not None:
         cache[key] = outcome
