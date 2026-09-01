@@ -1,0 +1,34 @@
+name: Design question or proposal
+description: Something the tool should decide differently, or does not handle yet
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Proposals are welcome, including ones that argue an existing decision is
+        wrong. Several of this repository's decisions were reversed that way.
+  - type: textarea
+    id: situation
+    attributes:
+      label: The situation the tool handles badly
+      description: >
+        Concrete beats abstract: a repository shape, an incident, a flag
+        combination.
+    validations:
+      required: true
+  - type: textarea
+    id: now
+    attributes:
+      label: What it does now
+      description: If you have run it, say what you saw rather than what you expect it does.
+    validations:
+      required: true
+  - type: textarea
+    id: instead
+    attributes:
+      label: What it should do, and what that would cost
+      description: >
+        Most changes here trade a false all-clear against a false "incomplete".
+        Saying which way yours goes, and who pays, makes the decision much faster.
+    validations:
+      required: true

@@ -1,0 +1,10 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/Official-Space-AI/deptrail/security/advisories/new
+    about: >
+      A false all-clear that hides a real exposure, or a credential reaching an
+      address it should not. Please report these privately.
+  - name: How the tool decides things
+    url: https://github.com/Official-Space-AI/deptrail/tree/main/docs
+    about: The advisory format, the grading model, and how rotation is derived.
