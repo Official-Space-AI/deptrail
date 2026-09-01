@@ -1,0 +1,51 @@
+name: Bug
+description: Something crashed, hung, or behaved wrongly other than a verdict
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        If the scan returned a *verdict* you think is wrong, the "Wrong verdict"
+        template asks better questions. If a credential went somewhere it should
+        not, use [private reporting](https://github.com/Official-Space-AI/deptrail/security/advisories/new).
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected instead
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce it
+      description: >
+        The smallest thing that shows it. A scratch repository built by a few git
+        commands is worth more than a description of a private one.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Output, or the traceback
+      render: text
+    validations:
+      required: false
+  - type: input
+    id: version
+    attributes:
+      label: deptrail --version
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: OS, Python version, git version
+    validations:
+      required: true

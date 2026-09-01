@@ -307,6 +307,29 @@ tying it to the commit and workflow that built it. Nothing is uploaded until the
 build proves the wheel installs into an empty environment, opens every bundled
 feed, and produces the demo's rotation list.
 
+## Contributing
+
+Bug reports, and especially reports of a **wrong verdict**, are the most useful
+thing you can send. The exit codes are a contract — `0` means absence of exposure
+was *established* — so a scan that exits 0 while history it could not examine
+exists is a defect worth an issue on its own. There is an issue form that asks
+for exactly the fields that make one reproducible.
+
+[CONTRIBUTING.md](https://github.com/Official-Space-AI/deptrail/blob/main/CONTRIBUTING.md)
+covers how to run the suite, what the five exit codes commit the tool to, how to
+tell whether a test is real (this repository's most common defect is a test that
+passes for the wrong reason), and the probe invariants a change must not quietly
+reverse.
+
+Security reports go through [private
+reporting](https://github.com/Official-Space-AI/deptrail/security/advisories/new)
+rather than a public issue —
+[SECURITY.md](https://github.com/Official-Space-AI/deptrail/blob/main/SECURITY.md)
+says what the tool promises about where a credential may go, and which of those
+promises count as vulnerabilities when broken. Everyone taking part is asked to
+follow the [Code of
+Conduct](https://github.com/Official-Space-AI/deptrail/blob/main/CODE_OF_CONDUCT.md).
+
 ## 한국어 요약
 
 npm 공급망 침해 사건(예: Shai-Hulud 웜)이 터진 다음 날 아침, 각 조직이 수작업으로 하던 조사 — "우리 레포가 공격 기간에 감염 버전을 설치했나 → 실제로 CI에서 실행됐나 → 어떤 시크릿을 재발급해야 하나" — 를 lockfile의 git 이력과 CI 실행 기록을 교차 대조해 **증거 등급**(확정/개연성 높음/가능성 있음/증거 없음)과 함께 자동 판정하는 도구입니다. "지금 감염돼 있나"를 보는 기존 스캐너(Dependabot, worm-sign)와 달리 **과거의 시간축**을 재구성합니다.
