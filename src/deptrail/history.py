@@ -775,17 +775,10 @@ def _heads_not_here(repo: Path, heads: dict[str, str]) -> list[str]:
     no ref leads to. Asking per branch instead cost a process per unfetched tip,
     which on an origin with hundreds of branches is the case this check exists for.
     """
-    tips = set()
-    for line in _git(repo, "for-each-ref", "--format=%(objectname) %(refname)",
-                     "refs/heads", "refs/remotes").splitlines():
-        tip, _, ref = line.partition(" ")
-        # Exactly the refs `_refs` hands the walker, or this answers for refs nobody
-        # walks: it drops every name ending in `/HEAD` as the alias it usually is,
-        # and a remote branch *called* `HEAD` lands there too — fetched, counted
-        # here as held, and never walked. A pin on it was reported at exit 0, which
-        # is #27 again through the check written to close it.
-        if not ref.endswith("/HEAD"):
-            tips.add(tip)
+    # Exactly the refs `_refs` hands the walker -- the same function answers both --
+    # or this vouches for refs nobody walks, which is #27 again through the check
+    # written to close it.
+    tips = {tip for _name, tip in _walkable_refs(repo)}
     # HEAD only once it resolves. An unborn HEAD — a clone that fetched but never
     # checked out — made `^HEAD` a fatal argument, and one fatal argument was read
     # below as "nothing is reachable", so a complete clone was told it was missing
@@ -1136,14 +1129,65 @@ def _existed_during(repo: Path, path: str, query: WindowQuery,
 
 
 
+def _walkable_refs(repo: Path) -> list[tuple[str, str]]:
+    """Every ref the walk may start from, as (name, the commit it resolves to).
+
+    One function with two callers on purpose. ``_refs`` names these for the walk and
+    ``_heads_not_here`` uses their commits to decide what this clone can reach, and a
+    coverage set that answers for refs nobody walks is how #27 came back the first
+    time. The invariant used to be a sentence in a docstring; it is the call graph
+    now.
+
+    **Tags are in here.** A commit reachable only from a tag is history this
+    repository holds: ``on: push: tags:`` is an ordinary CI trigger, and a project
+    that deletes its release branch after tagging leaves that tree reachable no other
+    way. Leaving them out reported exit 0 on a full clone that physically contained
+    the poisoned lockfile (#100). The walk pays almost nothing for them -- measured
+    across vueuse, jest, axios, express and chalk, commits reachable from a tag and
+    from no branch are 0.3% to 3.2% of history, and at most seven of them per
+    repository touch a lockfile at all -- because a tag whose commit some other ref
+    already leads to is dropped by ``_refs`` on the tip, so only unreachable history
+    adds a walk.
+
+    Two calls, because the obvious one call is fatal. Asking ``for-each-ref`` for
+    ``%(objecttype)`` or for the peeled ``%(*objectname)`` makes it read every object,
+    and a clone holding one ref whose object was pruned then exits 128 with nothing
+    on stdout -- so a single broken ref would take every other branch down with it,
+    which is the failure ``_heads_not_here`` was built to survive. Names come out of
+    a format that reads no objects, and ``cat-file --batch-check`` peels them: it
+    answers ``missing`` for a pruned ref and for a tag on a tree or a blob, one line
+    per line asked, and exits 0 through all of it.
+    """
+    names = [line.strip() for line in
+             _git(repo, "for-each-ref", "--format=%(refname)",
+                  "refs/heads", "refs/remotes", "refs/tags").splitlines()]
+    # Every name ending in `/HEAD` is dropped as the alias it usually is. A remote
+    # branch genuinely *called* `HEAD` is dropped with it, which is #99.
+    names = [name for name in names if name and not name.endswith("/HEAD")]
+    if not names:
+        return []
+    peeled = _local_git(repo, ["cat-file", "--batch-check"],
+                        "".join(f"{name}^{{commit}}\n" for name in names))
+    lines = peeled.stdout.splitlines()
+    if peeled.returncode != 0 or len(lines) != len(names):
+        # Never seen -- `--batch-check` answers every line and exits 0 even when the
+        # answer is `missing` -- but pairing by position is only sound while that
+        # holds, so a disagreement falls back to what the walk read before tags.
+        return [(name, "") for name in names
+                if name.startswith(("refs/heads/", "refs/remotes/"))]
+    found: list[tuple[str, str]] = []
+    for name, line in zip(names, lines):
+        sha, _, rest = line.partition(" ")
+        if rest.startswith("commit"):
+            found.append((name, sha))
+    return found
+
+
 def _refs(repo: Path) -> list[str]:
-    """HEAD first, then every branch head with a distinct tip."""
-    out = _git(repo, "for-each-ref", "--format=%(refname) %(objectname)",
-               "refs/heads", "refs/remotes")
+    """HEAD first, then every ref with a tip nothing before it already leads to."""
     refs, seen_tips = ["HEAD"], {_git(repo, "rev-parse", "HEAD").strip()}
-    for line in out.splitlines():
-        name, tip = line.rsplit(" ", 1)
-        if name.endswith("/HEAD") or tip in seen_tips:
+    for name, tip in _walkable_refs(repo):
+        if tip in seen_tips:
             continue
         seen_tips.add(tip)
         refs.append(name)

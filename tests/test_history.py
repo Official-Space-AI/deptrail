@@ -1217,6 +1217,109 @@ class TestPrecedenceAndDiagnostics:
         self.rewind(tmp_path, origin, "release/1.x")
         assert incomplete_history(repo)[0] == []
 
+    def test_a_lockfile_reachable_only_from_a_tag_is_walked(self, tmp_path):
+        """`on: push: tags:` is an ordinary CI trigger, and a project that deletes its
+        release branch after tagging leaves that tree reachable no other way. The walk
+        read only branches, so a full clone that physically contained the poisoned
+        lockfile reported exit 0 — no reason, no caveat, nothing to look at.
+        """
+        from deptrail.history import scan_repo
+        origin = tmp_path / "tagonly-origin.git"
+        git(tmp_path, "init", "-q", "--bare", str(origin))
+        work = self.fresh(tmp_path, "tagonly-work")
+        self.write(work, "package-lock.json", lock_json(None),
+                   "2025-11-20T10:00:00+00:00")
+        git(work, "branch", "-M", "main")
+        git(work, "remote", "add", "origin", str(origin))
+        git(work, "push", "-q", "origin", "main")
+        git(work, "checkout", "-qb", "release-9")
+        self.write(work, "package-lock.json", lock_json("5.6.1"),
+                   "2025-11-25T10:00:00+00:00")
+        git(work, "tag", "-a", "v9.9.9", "-m", "release")
+        git(work, "push", "-q", "origin", "v9.9.9")
+        git(work, "checkout", "-q", "main")
+        git(work, "branch", "-qD", "release-9")
+        # A bare repo initialised before git's default branch was `main` points HEAD
+        # at a branch that never arrives, and the clone then has nothing checked out.
+        git(tmp_path, "-C", str(origin), "symbolic-ref", "HEAD", "refs/heads/main")
+        repo = tmp_path / "tagonly-clone"
+        git(tmp_path, "clone", "-q", str(origin), str(repo))
+        # It is in the clone: `git show v9.9.9:package-lock.json` prints the pin.
+        finding = scan_repo(repo, WINDOW)
+        assert [e.version for e in finding.exposures] == ["5.6.1"], finding
+
+    def test_a_tag_on_a_commit_a_branch_already_leads_to_is_not_walked_twice(
+            self, tmp_path):
+        """What keeps tags cheap: a release tag usually sits on a commit `main`
+        reaches anyway, and walking it again would cost a `git log` per tag — 348 of
+        them on vueuse, against 42 commits reachable from a tag and from no branch.
+        """
+        from deptrail.history import _refs
+        repo = self.fresh(tmp_path, "dedup")
+        self.write(repo, "package-lock.json", lock_json(None),
+                   "2025-11-20T10:00:00+00:00")
+        for name in ("v1", "v2", "v3"):
+            git(repo, "tag", "-a", name, "-m", name)
+        refs = _refs(repo)
+        assert refs == ["HEAD"], refs
+
+    def test_a_tag_that_is_not_a_commit_is_not_handed_to_the_walk(self, tmp_path):
+        """`git tag <name> <blob>` is legal. Peeling it asks for a commit and gets
+        nothing, and handing the name to `git log` would be fatal.
+        """
+        from deptrail.history import _refs, _walkable_refs
+        repo = self.fresh(tmp_path, "blobtag")
+        self.write(repo, "package-lock.json", lock_json(None),
+                   "2025-11-20T10:00:00+00:00")
+        blob = subprocess.run(["git", "-C", str(repo), "hash-object", "-w", "--stdin"],
+                              input="hi\n", check=True, capture_output=True,
+                              text=True).stdout.strip()
+        git(repo, "tag", "blobtag", blob)
+        assert not [n for n, _ in _walkable_refs(repo) if n.endswith("blobtag")]
+        assert "refs/tags/blobtag" not in _refs(repo)
+
+    def test_one_pruned_ref_does_not_hide_every_tag(self, tmp_path):
+        """Asking `for-each-ref` for the object type, or for the peeled id, makes it
+        read every object — and a clone holding one ref whose object was pruned then
+        exits 128 with nothing on stdout, so a single broken ref would take every
+        other ref down with it. Measured: that is why this is two calls.
+        """
+        from deptrail.history import _walkable_refs
+        repo = self.fresh(tmp_path, "pruned")
+        self.write(repo, "package-lock.json", lock_json(None),
+                   "2025-11-20T10:00:00+00:00")
+        git(repo, "tag", "-a", "v1", "-m", "one")
+        broken = repo / ".git/refs/remotes/origin/pruned"
+        broken.parent.mkdir(parents=True, exist_ok=True)
+        broken.write_text("0" * 39 + "1\n")
+        names = [name for name, _ in _walkable_refs(repo)]
+        assert "refs/tags/v1" in names, names
+        assert "refs/remotes/origin/pruned" not in names, names
+
+    def test_coverage_counts_a_tip_the_clone_reaches_through_a_tag(self, tmp_path):
+        """Coverage asks what the walk can reach, so the two read the same refs — one
+        function answers both. Adding tags to the walk and not to this would have made
+        a clone that genuinely holds a tip report it as a branch it cannot judge:
+        incomplete, over history it can walk perfectly well.
+        """
+        from deptrail.history import _remote_heads, _heads_not_here
+        origin = self.origin_with_two_branches(tmp_path, "viatag")
+        work = tmp_path / "viatag-work"
+        git(work, "checkout", "-q", "release/1.x")
+        git(work, "tag", "-a", "shipped", "-m", "shipped")
+        git(work, "push", "-q", "origin", "shipped")
+        repo = self.fresh(tmp_path, "viatag-clone")
+        git(repo, "remote", "add", "origin", str(origin))
+        # `main`, and the tag — but not the branch the tag sits on.
+        git(repo, "fetch", "-q", "origin", "main", "tag", "shipped")
+        git(repo, "checkout", "-qb", "main", "FETCH_HEAD")
+        assert "refs/heads/release/1.x" not in [
+            line.split()[-1] for line in
+            subprocess.run(["git", "-C", str(repo), "for-each-ref",
+                            "--format=%(refname)"], check=True, capture_output=True,
+                           text=True).stdout.splitlines()]
+        assert _heads_not_here(repo, _remote_heads(repo)) == []
+
     def test_a_branch_called_head_is_not_counted_as_covered(self, tmp_path):
         """`_refs` drops every ref whose name ends in `/HEAD`, taking it for the
         alias it usually is — so a remote branch actually *called* `HEAD` is fetched,
@@ -1299,7 +1402,11 @@ class TestPrecedenceAndDiagnostics:
 
         repo = self.fresh(tmp_path, "tagged-clone")
         git(repo, "remote", "add", "origin", str(origin))
-        git(repo, "fetch", "-q", "origin", "main", "--tags")
+        # Without the tag: the walk starts from tags now, so fetching this one would
+        # make the commit behind `tagbranch` genuinely reachable here and there would
+        # be nothing left to get wrong. What is under test is the *id* — the tag
+        # object's, which matches nothing local — not whether a tag can cover.
+        git(repo, "fetch", "-q", "origin", "main")
         git(repo, "checkout", "-qb", "main", "FETCH_HEAD")
         heads = _remote_heads(repo)
         # release/1.x is missing too, and honestly so — this clone fetched only main.
